@@ -1059,7 +1059,13 @@ fn resizeCols(
         break :cursor .{
             .tracked_pin = c.pin orelse try self.trackPin(p),
             .untrack = c.pin == null,
-            .remaining_rows = self.rows - c.y - 1,
+            // When a resize shrinks both cols and rows, the row reduction
+            // runs before this column reflow, so `self.rows` is already
+            // the new (smaller) count while `c.y` is still the pre-resize
+            // cursor row and may exceed it. A cursor at or below the new
+            // bottom row has zero active rows beneath it, so the count
+            // saturates at 0 rather than going negative.
+            .remaining_rows = self.rows -| c.y -| 1,
             .wrapped_rows = wrapped,
         };
     } else null;
@@ -12657,6 +12663,52 @@ test "PageList resize reflow less cols cursor in wrapped row" {
         .x = 0,
         .y = 1,
     } }, s.pointFromPin(.active, p.*).?);
+}
+
+test "PageList resize reflow less cols and rows with cursor on bottom row" {
+    // Exercises resizeCols's cursor-preservation path when both cols and
+    // rows shrink in a single reflow resize and the cursor is on the
+    // bottom row. The cols-shrink branch lowers self.rows before the
+    // column reflow runs, so the reflow sees a cursor row (c.y) that
+    // exceeds the new row count; resizeCols must treat that as zero
+    // active rows remaining beneath the cursor and complete the resize.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 10, 0);
+    defer s.deinit();
+
+    // Fill every row so nothing is trimmed away before the resize.
+    const page = &s.pages.first.?.data;
+    for (0..s.rows) |y| {
+        for (0..s.cols) |x| {
+            const rac = page.getRowAndCell(x, y);
+            rac.cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = @intCast(x) },
+            };
+        }
+    }
+
+    // Track a pin at the cursor's bottom-row position before resizing,
+    // mirroring how Screen.resize passes self.cursor.page_pin. The pin
+    // resolves regardless of the post-row-shrink active bounds, so it
+    // reaches the `self.rows - c.y - 1` computation (unlike a pinless
+    // cursor, whose out-of-bounds active lookup short-circuits first).
+    const cursor_pin = try s.trackPin(s.pin(.{ .active = .{ .x = 0, .y = 9 } }).?);
+    defer s.untrackPin(cursor_pin);
+
+    // Shrink to 5x5 with the cursor pinned on row 9, which sits beyond
+    // the new 5-row active area.
+    try s.resize(.{
+        .cols = 5,
+        .rows = 5,
+        .reflow = true,
+        .cursor = .{ .x = 0, .y = 9, .pin = cursor_pin },
+    });
+
+    try testing.expectEqual(@as(size.CellCountInt, 5), s.cols);
+    try testing.expectEqual(@as(size.CellCountInt, 5), s.rows);
 }
 
 test "PageList resize reflow less cols wraps spacer head" {
