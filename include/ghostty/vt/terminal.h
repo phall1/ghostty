@@ -77,6 +77,7 @@ extern "C" {
  * | `GHOSTTY_TERMINAL_OPT_BELL`             | `GhosttyTerminalBellFn`           | BEL character (0x07)                      |
  * | `GHOSTTY_TERMINAL_OPT_TITLE_CHANGED`    | `GhosttyTerminalTitleChangedFn`   | Title change via OSC 0 / OSC 2            |
  * | `GHOSTTY_TERMINAL_OPT_PWD_CHANGED`      | `GhosttyTerminalPwdChangedFn`     | Pwd change via OSC 7 / OSC 9 / OSC 1337   |
+ * | `GHOSTTY_TERMINAL_OPT_DESKTOP_NOTIFICATION` | `GhosttyTerminalDesktopNotificationFn` | Desktop notification via OSC 9 / OSC 777 |
  * | `GHOSTTY_TERMINAL_OPT_ENQUIRY`          | `GhosttyTerminalEnquiryFn`        | ENQ character (0x05)                      |
  * | `GHOSTTY_TERMINAL_OPT_XTVERSION`        | `GhosttyTerminalXtversionFn`      | XTVERSION query (CSI > q)                 |
  * | `GHOSTTY_TERMINAL_OPT_SIZE`             | `GhosttyTerminalSizeFn`           | XTWINOPS size query (CSI 14/16/18 t)      |
@@ -399,6 +400,29 @@ typedef void (*GhosttyTerminalPwdChangedFn)(GhosttyTerminal terminal,
                                             void* userdata);
 
 /**
+ * Callback function type for desktop notifications.
+ *
+ * Called when the terminal requests a desktop notification via escape
+ * sequences: OSC 9 (`ESC ] 9 ; <body> ST`) or OSC 777
+ * (`ESC ] 777 ; notify ; <title> ; <body> ST`). For OSC 9 the title is
+ * an empty string and the body carries the message.
+ *
+ * The title and body strings are only valid for the duration of the
+ * call; copy them if they need to persist. The title may be empty.
+ *
+ * @param terminal The terminal handle
+ * @param userdata The userdata pointer set via GHOSTTY_TERMINAL_OPT_USERDATA
+ * @param title The notification title (may be empty)
+ * @param body The notification body
+ *
+ * @ingroup terminal
+ */
+typedef void (*GhosttyTerminalDesktopNotificationFn)(GhosttyTerminal terminal,
+                                                     void* userdata,
+                                                     GhosttyString title,
+                                                     GhosttyString body);
+
+/**
  * Callback function type for write_pty.
  *
  * Called when the terminal needs to write data back to the pty, for
@@ -693,6 +717,18 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Input type: GhosttyTerminalPwdChangedFn
    */
   GHOSTTY_TERMINAL_OPT_PWD_CHANGED = 25,
+
+  /**
+   * Callback invoked when the terminal requests a desktop notification
+   * via escape sequences (OSC 9 or OSC 777). For OSC 9 the title is
+   * empty and the body carries the message; OSC 777 provides both a
+   * title and a body. The strings passed to the callback are only valid
+   * for the duration of the call. Set to NULL to ignore desktop
+   * notification requests.
+   *
+   * Input type: GhosttyTerminalDesktopNotificationFn
+   */
+  GHOSTTY_TERMINAL_OPT_DESKTOP_NOTIFICATION = 26,
   GHOSTTY_TERMINAL_OPT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalOption;
 

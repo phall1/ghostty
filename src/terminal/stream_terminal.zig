@@ -88,6 +88,11 @@ pub const Handler = struct {
         /// handler.terminal.getPwd().
         pwd_changed: ?*const fn (*Handler) void,
 
+        /// Called when the terminal requests a desktop notification
+        /// (OSC 9 / OSC 777). The strings are only valid for the
+        /// duration of the call; copy if needed. `title` may be empty.
+        desktop_notification: ?*const fn (*Handler, title: []const u8, body: []const u8) void,
+
         /// Called in response to an XTVERSION query. Returns the version
         /// string to report (e.g. "ghostty 1.2.3"). The returned memory
         /// must be valid for the lifetime of the call. The maximum length
@@ -105,6 +110,7 @@ pub const Handler = struct {
             .size = null,
             .title_changed = null,
             .pwd_changed = null,
+            .desktop_notification = null,
             .write_pty = null,
             .xtversion = null,
         };
@@ -275,6 +281,7 @@ pub const Handler = struct {
             .size_report => self.reportSize(value),
             .window_title => self.windowTitle(value.title),
             .report_pwd => self.reportPwd(value.url),
+            .show_desktop_notification => self.desktopNotification(value.title, value.body),
             .xtversion => self.reportXtversion(),
 
             // No supported DCS commands have any terminal-modifying effects,
@@ -285,7 +292,6 @@ pub const Handler = struct {
             => {},
 
             // Have no terminal-modifying effect
-            .show_desktop_notification,
             .progress_report,
             .clipboard_contents,
             .title_push,
@@ -464,6 +470,11 @@ pub const Handler = struct {
 
         const func = self.effects.pwd_changed orelse return;
         func(self);
+    }
+
+    fn desktopNotification(self: *Handler, title: []const u8, body: []const u8) void {
+        const func = self.effects.desktop_notification orelse return;
+        func(self, title, body);
     }
 
     fn requestMode(self: *Handler, mode: modes.Mode) void {

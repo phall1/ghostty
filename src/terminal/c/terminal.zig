@@ -53,6 +53,7 @@ const Effects = struct {
     xtversion: ?XtversionFn = null,
     title_changed: ?TitleChangedFn = null,
     pwd_changed: ?PwdChangedFn = null,
+    desktop_notification: ?DesktopNotificationFn = null,
     size_cb: ?SizeFn = null,
 
     /// Scratch buffer for DA1 feature codes. The device attributes
@@ -89,6 +90,11 @@ const Effects = struct {
 
     /// C function pointer type for the pwd_changed callback.
     pub const PwdChangedFn = *const fn (Terminal, ?*anyopaque) callconv(lib.calling_conv) void;
+
+    /// C function pointer type for the desktop_notification callback.
+    /// The title and body strings are only valid for the duration of
+    /// the call; copy them if they need to persist.
+    pub const DesktopNotificationFn = *const fn (Terminal, ?*anyopaque, title: lib.String, body: lib.String) callconv(lib.calling_conv) void;
 
     /// C function pointer type for the size callback.
     /// Returns true and fills out_size if size is available,
@@ -210,6 +216,13 @@ const Effects = struct {
         func(@ptrCast(wrapper), wrapper.effects.userdata);
     }
 
+    fn desktopNotificationTrampoline(handler: *Handler, title: []const u8, body: []const u8) void {
+        const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
+        const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
+        const func = wrapper.effects.desktop_notification orelse return;
+        func(@ptrCast(wrapper), wrapper.effects.userdata, .{ .ptr = title.ptr, .len = title.len }, .{ .ptr = body.ptr, .len = body.len });
+    }
+
     fn sizeTrampoline(handler: *Handler) ?size_report.Size {
         const stream_ptr: *Stream = @fieldParentPtr("handler", handler);
         const wrapper: *TerminalWrapper = @fieldParentPtr("stream", stream_ptr);
@@ -295,6 +308,7 @@ fn new_(
         .xtversion = &Effects.xtversionTrampoline,
         .title_changed = &Effects.titleChangedTrampoline,
         .pwd_changed = &Effects.pwdChangedTrampoline,
+        .desktop_notification = &Effects.desktopNotificationTrampoline,
         .size = &Effects.sizeTrampoline,
     };
 
@@ -343,6 +357,7 @@ pub const Option = enum(c_int) {
     default_cursor_blink = 23,
     glyph_protocol = 24,
     pwd_changed = 25,
+    desktop_notification = 26,
 
     /// Input type expected for setting the option.
     pub fn InType(comptime self: Option) type {
@@ -356,6 +371,7 @@ pub const Option = enum(c_int) {
             .xtversion => ?Effects.XtversionFn,
             .title_changed => ?Effects.TitleChangedFn,
             .pwd_changed => ?Effects.PwdChangedFn,
+            .desktop_notification => ?Effects.DesktopNotificationFn,
             .size_cb => ?Effects.SizeFn,
             .title, .pwd => ?*const lib.String,
             .color_foreground, .color_background, .color_cursor => ?*const color.RGB.C,
@@ -412,6 +428,7 @@ fn setTyped(
         .xtversion => wrapper.effects.xtversion = value,
         .title_changed => wrapper.effects.title_changed = value,
         .pwd_changed => wrapper.effects.pwd_changed = value,
+        .desktop_notification => wrapper.effects.desktop_notification = value,
         .size_cb => wrapper.effects.size_cb = value,
         .title => {
             const str = if (value) |v| v.ptr[0..v.len] else "";
@@ -2438,6 +2455,89 @@ test "pwd_changed without callback is silent" {
     const seq = "\x1B]7;file:///tmp\x1B\\";
     vt_write(t, seq, seq.len);
     try testing.expectEqualStrings("file:///tmp", zigTerminal(t).?.getPwd().?);
+}
+
+test "set desktop_notification callback" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{
+            .cols = 80,
+            .rows = 24,
+            .max_scrollback = 0,
+        },
+    ));
+    defer free(t);
+
+    const S = struct {
+        var notify_count: usize = 0;
+        var last_userdata: ?*anyopaque = null;
+        var last_title: [128]u8 = undefined;
+        var last_title_len: usize = 0;
+        var last_body: [128]u8 = undefined;
+        var last_body_len: usize = 0;
+
+        fn desktopNotification(
+            _: Terminal,
+            ud: ?*anyopaque,
+            title: lib.String,
+            body: lib.String,
+        ) callconv(lib.calling_conv) void {
+            notify_count += 1;
+            last_userdata = ud;
+            last_title_len = title.len;
+            @memcpy(last_title[0..title.len], title.ptr[0..title.len]);
+            last_body_len = body.len;
+            @memcpy(last_body[0..body.len], body.ptr[0..body.len]);
+        }
+    };
+    S.notify_count = 0;
+    S.last_userdata = null;
+
+    var sentinel: u8 = 88;
+    try testing.expectEqual(Result.success, set(t, .userdata, @ptrCast(&sentinel)));
+    try testing.expectEqual(Result.success, set(t, .desktop_notification, @ptrCast(&S.desktopNotification)));
+
+    // OSC 777 ; notify ; title ; body ST — title and body
+    const seq1 = "\x1B]777;notify;Title;Body\x1B\\";
+    vt_write(t, seq1, seq1.len);
+    try testing.expectEqual(@as(usize, 1), S.notify_count);
+    try testing.expectEqual(@as(?*anyopaque, @ptrCast(&sentinel)), S.last_userdata);
+    try testing.expectEqualStrings("Title", S.last_title[0..S.last_title_len]);
+    try testing.expectEqualStrings("Body", S.last_body[0..S.last_body_len]);
+
+    // OSC 9 ; body BEL — empty title, body only
+    const seq2 = "\x1B]9;Hello world\x07";
+    vt_write(t, seq2, seq2.len);
+    try testing.expectEqual(@as(usize, 2), S.notify_count);
+    try testing.expectEqualStrings("", S.last_title[0..S.last_title_len]);
+    try testing.expectEqualStrings("Hello world", S.last_body[0..S.last_body_len]);
+}
+
+test "desktop_notification without callback is silent" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{
+            .cols = 80,
+            .rows = 24,
+            .max_scrollback = 0,
+        },
+    ));
+    defer free(t);
+
+    // OSC 777 desktop notification without a callback should not crash
+    // and should not modify terminal state.
+    const seq = "\x1B]777;notify;Title;Body\x1B\\";
+    vt_write(t, seq, seq.len);
+
+    // Terminal should remain functional afterwards.
+    vt_write(t, "Test", 4);
+    const str = try t.?.terminal.plainString(testing.allocator);
+    defer testing.allocator.free(str);
+    try testing.expectEqualStrings("Test", str);
 }
 
 test "set size callback" {
