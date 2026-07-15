@@ -22,6 +22,20 @@ const KeyEncoderWrapper = struct {
 /// C: GhosttyKeyEncoder
 pub const Encoder = ?*KeyEncoderWrapper;
 
+/// Terminal-derived key encoder options, suitable for crossing thread or
+/// process boundaries without carrying a Terminal pointer.
+/// C: GhosttyKeyEncoderTerminalOptions
+pub const TerminalOptions = extern struct {
+    size: usize = @sizeOf(TerminalOptions),
+    cursor_key_application: bool,
+    keypad_key_application: bool,
+    ignore_keypad_with_numlock: bool,
+    alt_esc_prefix: bool,
+    modify_other_keys_state_2: bool,
+    kitty_flags: u8,
+    backarrow_key_mode: bool,
+};
+
 pub fn new(
     alloc_: ?*const CAllocator,
     result: *Encoder,
@@ -122,6 +136,26 @@ fn setoptTyped(
         },
         .backarrow_key_mode => opts.backarrow_key_mode = value.*,
     }
+}
+
+pub fn terminal_options(
+    terminal_: Terminal,
+    out: ?*TerminalOptions,
+) callconv(lib.calling_conv) Result {
+    const t: *ZigTerminal = (terminal_ orelse return .invalid_value).terminal;
+    const result = out orelse return .invalid_value;
+    if (result.size < @sizeOf(TerminalOptions)) return .invalid_value;
+    const opts: key_encode.Options = .fromTerminal(t);
+    result.* = .{
+        .cursor_key_application = opts.cursor_key_application,
+        .keypad_key_application = opts.keypad_key_application,
+        .ignore_keypad_with_numlock = opts.ignore_keypad_with_numlock,
+        .alt_esc_prefix = opts.alt_esc_prefix,
+        .modify_other_keys_state_2 = opts.modify_other_keys_state_2,
+        .kitty_flags = @intCast(@as(u5, @bitCast(opts.kitty_flags))),
+        .backarrow_key_mode = opts.backarrow_key_mode,
+    };
+    return .success;
 }
 
 pub fn setopt_from_terminal(
@@ -238,6 +272,30 @@ test "setopt macos option as alt" {
     const opt_true: OptionAsAlt = .true;
     setopt(e, .macos_option_as_alt, &opt_true);
     try testing.expectEqual(OptionAsAlt.true, e.?.opts.macos_option_as_alt);
+}
+
+test "terminal_options exactly captures fromTerminal" {
+    const testing = std.testing;
+    var terminal = try ZigTerminal.init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer terminal.deinit(testing.allocator);
+    terminal.modes.set(.cursor_keys, true);
+    terminal.modes.set(.keypad_keys, true);
+    terminal.modes.set(.ignore_keypad_with_numlock, true);
+    terminal.modes.set(.alt_esc_prefix, true);
+    terminal.flags.modify_other_keys_2 = true;
+    terminal.modes.set(.backarrow_key_mode, true);
+
+    var out: TerminalOptions = undefined;
+    out.size = @sizeOf(TerminalOptions);
+    try testing.expectEqual(Result.success, terminal_options(.{ .terminal = &terminal }, &out));
+    const expected: key_encode.Options = .fromTerminal(&terminal);
+    try testing.expectEqual(expected.cursor_key_application, out.cursor_key_application);
+    try testing.expectEqual(expected.keypad_key_application, out.keypad_key_application);
+    try testing.expectEqual(expected.ignore_keypad_with_numlock, out.ignore_keypad_with_numlock);
+    try testing.expectEqual(expected.alt_esc_prefix, out.alt_esc_prefix);
+    try testing.expectEqual(expected.modify_other_keys_state_2, out.modify_other_keys_state_2);
+    try testing.expectEqual(@as(u8, @intCast(@as(u5, @bitCast(expected.kitty_flags)))), out.kitty_flags);
+    try testing.expectEqual(expected.backarrow_key_mode, out.backarrow_key_mode);
 }
 
 test "setopt_from_terminal" {
