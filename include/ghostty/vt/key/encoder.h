@@ -116,6 +116,25 @@ typedef enum GHOSTTY_ENUM_TYPED {
     GHOSTTY_KEY_ENCODER_OPT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyKeyEncoderOption;
 
+/** Terminal-derived key encoder options. */
+typedef struct {
+    size_t size;
+    bool cursor_key_application;
+    bool keypad_key_application;
+    bool ignore_keypad_with_numlock;
+    bool alt_esc_prefix;
+    bool modify_other_keys_state_2;
+    GhosttyKittyKeyFlags kitty_flags;
+    bool backarrow_key_mode;
+} GhosttyKeyEncoderTerminalOptions;
+
+/**
+ * Capture exactly the options ghostty_key_encoder_setopt_from_terminal applies.
+ */
+GHOSTTY_API GhosttyResult ghostty_key_encoder_terminal_options(
+    GhosttyTerminal terminal,
+    GhosttyKeyEncoderTerminalOptions *options);
+
 /**
  * Create a new key encoder instance.
  *
