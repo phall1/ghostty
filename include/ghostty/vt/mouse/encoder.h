@@ -62,6 +62,18 @@ typedef enum GHOSTTY_ENUM_TYPED {
   GHOSTTY_MOUSE_FORMAT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyMouseFormat;
 
+/** Terminal-derived effective mouse encoder options. */
+typedef struct {
+  size_t size;
+  GhosttyMouseTrackingMode event;
+  GhosttyMouseFormat format;
+} GhosttyMouseEncoderTerminalOptions;
+
+/** Capture exactly the options ghostty_mouse_encoder_setopt_from_terminal applies. */
+GHOSTTY_API GhosttyResult ghostty_mouse_encoder_terminal_options(
+    GhosttyTerminal terminal,
+    GhosttyMouseEncoderTerminalOptions *options);
+
 /**
  * Mouse encoder size and geometry context.
  *

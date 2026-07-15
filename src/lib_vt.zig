@@ -156,6 +156,7 @@ comptime {
         @export(&c.key_encoder_new, .{ .name = "ghostty_key_encoder_new" });
         @export(&c.key_encoder_free, .{ .name = "ghostty_key_encoder_free" });
         @export(&c.key_encoder_setopt, .{ .name = "ghostty_key_encoder_setopt" });
+        @export(&c.key_encoder_terminal_options, .{ .name = "ghostty_key_encoder_terminal_options" });
         @export(&c.key_encoder_setopt_from_terminal, .{ .name = "ghostty_key_encoder_setopt_from_terminal" });
         @export(&c.key_encoder_encode, .{ .name = "ghostty_key_encoder_encode" });
         @export(&c.mouse_event_new, .{ .name = "ghostty_mouse_event_new" });
@@ -172,6 +173,7 @@ comptime {
         @export(&c.mouse_encoder_new, .{ .name = "ghostty_mouse_encoder_new" });
         @export(&c.mouse_encoder_free, .{ .name = "ghostty_mouse_encoder_free" });
         @export(&c.mouse_encoder_setopt, .{ .name = "ghostty_mouse_encoder_setopt" });
+        @export(&c.mouse_encoder_terminal_options, .{ .name = "ghostty_mouse_encoder_terminal_options" });
         @export(&c.mouse_encoder_setopt_from_terminal, .{ .name = "ghostty_mouse_encoder_setopt_from_terminal" });
         @export(&c.mouse_encoder_reset, .{ .name = "ghostty_mouse_encoder_reset" });
         @export(&c.mouse_encoder_encode, .{ .name = "ghostty_mouse_encoder_encode" });
