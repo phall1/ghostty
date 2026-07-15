@@ -134,6 +134,7 @@ pub const key_event_get_unshifted_codepoint = key_event.get_unshifted_codepoint;
 pub const key_encoder_new = key_encode.new;
 pub const key_encoder_free = key_encode.free;
 pub const key_encoder_setopt = key_encode.setopt;
+pub const key_encoder_terminal_options = key_encode.terminal_options;
 pub const key_encoder_setopt_from_terminal = key_encode.setopt_from_terminal;
 pub const key_encoder_encode = key_encode.encode;
 
@@ -152,6 +153,7 @@ pub const mouse_event_get_position = mouse_event.get_position;
 pub const mouse_encoder_new = mouse_encode.new;
 pub const mouse_encoder_free = mouse_encode.free;
 pub const mouse_encoder_setopt = mouse_encode.setopt;
+pub const mouse_encoder_terminal_options = mouse_encode.terminal_options;
 pub const mouse_encoder_setopt_from_terminal = mouse_encode.setopt_from_terminal;
 pub const mouse_encoder_reset = mouse_encode.reset;
 pub const mouse_encoder_encode = mouse_encode.encode;

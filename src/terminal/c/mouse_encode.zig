@@ -26,6 +26,15 @@ const MouseEncoderWrapper = struct {
 /// C: GhosttyMouseEncoder
 pub const Encoder = ?*MouseEncoderWrapper;
 
+/// Terminal-derived mouse encoder options, after the terminal has resolved
+/// tracking and format precedence.
+/// C: GhosttyMouseEncoderTerminalOptions
+pub const TerminalOptions = extern struct {
+    size: usize = @sizeOf(TerminalOptions),
+    event: TrackingMode,
+    format: Format,
+};
+
 /// C: GhosttyMouseTrackingMode
 pub const TrackingMode = terminal_mouse.Event;
 
@@ -184,6 +193,20 @@ fn setoptTyped(
     }
 }
 
+pub fn terminal_options(
+    terminal_: Terminal,
+    out: ?*TerminalOptions,
+) callconv(lib.calling_conv) Result {
+    const t: *ZigTerminal = (terminal_ orelse return .invalid_value).terminal;
+    const result = out orelse return .invalid_value;
+    if (result.size < @sizeOf(TerminalOptions)) return .invalid_value;
+    result.* = .{
+        .event = t.flags.mouse_event,
+        .format = t.flags.mouse_format,
+    };
+    return .success;
+}
+
 pub fn setopt_from_terminal(
     encoder_: Encoder,
     terminal_: Terminal,
@@ -308,6 +331,19 @@ test "setopt" {
     const track_last_cell = true;
     setopt(e, .track_last_cell, &track_last_cell);
     try testing.expect(e.?.track_last_cell);
+}
+
+test "terminal_options exactly captures effective state" {
+    var terminal = try ZigTerminal.init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer terminal.deinit(testing.allocator);
+    terminal.flags.mouse_event = .any;
+    terminal.flags.mouse_format = .sgr_pixels;
+
+    var out: TerminalOptions = undefined;
+    out.size = @sizeOf(TerminalOptions);
+    try testing.expectEqual(Result.success, terminal_options(.{ .terminal = &terminal }, &out));
+    try testing.expectEqual(terminal.flags.mouse_event, out.event);
+    try testing.expectEqual(terminal.flags.mouse_format, out.format);
 }
 
 test "setopt_from_terminal" {
