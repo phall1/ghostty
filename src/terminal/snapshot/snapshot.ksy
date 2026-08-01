@@ -8,11 +8,12 @@ doc: |
   Ghostty terminal snapshot format version 1.
 
   A complete snapshot contains an envelope, terminal-wide state, one or two
-  renderable screen sequences, a READY checkpoint, matching history sequences,
-  and a FINISH checkpoint. SCREEN pages are oldest-to-newest. HISTORY pages are
-  newest-to-oldest. FINISH terminates the snapshot; bytes that follow belong to
-  the containing transport and are outside this schema. Each SCREEN declares
-  its complete logical history extent before READY.
+  renderable screen sequences, one raw standard-Stream CONTINUATION, a READY
+  checkpoint, matching history sequences, and a FINISH checkpoint. SCREEN pages
+  are oldest-to-newest. HISTORY pages are newest-to-oldest. FINISH terminates the
+  snapshot; bytes that follow belong to the containing transport and are outside
+  this schema. Each SCREEN declares its complete logical history extent before
+  READY.
 
   Record CRC32C values and checkpoint BLAKE3-256 digests are represented here
   but cannot be calculated by portable Kaitai Struct expressions. The adjacent
@@ -26,6 +27,8 @@ seq:
     type: screen_sequence
     repeat: expr
     repeat-expr: terminal.payload.header.screen_count
+  - id: continuation
+    type: continuation_record
   - id: ready
     type: checkpoint_record(5)
   - id: histories
@@ -42,6 +45,7 @@ enums:
     4: history
     5: ready
     6: finish
+    7: continuation
   screen_key:
     0: primary
     1: alternate
@@ -200,6 +204,16 @@ types:
         type: record_header(4)
       - id: payload
         type: history_payload
+        size: header.payload_length
+
+  continuation_record:
+    doc: |
+      Raw canonical standard TerminalStream continuation bytes. An empty
+      payload explicitly represents ground state.
+    seq:
+      - id: header
+        type: record_header(7)
+      - id: payload
         size: header.payload_length
 
   checkpoint_record:

@@ -10,11 +10,11 @@
 //! To do that, it sends the active terminal state followed by a READY record,
 //! then complete history.
 //!
-//! READY denotes that enough of the terminal state is down that it can
-//! be fully rendered at that point. This is also the point where live
-//! terminals can also start accepting pty bytes, typically. But the current
-//! snapshot format lacks some of the information necessary to synchronize
-//! pty byte state with an authoritative server.
+//! READY denotes that enough authenticated state is present to render the
+//! terminal and reconstruct its unfinished standard Stream state. The current
+//! synchronous decoder still returns only after FINISH. A caller moves the
+//! Terminal into final storage, replays CONTINUATION once, and only then applies
+//! PTY bytes belonging after the snapshot cut.
 //!
 //! After READY, we send history pages (scrollback).
 //!
@@ -53,6 +53,8 @@
 //! | SCREEN * terminal.screen_count         |
 //! | PAGE * each screen.page_count          |
 //! +----------------------------------------+
+//! | CONTINUATION                           |
+//! +----------------------------------------+
 //! | READY                                  |
 //! +----------------------------------------+
 //! | HISTORY * terminal.screen_count        |
@@ -71,12 +73,16 @@
 //! is zero. FINISH terminates the snapshot. Bytes after FINISH belong to the
 //! containing transport and are not consumed by snapshot decoding.
 //!
+//! CONTINUATION contains the bytes required to bring the terminal's
+//! VT parser/stream up to the same state, or no bytes if it should be
+//! in the ground state.
+//!
 //! READY and FINISH contain BLAKE3-256 digests of all preceding snapshot bytes.
-//! READY therefore validates the renderable active-state prefix. FINISH covers
-//! READY and all history as well, validating the complete snapshot and its
-//! record ordering. Each SCREEN declares its complete logical history extent,
-//! allowing a client to size its scrollbar at READY even though older PAGE
-//! records arrive afterward.
+//! READY therefore validates the renderable active state and continuation.
+//! FINISH covers READY and all history as well, validating the complete snapshot
+//! and its record ordering. Each SCREEN declares its complete logical history
+//! extent, allowing a client to size its scrollbar at READY even though older
+//! PAGE records arrive afterward.
 //!
 //! ## Encoding
 //!
@@ -86,7 +92,9 @@
 //! var output: std.Io.Writer.Allocating = .init(alloc);
 //! defer output.deinit();
 //!
-//! try snapshot.encode(alloc, &output.writer, &terminal);
+//! try snapshot.encode(alloc, &output.writer, &terminal, .{
+//!     .continuation = .ground,
+//! });
 //!
 //! const bytes = output.written();
 //! ```
@@ -113,7 +121,11 @@
 //! outside this ordered snapshot record sequence.
 //!
 //! ```zig
-//! var terminal = try snapshot.decode(alloc, io, &reader);
+//! var decoded = try snapshot.decode(alloc, io, &reader, .{
+//!     .max_continuation_bytes = 1024 * 1024,
+//! });
+//! defer decoded.deinit(alloc);
+//! var terminal = decoded.toOwned();
 //! defer terminal.deinit(alloc);
 //! ```
 //!
@@ -122,6 +134,7 @@
 //! block when used with a live stream.
 
 pub const checkpoint = @import("checkpoint.zig");
+pub const continuation = @import("continuation.zig");
 pub const envelope = @import("envelope.zig");
 pub const grid = @import("grid.zig");
 pub const history = @import("history.zig");
@@ -136,6 +149,10 @@ const codec = @import("snapshot.zig");
 pub const EncodeError = codec.EncodeError;
 pub const DecodeError = codec.DecodeError;
 pub const DecodeExactError = codec.DecodeExactError;
+pub const Continuation = codec.Continuation;
+pub const EncodeOptions = codec.EncodeOptions;
+pub const DecodeOptions = codec.DecodeOptions;
+pub const Decoded = codec.Decoded;
 pub const encode = codec.encode;
 pub const decode = codec.decode;
 pub const decodeExact = codec.decodeExact;

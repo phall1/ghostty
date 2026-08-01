@@ -4,6 +4,47 @@ const Allocator = std.mem.Allocator;
 const Parser = @import("Parser.zig");
 const UTF8Decoder = @import("UTF8Decoder.zig");
 
+/// Errors possible while validating a snapshot continuation.
+pub const ValidateError = error{
+    /// A byte continuation must contain at least one byte.
+    EmptyContinuation,
+
+    /// Replaying the bytes would repeat handler-visible work.
+    ContinuationHasCommittedWork,
+
+    /// The bytes finish with both the VT parser and UTF-8 decoder at ground.
+    ContinuationEndsAtGround,
+
+    /// A later replay start makes some leading bytes unnecessary.
+    NonCanonicalContinuation,
+};
+
+/// Validate one nonempty, canonical continuation exported by TerminalStream.
+///
+/// This runs only during snapshot work. It replays the bytes through the same
+/// parser and UTF-8 transitions used to filter tracked continuation output,
+/// without invoking a handler or allocating. A valid value commits no work,
+/// ends unfinished, and begins at the final state's effective replay start.
+pub fn validate(bytes: []const u8) ValidateError!void {
+    if (bytes.len == 0) return error.EmptyContinuation;
+
+    var scanner: BoundaryScanner = .init();
+    var committed_work = false;
+    for (bytes) |byte| {
+        if (scanner.next(byte) != .uncommitted) committed_work = true;
+    }
+
+    if (scanner.ground()) return error.ContinuationEndsAtGround;
+
+    const replay_start = if (scanner.parser.state != .ground)
+        findVTReplayStart(bytes)
+    else
+        findUtf8ReplayStart(bytes);
+    if (replay_start != 0) return error.NonCanonicalContinuation;
+
+    if (committed_work) return error.ContinuationHasCommittedWork;
+}
+
 /// Retains the input needed to reconstruct unfinished Stream parser state.
 ///
 /// A feed is one chunk of bytes given to a Stream. It can end in the middle of

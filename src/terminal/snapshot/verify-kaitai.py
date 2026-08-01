@@ -159,7 +159,7 @@ def crc32c(data: bytes) -> int:
 
 def validate_record(record: Any, data: bytes, offset: int) -> int:
     """Validate one parsed record's source bytes and CRC32C."""
-    payload = record._raw_payload
+    payload = getattr(record, "_raw_payload", record.payload)
     header = record.header
     if header.payload_length != len(payload):
         raise ValueError(
@@ -194,6 +194,7 @@ def all_snapshot_records(snapshot: Any) -> list[Any]:
     for sequence in snapshot.screens:
         records.append(sequence.screen)
         records.extend(sequence.pages)
+    records.append(snapshot.continuation)
     records.append(snapshot.ready)
     for sequence in snapshot.histories:
         records.append(sequence.history)

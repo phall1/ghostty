@@ -53,6 +53,9 @@ pub const Tag = enum(u16) {
 
     /// Digest validating the complete snapshot blob.
     finish = 6,
+
+    /// Canonical unfinished standard TerminalStream input.
+    continuation = 7,
 };
 
 /// The fixed framing that precedes every record payload.
@@ -408,7 +411,7 @@ test "golden PAGE record header and checksum" {
 }
 
 test "reject invalid tags" {
-    for ([_]u16{ 0, 7, std.math.maxInt(u16) }) |tag| {
+    for ([_]u16{ 0, 8, std.math.maxInt(u16) }) |tag| {
         var fixture = [_]u8{0} ** Header.len;
         std.mem.writeInt(u16, fixture[0..2], tag, .little);
         var reader: std.Io.Reader = .fixed(&fixture);
