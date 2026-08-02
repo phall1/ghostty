@@ -431,18 +431,32 @@ async function makeTrackingAllocator(rt) {
   assert.ok(table, "standalone wasm must export its indirect function table");
   const base = table.grow(4);
   const functions = ["alloc", "resize", "remap", "free"];
-  functions.forEach((name, index) =>
-    table.set(base + index, helper.instance.exports[name]));
+  functions.forEach((name, index) => {
+    const callback = helper.instance.exports[name];
+    table.set(base + index, callback);
+    assert.equal(table.get(base + index), callback);
+  });
   const context = rt.alloc(1);
   const vtable = rt.rawStruct("GhosttyAllocatorVtable");
-  functions.forEach((name, index) => rt.view().setUint32(
-    vtable.ptr + rt.field(vtable.name, name), base + index, true));
+  functions.forEach((name, index) => {
+    const field = vtable.ptr + rt.field(vtable.name, name);
+    rt.view().setUint32(field, base + index, true);
+    assert.equal(rt.view().getUint32(field, true), base + index);
+  });
   const allocator = rt.rawStruct("GhosttyAllocator");
   rt.setPtr(allocator, "ctx", context);
   rt.setPtr(allocator, "vtable", vtable.ptr);
   return {
     ptr: allocator.ptr,
     state,
+    probeResizeSignatures() {
+      const resizeCalls = state.calls.resize;
+      const remapCalls = state.calls.remap;
+      assert.equal(helper.instance.exports.resize(0, 0, 0, 0, 0, 0), 0);
+      assert.equal(helper.instance.exports.remap(0, 0, 0, 0, 0, 0), 0);
+      assert.equal(state.calls.resize, resizeCalls + 1);
+      assert.equal(state.calls.remap, remapCalls + 1);
+    },
     reset(failAfter = Number.POSITIVE_INFINITY) {
       state.calls = { alloc: 0, resize: 0, remap: 0, free: 0 };
       state.failAfter = failAfter;
@@ -734,11 +748,12 @@ rt.write(source, sourceText);
 assert.ok(rt.terminalUsize(source, 15) > 1000);
 exerciseCaptureLimit(rt, source);
 const trackingAllocator = await makeTrackingAllocator(rt);
+trackingAllocator.probeResizeSignatures();
 trackingAllocator.reset();
 const allocatorCapture = captureAll(rt, source, trackingAllocator.ptr);
 assert.ok(allocatorCapture.records.some(
   (record) => record.kind === CAPTURE_HISTORY_PAGE));
-for (const callback of ["alloc", "resize", "remap", "free"]) {
+for (const callback of ["alloc", "free"]) {
   assert.ok(trackingAllocator.state.calls[callback] > 0, callback);
 }
 assert.equal(trackingAllocator.state.allocations.size, 0);
