@@ -910,9 +910,65 @@ assert.equal(offset, captured.encoded.length);
 assert.equal(decodedHistoryPages, decodedHistoryCount);
 rt.e.ghostty_terminal_snapshot_decoder_free(decoder);
 
-const sourceAfterReplay = captureAll(rt, source).encoded;
-const decodedAfterReplay = captureAll(rt, decodedTerminal).encoded;
-assert.deepEqual(decodedAfterReplay, sourceAfterReplay);
+const sourceAfterReplay = captureAll(rt, source);
+const decodedAfterReplay = captureAll(rt, decodedTerminal);
+const recordEqual = (left, right) =>
+  left.kind === right.kind &&
+  left.screenKey === right.screenKey &&
+  left.index === right.index &&
+  left.count === right.count &&
+  left.bytes.length === right.bytes.length &&
+  left.bytes.every((byte, index) => byte === right.bytes[index]);
+let firstDifferentRecord = 0;
+while (firstDifferentRecord < sourceAfterReplay.records.length &&
+    firstDifferentRecord < decodedAfterReplay.records.length &&
+    recordEqual(
+      sourceAfterReplay.records[firstDifferentRecord],
+      decodedAfterReplay.records[firstDifferentRecord])) {
+  ++firstDifferentRecord;
+}
+if (firstDifferentRecord !== sourceAfterReplay.records.length ||
+    firstDifferentRecord !== decodedAfterReplay.records.length) {
+  const sourceRecord = sourceAfterReplay.records[firstDifferentRecord] ?? null;
+  const decodedRecord = decodedAfterReplay.records[firstDifferentRecord] ?? null;
+  let firstDifferentByte = null;
+  if (sourceRecord && decodedRecord) {
+    const common = Math.min(sourceRecord.bytes.length, decodedRecord.bytes.length);
+    firstDifferentByte = 0;
+    while (firstDifferentByte < common &&
+        sourceRecord.bytes[firstDifferentByte] ===
+          decodedRecord.bytes[firstDifferentByte]) ++firstDifferentByte;
+  }
+  console.error("snapshot recapture mismatch", JSON.stringify({
+    firstDifferentRecord,
+    firstDifferentByte,
+    source: {
+      totalRows: rt.terminalUsize(source, 14),
+      historyRows: rt.terminalUsize(source, 15),
+      recordCount: sourceAfterReplay.records.length,
+      record: sourceRecord && {
+        kind: sourceRecord.kind,
+        screenKey: sourceRecord.screenKey,
+        index: sourceRecord.index,
+        count: sourceRecord.count,
+        bytes: sourceRecord.bytes.length,
+      },
+    },
+    decoded: {
+      totalRows: rt.terminalUsize(decodedTerminal, 14),
+      historyRows: rt.terminalUsize(decodedTerminal, 15),
+      recordCount: decodedAfterReplay.records.length,
+      record: decodedRecord && {
+        kind: decodedRecord.kind,
+        screenKey: decodedRecord.screenKey,
+        index: decodedRecord.index,
+        count: decodedRecord.count,
+        bytes: decodedRecord.bytes.length,
+      },
+    },
+  }));
+}
+assert.deepEqual(decodedAfterReplay.encoded, sourceAfterReplay.encoded);
 
 const unknownVersion = Uint8Array.from(captured.encoded);
 unknownVersion[8] = 0xff;
