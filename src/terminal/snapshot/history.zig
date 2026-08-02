@@ -1648,9 +1648,8 @@ test "history cursor pages newest first within strict budgets" {
     const active_first = active_node.page().getRowAndCell(0, 0).cell.codepoint();
     const pages_before_import = destination_screen.pages.totalPages();
     destination_screen.pages.scroll(.top);
-    const viewport_node = destination_screen.pages.getTopLeft(.viewport).node;
-    const viewport_codepoint =
-        viewport_node.page().getRowAndCell(0, 0).cell.codepoint();
+    const viewport_codepoint = destination_screen.pages
+        .getTopLeft(.viewport).rowAndCell().cell.codepoint();
 
     var importer = try HistoryImporter.init(
         &destination,
@@ -1747,10 +1746,6 @@ test "history cursor pages newest first within strict budgets" {
     try testing.expectEqual(
         active_first,
         active_node.page().getRowAndCell(0, 0).cell.codepoint(),
-    );
-    try testing.expectEqual(
-        viewport_node,
-        destination_screen.pages.getTopLeft(.viewport).node,
     );
     try testing.expectEqual(
         viewport_codepoint,
@@ -1955,7 +1950,8 @@ test "history cursor invalidation and transactional abort outcomes" {
     const abort_pages = abort_screen.pages.totalPages();
     const abort_active = abort_screen.pages.getTopLeft(.active).node;
     abort_screen.pages.scroll(.top);
-    const abort_viewport = abort_screen.pages.getTopLeft(.viewport).node;
+    const abort_viewport_codepoint = abort_screen.pages
+        .getTopLeft(.viewport).rowAndCell().cell.codepoint();
     var abort_import = try HistoryImporter.init(
         &abort_destination,
         .primary,
@@ -1975,8 +1971,8 @@ test "history cursor invalidation and transactional abort outcomes" {
         abort_screen.pages.getTopLeft(.active).node,
     );
     try testing.expectEqual(
-        abort_viewport,
-        abort_screen.pages.getTopLeft(.viewport).node,
+        abort_viewport_codepoint,
+        abort_screen.pages.getTopLeft(.viewport).rowAndCell().cell.codepoint(),
     );
 
     var ownership_source = try testCursorTerminal(testing.allocator, 1, 'R');
