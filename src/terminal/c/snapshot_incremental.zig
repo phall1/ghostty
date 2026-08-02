@@ -276,6 +276,7 @@ const CaptureState = struct {
     history_index: u32 = 0,
     history_count: u32 = 0,
     page_records: usize = 0,
+    envelope_emitted: bool = false,
     terminal_state: bool = false,
 };
 
@@ -330,6 +331,7 @@ pub fn captureNew(
     state.history_key = 0;
     state.history_index = 0;
     state.history_count = 0;
+    state.envelope_emitted = false;
     state.page_records = 0;
     state.terminal_state = false;
     const continuation_value: snapshot.Continuation = if (continuation.len == 0)
@@ -361,6 +363,10 @@ fn classifyCapture(state: *CaptureState, event: snapshot.EncodeEvent, bytes: []c
     state.pending_count = 0;
     state.pending_checkpoint = [_]u8{0} ** token_len;
 
+    if (!state.envelope_emitted) {
+        state.envelope_emitted = true;
+        return .success;
+    }
     if (event == .ready) {
         if (bytes.len < snapshot.record.Header.len + token_len) return .corruption;
         @memcpy(state.pending_checkpoint[0..], bytes[snapshot.record.Header.len..][0..token_len]);
