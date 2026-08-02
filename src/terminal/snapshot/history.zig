@@ -607,6 +607,9 @@ test "HISTORY encodes newest first and restores complete history" {
     defer decoded_partial.deinit();
     const partial = &decoded_partial.screen;
     const screen_page_count = partial.pages.totalPages();
+    const screen_first = partial.pages.getTopLeft(.screen).node;
+    const screen_first_codepoint =
+        screen_first.page().getRowAndCell(0, 0).cell.codepoint();
     try std.testing.expectError(
         error.UnexpectedRecordTag,
         decode(
@@ -621,7 +624,11 @@ test "HISTORY encodes newest first and restores complete history" {
         partial.pages.totalPages(),
     );
     try std.testing.expectEqual(
-        @as(u21, 'C'),
+        screen_first,
+        partial.pages.getTopLeft(.screen).node,
+    );
+    try std.testing.expectEqual(
+        screen_first_codepoint,
         partial.pages.getTopLeft(.screen).node
             .page().getRowAndCell(0, 0).cell.codepoint(),
     );
