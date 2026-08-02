@@ -363,6 +363,16 @@ pub const MemoryPool = struct {
     }
 };
 
+/// Reason the latest history generation was invalidated.
+///
+/// This is deliberately independent from page generations: a history cursor
+/// needs to distinguish terminal lifecycle events from ordinary page pruning.
+pub const HistoryInvalidation = enum {
+    none,
+    reset,
+    resize,
+    stale,
+};
 /// The memory pool we get page nodes, pages from.
 pool: MemoryPool,
 
@@ -398,16 +408,6 @@ page_serial_epoch: u64,
 /// Monotonic invalidation token for commands which explicitly discard
 /// scrollback or reset the complete page list.
 history_generation: u64 = 0,
-/// Reason the latest history generation was invalidated.
-///
-/// This is deliberately independent from page generations: a history cursor
-/// needs to distinguish terminal lifecycle events from ordinary page pruning.
-pub const HistoryInvalidation = enum {
-    none,
-    reset,
-    resize,
-    stale,
-};
 
 history_invalidation: HistoryInvalidation = .none,
 
