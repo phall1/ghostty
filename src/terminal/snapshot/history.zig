@@ -352,12 +352,16 @@ pub const HistoryCursor = struct {
     }
 };
 
+const PageSliceEncodeError = Allocator.Error ||
+    page.EncodeError ||
+    TerminalPage.CloneFromError;
+
 fn encodePageSlice(
     alloc: Allocator,
     source: *const TerminalPage,
     row_start: usize,
     row_end: usize,
-) !std.Io.Writer.Allocating {
+) PageSliceEncodeError!std.Io.Writer.Allocating {
     std.debug.assert(row_start < row_end);
     std.debug.assert(row_end <= source.size.rows);
 
@@ -369,9 +373,9 @@ fn encodePageSlice(
     if (row_start == 0 and row_end == source.size.rows) {
         try page.encode(source, &stream);
     } else {
-        var sliced = try TerminalPage.init(
+        var sliced = TerminalPage.init(
             source.exactRowCapacity(row_start, row_end),
-        );
+        ) catch return error.OutOfMemory;
         defer sliced.deinit();
         sliced.size.rows = @intCast(row_end - row_start);
         try sliced.cloneFrom(source, row_start, row_end);
