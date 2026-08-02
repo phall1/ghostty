@@ -201,6 +201,10 @@ class Runtime {
     return value;
   }
 
+  unlimitedScrollback(terminal) {
+    assert.equal(this.e.ghostty_terminal_set(terminal, 27, 0), SUCCESS);
+  }
+
   gridText(terminal, tag, y, length) {
     const point = this.rawStruct("GhosttyPoint");
     const ref = this.struct("GhosttyGridRef");
@@ -633,6 +637,8 @@ function historyTransfer(rt, source, destination, checkpointOwner) {
       importerHandle, destination, unit, written, options.ptr, imported.ptr),
     SUCCESS);
     assert.equal(rt.getUsize(imported, "consumed"), written);
+    assert.equal(rt.view().getUint8(
+      imported.ptr + rt.field(imported.name, "retained")), 1);
     ++unitCount;
     rt.write(destination, new TextEncoder().encode(
       `\x1b[32mlive-pty-${unitCount}\x1b[0m\r\n`));
@@ -740,6 +746,7 @@ rt.dispose(buildInfo);
 rt.dispose(capabilities);
 
 const source = rt.terminal();
+rt.unlimitedScrollback(source);
 let sourceText = "";
 for (let index = 0; index < 2000; ++index) {
   sourceText += `row-${String(index).padStart(4, "0")}\r\n`;
@@ -856,6 +863,12 @@ const parserSuffix = "mparser-continuation-replayed\x1b[0m\r\n";
 rt.write(source, parserSuffix);
 rt.write(decodedTerminal, parserSuffix);
 const historyDestination = rt.terminal();
+rt.unlimitedScrollback(historyDestination);
+const sourceHistoryRows = rt.terminalUsize(source, 15);
+assert.ok(sourceHistoryRows > 1000);
+assert.equal(rt.gridText(source, 3, 0, 8), "row-0000");
+assert.equal(rt.gridText(
+  source, 3, sourceHistoryRows - 1, 8), "row-1993");
 const checkpointOwner = { value: null };
 historyTransfer(rt, source, historyDestination, checkpointOwner);
 assert.ok(checkpointOwner.value.some((byte) => byte !== 0));
