@@ -4,9 +4,10 @@
 //! before that checkpoint's record header. This binds record order and detects
 //! omitted or duplicated records in ways that independent record CRCs cannot.
 //!
-//! READY covers the envelope, TERMINAL, all SCREEN/PAGE sequences, and the
-//! required CONTINUATION record. FINISH covers that same prefix plus the
-//! complete READY record and all HISTORY/PAGE sequences. Neither digest includes
+//! READY covers the envelope, TERMINAL, and all SCREEN/PAGE sequences. Version
+//! 2 additionally covers its required CONTINUATION record before READY. FINISH
+//! covers that version-specific prefix plus the complete READY record and all
+//! HISTORY/PAGE sequences. Neither digest includes
 //! its own record. FINISH terminates one snapshot; bytes after it belong to the
 //! containing transport.
 //!

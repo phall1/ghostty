@@ -18,15 +18,45 @@ const TerminalPageList = @import("../PageList.zig");
 const TerminalScreen = @import("../Screen.zig");
 const TerminalScreenKey = @import("../ScreenSet.zig").Key;
 
-const test_complete_fixture = test_fixture.parse(
+const test_complete_v1_fixture = test_fixture.parse(
     @embedFile("testdata/complete-v1.hex"),
+);
+const test_complete_v2_fixture = test_fixture.parse(
+    @embedFile("testdata/complete-v2.hex"),
 );
 
 const test_encode_options: EncodeOptions = .{ .continuation = .ground };
 const test_decode_options: DecodeOptions = .{ .max_continuation_bytes = 1024 };
 
+pub const Version = envelope.Version;
+
 /// Re-export continuation to make it a bit more ergonomic to reference.
 pub const Continuation = continuation.Value;
+
+/// Immutable feature metadata for the complete snapshot codec. Feature booleans
+/// describe the default encoded format; decoding support is version-dispatched.
+pub const Capabilities = struct {
+    /// Inclusive envelope-version decode bounds.
+    min_decode_version: Version,
+    max_decode_version: Version,
+
+    /// Version emitted by `encode`.
+    default_encode_version: Version,
+
+    /// Features present in `default_encode_version`.
+    continuation: bool,
+    ready: bool,
+    history: bool,
+};
+
+pub const capabilities: Capabilities = .{
+    .min_decode_version = envelope.min_decode_version,
+    .max_decode_version = envelope.max_decode_version,
+    .default_encode_version = envelope.default_encode_version,
+    .continuation = true,
+    .ready = true,
+    .history = true,
+};
 
 /// Errors possible while encoding one complete terminal snapshot.
 pub const EncodeError = terminal.EncodeError ||
@@ -39,7 +69,7 @@ pub const EncodeOptions = struct {
     continuation: Continuation,
 };
 
-/// Encode one complete terminal snapshot.
+/// Encode one complete terminal snapshot using `capabilities.default_encode_version`.
 ///
 /// Encoding starts at the destination's current position. Only one record
 /// payload is buffered at a time; completed records stream immediately. On
@@ -51,15 +81,41 @@ pub fn encode(
     t: *const Terminal,
     options: EncodeOptions,
 ) EncodeError!void {
-    // Continuation errors must not emit even the snapshot envelope.
-    try continuation.validate(options.continuation);
+    return encodeVersion(
+        alloc,
+        destination,
+        t,
+        options,
+        capabilities.default_encode_version,
+    );
+}
+
+/// Version-selectable encoder kept private so public encoding has one
+/// unambiguous compatibility policy. Tests use v1 to freeze its legacy bytes.
+fn encodeVersion(
+    alloc: Allocator,
+    destination: *std.Io.Writer,
+    t: *const Terminal,
+    options: EncodeOptions,
+    version: Version,
+) EncodeError!void {
+    switch (version) {
+        .v1 => switch (options.continuation) {
+            .ground => {},
+            .bytes => unreachable,
+        },
+        .v2 => {
+            // Continuation errors must not emit even the snapshot envelope.
+            try continuation.validate(options.continuation);
+        },
+    }
+    // All version-specific input validation must precede the envelope.
 
     var stream: record.Writer = .init(alloc, destination);
     defer stream.deinit();
 
     // 1. Envelope
-    try envelope.encode(stream.writer());
-
+    try envelope.encodeVersion(stream.writer(), version);
     // 2. Terminal
     try terminal.encode(t, &stream);
 
@@ -75,8 +131,9 @@ pub fn encode(
         &stream,
     );
 
-    // 4. Standard Stream continuation.
-    try continuation.encode(options.continuation, &stream);
+    // 4. Version 2 adds standard Stream continuation before READY. Version 1
+    // proceeds directly to READY and therefore always restores at ground.
+    if (version == .v2) try continuation.encode(options.continuation, &stream);
 
     // 5. Ready checkpoint.
     try checkpoint.encode(.ready, &stream);
@@ -148,6 +205,9 @@ pub const Decoded = struct {
     /// TerminalStream.
     terminal: ?Terminal,
 
+    /// Format version selected by the decoded envelope.
+    version: Version,
+
     /// For decoded results, nonempty bytes are allocator-owned and remain
     /// valid until `deinit`. Ground needs no replay. Bytes must be replayed
     /// exactly once after the Terminal has reached its final address.
@@ -195,8 +255,8 @@ pub fn decode(
     var stream: record.StreamReader = .init(source);
     const reader = stream.reader();
 
-    // Read the envelope, which is currently just a verification step.
-    try envelope.decode(reader);
+    // Version dispatch completes before TERMINAL performs its first allocation.
+    const version = try envelope.decode(reader);
 
     // TERMINAL establishes terminal-wide state and allocates empty screen
     // slots with their final routing. SCREEN values replace those slots in
@@ -253,20 +313,24 @@ pub fn decode(
         );
     }
 
-    // CONTINUATION is required after every active screen. Nonempty bytes are
-    // owned locally until the complete snapshot validates.
-    const decoded_continuation = try continuation.decode(
-        alloc,
-        reader,
-        options.max_continuation_bytes,
-    );
+    // Version 1 proceeds directly to READY and explicitly restores a ground
+    // stream. Version 2 requires CONTINUATION before READY. Keeping this switch
+    // here prevents either record order from being reinterpreted as the other.
+    const decoded_continuation: Continuation = switch (version) {
+        .v1 => .ground,
+        .v2 => try continuation.decode(
+            alloc,
+            reader,
+            options.max_continuation_bytes,
+        ),
+    };
     errdefer switch (decoded_continuation) {
         .ground => {},
         .bytes => |bytes| alloc.free(bytes),
     };
 
-    // READY covers the exact envelope-through-CONTINUATION prefix. Finalizing
-    // does not consume the hasher, so the stream continues toward FINISH.
+    // READY covers the exact version-specific prefix: through the active
+    // SCREEN/PAGE sequences in v1, and through CONTINUATION in v2.
     try checkpoint.decode(.ready, &stream);
 
     // HISTORY keys make this sequence order-independent just like SCREEN.
@@ -309,6 +373,7 @@ pub fn decode(
     for (keys) |key| result.screens.generations.put(key, 0);
     return .{
         .terminal = result,
+        .version = version,
         .continuation = decoded_continuation,
     };
 }
@@ -429,9 +494,9 @@ test "complete snapshot round trip with history and alternate screen" {
     try testing.expectEqualDeep(source_memory, primary.pages.memoryStats());
     try test_fixture.expectEqual(
         .snapshot,
-        "src/terminal/snapshot/testdata/complete-v1.hex",
-        "snapshot_fixture-complete-v1.hex",
-        &test_complete_fixture,
+        "src/terminal/snapshot/testdata/complete-v2.hex",
+        "snapshot_fixture-complete-v2.hex",
+        &test_complete_v2_fixture,
         encoded.written(),
     );
 
@@ -445,12 +510,12 @@ test "complete snapshot round trip with history and alternate screen" {
     );
     try encode(testing.allocator, &hashing.writer, &t, test_encode_options);
     try testing.expectEqual(
-        @as(u64, test_complete_fixture.len),
+        @as(u64, test_complete_v2_fixture.len),
         discard.fullCount(),
     );
     var expected_digest: checkpoint.Digest = undefined;
     std.crypto.hash.Blake3.hash(
-        &test_complete_fixture,
+        &test_complete_v2_fixture,
         &expected_digest,
         .{},
     );
@@ -459,7 +524,7 @@ test "complete snapshot round trip with history and alternate screen" {
     try testing.expectEqual(expected_digest, actual_digest);
 
     // Restore the checked-in reference rather than the just-generated bytes.
-    var encoded_source: std.Io.Reader = .fixed(&test_complete_fixture);
+    var encoded_source: std.Io.Reader = .fixed(&test_complete_v2_fixture);
     var source_buffer: [1]u8 = undefined;
     var limited = encoded_source.limited(.unlimited, &source_buffer);
     var restored = try decode(
@@ -469,6 +534,7 @@ test "complete snapshot round trip with history and alternate screen" {
         test_decode_options,
     );
     defer restored.deinit(testing.allocator);
+    try testing.expectEqual(Version.v2, restored.version);
     const restored_terminal = &restored.terminal.?;
 
     try testing.expectEqual(
@@ -503,7 +569,7 @@ test "complete snapshot round trip with history and alternate screen" {
         test_encode_options,
     );
     try testing.expectEqualStrings(
-        &test_complete_fixture,
+        &test_complete_v2_fixture,
         reencoded.written(),
     );
 
@@ -556,7 +622,83 @@ test "complete snapshot round trip with history and alternate screen" {
     );
 }
 
-test "complete snapshot restores a canonical Stream continuation" {
+test "v1 decode is ground-compatible and default re-encoding upgrades to v2" {
+    const testing = std.testing;
+
+    var source: std.Io.Reader = .fixed(&test_complete_v1_fixture);
+    var decoded = try decode(
+        testing.allocator,
+        testing.io,
+        &source,
+        .{ .max_continuation_bytes = 0 },
+    );
+    defer decoded.deinit(testing.allocator);
+
+    try testing.expectEqual(Version.v1, decoded.version);
+    switch (decoded.continuation) {
+        .ground => {},
+        .bytes => return error.TestUnexpectedResult,
+    }
+
+    // The private version-selectable path freezes the original v1 grammar and
+    // bytes. Public encoding deliberately has no legacy-version ambiguity.
+    var frozen_v1: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer frozen_v1.deinit();
+    try encodeVersion(
+        testing.allocator,
+        &frozen_v1.writer,
+        &decoded.terminal.?,
+        test_encode_options,
+        .v1,
+    );
+    try test_fixture.expectEqual(
+        .snapshot,
+        "src/terminal/snapshot/testdata/complete-v1.hex",
+        "snapshot_fixture-complete-v1.hex",
+        &test_complete_v1_fixture,
+        frozen_v1.written(),
+    );
+
+    var upgraded: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer upgraded.deinit();
+    try encode(
+        testing.allocator,
+        &upgraded.writer,
+        &decoded.terminal.?,
+        test_encode_options,
+    );
+    try test_fixture.expectEqual(
+        .snapshot,
+        "src/terminal/snapshot/testdata/complete-v2.hex",
+        "snapshot_fixture-complete-v2-upgrade.hex",
+        &test_complete_v2_fixture,
+        upgraded.written(),
+    );
+}
+
+test "unknown version is rejected before record allocation" {
+    const testing = std.testing;
+
+    var unknown = test_complete_v2_fixture;
+    std.mem.writeInt(u16, unknown[8..10], 3, .little);
+    var source: std.Io.Reader = .fixed(&unknown);
+    var failing = testing.FailingAllocator.init(testing.allocator, .{
+        .fail_index = 0,
+    });
+    try testing.expectError(
+        error.UnsupportedVersion,
+        decode(
+            failing.allocator(),
+            testing.io,
+            &source,
+            test_decode_options,
+        ),
+    );
+    try testing.expectEqual(@as(usize, 0), failing.alloc_index);
+    try testing.expectEqual(@as(usize, envelope.encoded_len), source.seek);
+}
+
+test "v2 restores a split continuation before immediate PTY bytes" {
     const testing = std.testing;
 
     var source_terminal = try Terminal.init(
@@ -592,6 +734,7 @@ test "complete snapshot restores a canonical Stream continuation" {
         .{ .max_continuation_bytes = 1024 },
     );
     defer decoded.deinit(testing.allocator);
+    try testing.expectEqual(Version.v2, decoded.version);
     try testing.expectEqualStrings(
         exported.buffered(),
         decoded.continuation.bytes,
@@ -973,8 +1116,8 @@ test "complete snapshot rejects ordering and invalid checkpoints" {
     defer t.deinit(testing.allocator);
     const primary = t.screens.get(.primary).?;
 
-    // Old version-1 snapshots proceeded directly from SCREEN to READY. READY
-    // is individually valid here, but CONTINUATION is now required first.
+    // A v2 envelope cannot reinterpret v1's direct SCREEN-to-READY order.
+    // READY is individually valid here, but v2 requires CONTINUATION first.
     var old_order: std.Io.Writer.Allocating = .init(testing.allocator);
     defer old_order.deinit();
     var old_order_stream: record.Writer = .init(
@@ -1315,8 +1458,9 @@ test "complete snapshot decode allocation failures are transactional" {
         }
     };
 
-    // The complete golden exercises Terminal, both screens, and history.
-    try S.exercise(&test_complete_fixture);
+    // Both complete goldens exercise Terminal, both screens, and history.
+    try S.exercise(&test_complete_v1_fixture);
+    try S.exercise(&test_complete_v2_fixture);
 
     // A non-ground component additionally exercises owned continuation bytes.
     var t = try Terminal.init(

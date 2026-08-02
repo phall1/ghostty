@@ -5,7 +5,7 @@
 //! it. Screen contents, cursors, and history are encoded by `screen.zig` and
 //! `history.zig`.
 //!
-//! Snapshot version 1 supports the primary screen and an optional alternate
+//! Snapshot versions 1 and 2 support the primary screen and an optional alternate
 //! screen. `screen_count` is therefore one or two. SCREEN records identify
 //! their destination by key and may appear in either order. Canonical encoders
 //! write primary first, then alternate when present. `active_screen_key` must

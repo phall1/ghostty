@@ -11,18 +11,20 @@
 //! then complete history.
 //!
 //! READY denotes that enough authenticated state is present to render the
-//! terminal and reconstruct its unfinished standard Stream state. The current
-//! synchronous decoder still returns only after FINISH. A caller moves the
-//! Terminal into final storage, replays CONTINUATION once, and only then applies
-//! PTY bytes belonging after the snapshot cut.
+//! terminal. Version 1 restores the standard Stream at ground. Version 2 also
+//! authenticates the Stream CONTINUATION before READY, so a caller can replay
+//! it once after moving the Terminal into final storage and then immediately
+//! apply PTY bytes belonging after the snapshot cut.
 //!
 //! After READY, we send history pages (scrollback).
 //!
 //! ## Snapshot Format
 //!
-//! This documents snapshot format 1. Version 1 is the work-in-progress
-//! format that we intended to continue to break until we can promise
-//! binary compatibility.
+//! Versions 1 and 2 are frozen compatibility boundaries. Public encoding emits
+//! version 2. Decoding dispatches the complete record order from the envelope:
+//! v1 remains the pre-continuation display/ground format, while v2 adds the
+//! continuation required for immediate safe PTY resumption. Any future layout,
+//! tag, or record-semantic change requires another version.
 //!
 //! A snapshot is one envelope followed by a sequence of records. The envelope
 //! occurs once at byte zero. Every record is independently framed as a fixed
@@ -53,7 +55,7 @@
 //! | SCREEN * terminal.screen_count         |
 //! | PAGE * each screen.page_count          |
 //! +----------------------------------------+
-//! | CONTINUATION                           |
+//! | CONTINUATION (version 2 only)          |
 //! +----------------------------------------+
 //! | READY                                  |
 //! +----------------------------------------+
@@ -73,14 +75,14 @@
 //! is zero. FINISH terminates the snapshot. Bytes after FINISH belong to the
 //! containing transport and are not consumed by snapshot decoding.
 //!
-//! CONTINUATION contains the bytes required to bring the terminal's
-//! VT parser/stream up to the same state, or no bytes if it should be
-//! in the ground state.
+//! In version 2, CONTINUATION contains the bytes required to bring the
+//! VT parser/stream up to the same state, or no bytes if it should be in the
+//! ground state. Version 1 has no CONTINUATION record and restores ground.
 //!
 //! READY and FINISH contain BLAKE3-256 digests of all preceding snapshot bytes.
-//! READY therefore validates the renderable active state and continuation.
-//! FINISH covers READY and all history as well, validating the complete snapshot
-//! and its record ordering. Each SCREEN declares its complete logical history
+//! READY therefore validates through active SCREEN/PAGE in v1 and through
+//! CONTINUATION in v2. FINISH covers READY, all history, and the complete
+//! version-specific record order. Each SCREEN declares its complete logical
 //! extent, allowing a client to size its scrollbar at READY even though older
 //! PAGE records arrive afterward.
 //!
@@ -149,6 +151,9 @@ const codec = @import("snapshot.zig");
 pub const EncodeError = codec.EncodeError;
 pub const DecodeError = codec.DecodeError;
 pub const DecodeExactError = codec.DecodeExactError;
+pub const Version = codec.Version;
+pub const Capabilities = codec.Capabilities;
+pub const capabilities = codec.capabilities;
 pub const Continuation = codec.Continuation;
 pub const EncodeOptions = codec.EncodeOptions;
 pub const DecodeOptions = codec.DecodeOptions;

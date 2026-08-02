@@ -2,7 +2,7 @@
 # Kaitai type: continuation_record
 # Kaitai params:
 # Kaitai offset: 0
-# Wire version: 1
+# Wire version: 2
 
 # Incomplete supported DCS payload.
 07 00 07 00 00 00 63 ae 0a 1d 1b 50 71 64 61 74 61

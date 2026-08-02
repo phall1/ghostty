@@ -7,6 +7,7 @@
 #ifndef GHOSTTY_VT_SNAPSHOT_H
 #define GHOSTTY_VT_SNAPSHOT_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <ghostty/vt/allocator.h>
@@ -25,14 +26,48 @@ extern "C" {
  * expose incremental READY/history delivery; callers receive or provide one
  * complete snapshot blob.
  *
- * The snapshot wire format is currently unstable. A decoder may reject a blob
- * produced by an incompatible libghostty-vt version with
- * `GHOSTTY_INVALID_VALUE`.
+ * Snapshot versions 1 and 2 are frozen compatibility boundaries. This codec
+ * decodes both and emits version 2 by default. A decoder may reject a blob
+ * produced with an unknown version using `GHOSTTY_INVALID_VALUE`.
  *
  * Snapshot calls are not thread safe with terminal mutation. The caller must
  * pause and serialize VT writes while encoding a terminal.
  *
  * @{ */
+
+/**
+ * Immutable compatibility and feature metadata for the complete snapshot
+ * codec.
+ *
+ * Before calling ghostty_terminal_snapshot_capabilities(), set `size` to
+ * `sizeof(GhosttyTerminalSnapshotCapabilities)`. The decode bounds are
+ * inclusive. Feature booleans describe the format emitted by
+ * `default_encode_version`; older decoded versions may omit a feature.
+ */
+typedef struct {
+    size_t size;
+    /** Lowest accepted envelope version, inclusive. */
+    uint16_t min_decode_version;
+    /** Highest accepted envelope version, inclusive. */
+    uint16_t max_decode_version;
+    /** Envelope version emitted by the whole-blob encoder. */
+    uint16_t default_encode_version;
+    /** Default encoding includes CONTINUATION before READY. */
+    bool continuation;
+    /** Default encoding exposes an authenticated READY boundary. */
+    bool ready;
+    /** Default encoding includes HISTORY/PAGE after READY. */
+    bool history;
+} GhosttyTerminalSnapshotCapabilities;
+
+/**
+ * Return immutable codec compatibility and feature metadata.
+ *
+ * `out_capabilities` must be non-NULL and its `size` must be at least
+ * `sizeof(GhosttyTerminalSnapshotCapabilities)`.
+ */
+GHOSTTY_API GhosttyResult ghostty_terminal_snapshot_capabilities(
+    GhosttyTerminalSnapshotCapabilities* out_capabilities);
 
 /**
  * Allocator-owned bytes for one complete encoded terminal snapshot.
@@ -72,7 +107,7 @@ typedef struct {
 
 /**
  * Encode a terminal and its live VT stream continuation as one complete
- * allocator-owned snapshot.
+ * allocator-owned version 2 snapshot.
  *
  * `allocator` may be NULL to use the library default. `terminal` and
  * `out_snapshot` must be non-NULL, and `out_snapshot->size` must be at least
@@ -95,9 +130,10 @@ GHOSTTY_API GhosttyResult ghostty_terminal_snapshot_encode(
  * must be at least `sizeof(GhosttyTerminalSnapshotDecodeResult)`.
  *
  * The operation is transactional: no terminal is published until every record
- * through FINISH has validated and the canonical stream continuation has been
- * replayed exactly once at the terminal's final address. Trailing bytes are
- * allowed and are reported via `out_result->consumed`.
+ * through FINISH has validated. Version 1 explicitly restores a ground stream;
+ * version 2 replays its canonical continuation exactly once at the terminal's
+ * final address. Trailing bytes are allowed and are reported via
+ * `out_result->consumed`.
  *
  * Returns `GHOSTTY_SUCCESS` on success, `GHOSTTY_OUT_OF_MEMORY` if allocation
  * fails, or `GHOSTTY_INVALID_VALUE` for malformed, truncated, unsupported, or

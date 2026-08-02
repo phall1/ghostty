@@ -5,12 +5,14 @@ meta:
   license: MIT
   endian: le
 doc: |
-  Ghostty terminal snapshot format version 1.
+  Ghostty terminal snapshot formats version 1 and 2.
 
-  A complete snapshot contains an envelope, terminal-wide state, one or two
-  renderable screen sequences, one raw standard-Stream CONTINUATION, a READY
-  checkpoint, matching history sequences, and a FINISH checkpoint. SCREEN pages
-  are oldest-to-newest. HISTORY pages are newest-to-oldest. FINISH terminates the
+  Both versions contain an envelope, terminal-wide state, one or two renderable
+  screen sequences, a READY checkpoint, matching history sequences, and a
+  FINISH checkpoint. Version 2 inserts one raw standard-Stream CONTINUATION
+  immediately before READY; version 1 proceeds directly from its last active
+  PAGE to READY and restores the stream at ground. SCREEN pages are
+  oldest-to-newest. HISTORY pages are newest-to-oldest. FINISH terminates the
   snapshot; bytes that follow belong to the containing transport and are outside
   this schema. Each SCREEN declares its complete logical history extent before
   READY.
@@ -29,6 +31,7 @@ seq:
     repeat-expr: terminal.payload.header.screen_count
   - id: continuation
     type: continuation_record
+    if: envelope.version == 2
   - id: ready
     type: checkpoint_record(5)
   - id: histories
@@ -156,7 +159,9 @@ types:
         contents: [0x47, 0x48, 0x4f, 0x53, 0x54, 0x53, 0x4e, 0x50]
       - id: version
         type: u2
-        valid: 1
+        valid:
+          min: 1
+          max: 2
 
   record_header:
     doc: |
@@ -208,8 +213,9 @@ types:
 
   continuation_record:
     doc: |
-      Raw canonical standard TerminalStream continuation bytes. An empty
-      payload explicitly represents ground state.
+      Version 2 raw canonical standard TerminalStream continuation bytes. An
+      empty payload explicitly represents ground state. Version 1 has no such
+      record and is ground by definition.
     seq:
       - id: header
         type: record_header(7)

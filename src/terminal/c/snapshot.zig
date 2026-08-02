@@ -26,11 +26,46 @@ pub const DecodeResult = extern struct {
     consumed: usize,
 };
 
+/// Immutable complete-snapshot codec compatibility and feature metadata.
+///
+/// C: GhosttyTerminalSnapshotCapabilities
+pub const Capabilities = extern struct {
+    size: usize,
+    min_decode_version: u16,
+    max_decode_version: u16,
+    default_encode_version: u16,
+    continuation: bool,
+    ready: bool,
+    history: bool,
+};
+
 fn mapError(err: anyerror) Result {
     return switch (err) {
         error.OutOfMemory, error.WriteFailed => .out_of_memory,
         else => .invalid_value,
     };
+}
+
+/// Return immutable complete-snapshot codec capabilities.
+pub fn capabilities(
+    out_: ?*Capabilities,
+) callconv(lib.calling_conv) Result {
+    const out = out_ orelse return .invalid_value;
+    if (out.size < @sizeOf(Capabilities)) return .invalid_value;
+
+    out.min_decode_version = @intFromEnum(
+        snapshot_codec.capabilities.min_decode_version,
+    );
+    out.max_decode_version = @intFromEnum(
+        snapshot_codec.capabilities.max_decode_version,
+    );
+    out.default_encode_version = @intFromEnum(
+        snapshot_codec.capabilities.default_encode_version,
+    );
+    out.continuation = snapshot_codec.capabilities.continuation;
+    out.ready = snapshot_codec.capabilities.ready;
+    out.history = snapshot_codec.capabilities.history;
+    return .success;
 }
 
 /// Encode the terminal and its live standard-stream continuation into one
@@ -141,7 +176,11 @@ fn testEncode(terminal: terminal_c.Terminal) !Encoded {
         &result,
     ));
     try testing.expect(result.data != null);
-    try testing.expect(result.len > 0);
+    try testing.expect(result.len >= snapshot_codec.envelope.encoded_len);
+    try testing.expectEqual(
+        @as(u16, @intFromEnum(snapshot_codec.capabilities.default_encode_version)),
+        std.mem.readInt(u16, result.data.?[8..10], .little),
+    );
     return result;
 }
 
@@ -179,6 +218,29 @@ fn expectEquivalent(a: terminal_c.Terminal, b: terminal_c.Terminal) !void {
         a_encoded.data.?[0..a_encoded.len],
         b_encoded.data.?[0..b_encoded.len],
     );
+}
+
+test "snapshot C API exposes immutable codec capabilities" {
+    var result: Capabilities = .{
+        .size = @sizeOf(Capabilities),
+        .min_decode_version = 0,
+        .max_decode_version = 0,
+        .default_encode_version = 0,
+        .continuation = false,
+        .ready = false,
+        .history = false,
+    };
+    try testing.expectEqual(Result.success, capabilities(&result));
+    try testing.expectEqual(@as(u16, 1), result.min_decode_version);
+    try testing.expectEqual(@as(u16, 2), result.max_decode_version);
+    try testing.expectEqual(@as(u16, 2), result.default_encode_version);
+    try testing.expect(result.continuation);
+    try testing.expect(result.ready);
+    try testing.expect(result.history);
+
+    result.size -= 1;
+    try testing.expectEqual(Result.invalid_value, capabilities(&result));
+    try testing.expectEqual(Result.invalid_value, capabilities(null));
 }
 
 test "snapshot C API ground-state round trip restores usable terminal" {

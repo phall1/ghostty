@@ -9,8 +9,8 @@ To turn an annotated fixture into a binary suitable for the Kaitai Web IDE:
 
     src/terminal/snapshot/verify-kaitai.py \
         --write-binary \
-        src/terminal/snapshot/testdata/complete-v1.hex \
-        /tmp/complete-v1.bin
+        src/terminal/snapshot/testdata/complete-v2.hex \
+        /tmp/complete-v2.bin
 
 Then load `snapshot.ksy` and the generated binary into
 https://ide.kaitai.io/.
@@ -189,12 +189,24 @@ def validate_record(record: Any, data: bytes, offset: int) -> int:
 
 
 def all_snapshot_records(snapshot: Any) -> list[Any]:
-    """Return complete-snapshot records in their authenticated wire order."""
+    """Return complete-snapshot records in version-authenticated wire order."""
     records = [snapshot.terminal]
     for sequence in snapshot.screens:
         records.append(sequence.screen)
         records.extend(sequence.pages)
-    records.append(snapshot.continuation)
+
+    version = snapshot.envelope.version
+    continuation = getattr(snapshot, "continuation", None)
+    if version == 1:
+        if continuation is not None:
+            raise ValueError("version 1 unexpectedly contains CONTINUATION")
+    elif version == 2:
+        if continuation is None:
+            raise ValueError("version 2 is missing CONTINUATION")
+        records.append(continuation)
+    else:
+        raise ValueError(f"unsupported complete snapshot version {version}")
+
     records.append(snapshot.ready)
     for sequence in snapshot.histories:
         records.append(sequence.history)

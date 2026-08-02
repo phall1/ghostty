@@ -2,7 +2,7 @@
 # Kaitai type: continuation_record
 # Kaitai params:
 # Kaitai offset: 0
-# Wire version: 1
+# Wire version: 2
 
-# Bare ESC leaves the VT parser unfinished.
-07 00 01 00 00 00 1c d9 1d 17 1b
+# Incomplete title OSC.
+07 00 09 00 00 00 39 7d 6e 08 1b 5d 32 3b 74 69 74 6c 65

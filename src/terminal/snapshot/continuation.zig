@@ -1,6 +1,6 @@
-//! Standard TerminalStream continuation snapshot record.
+//! Version 2 standard TerminalStream continuation snapshot record.
 //!
-//! CONTINUATION uses the common record header without an inner payload
+//! Version 1 has no CONTINUATION. In version 2 it uses the common record header
 //! structure. A zero-length payload is an explicit ground-state assertion.
 //! A nonempty payload is the exact canonical replay-safe byte suffix exported
 //! by TerminalStream.writeContinuation.
@@ -101,13 +101,13 @@ pub fn decode(
     return .{ .bytes = bytes };
 }
 
-const test_ground_fixture = test_fixture.parse(@embedFile("testdata/continuation-ground-v1.hex"));
-const test_utf8_fixture = test_fixture.parse(@embedFile("testdata/continuation-utf8-v1.hex"));
-const test_esc_fixture = test_fixture.parse(@embedFile("testdata/continuation-esc-v1.hex"));
-const test_csi_fixture = test_fixture.parse(@embedFile("testdata/continuation-csi-v1.hex"));
-const test_osc_fixture = test_fixture.parse(@embedFile("testdata/continuation-osc-v1.hex"));
-const test_dcs_fixture = test_fixture.parse(@embedFile("testdata/continuation-dcs-v1.hex"));
-const test_apc_fixture = test_fixture.parse(@embedFile("testdata/continuation-apc-v1.hex"));
+const test_ground_fixture = test_fixture.parse(@embedFile("testdata/continuation-ground-v2.hex"));
+const test_utf8_fixture = test_fixture.parse(@embedFile("testdata/continuation-utf8-v2.hex"));
+const test_esc_fixture = test_fixture.parse(@embedFile("testdata/continuation-esc-v2.hex"));
+const test_csi_fixture = test_fixture.parse(@embedFile("testdata/continuation-csi-v2.hex"));
+const test_osc_fixture = test_fixture.parse(@embedFile("testdata/continuation-osc-v2.hex"));
+const test_dcs_fixture = test_fixture.parse(@embedFile("testdata/continuation-dcs-v2.hex"));
+const test_apc_fixture = test_fixture.parse(@embedFile("testdata/continuation-apc-v2.hex"));
 
 test "continuation golden records" {
     const Golden = struct {
@@ -118,44 +118,44 @@ test "continuation golden records" {
     };
     const values = [_]Golden{
         .{
-            .path = "src/terminal/snapshot/testdata/continuation-ground-v1.hex",
-            .candidate = "snapshot_fixture-continuation-ground-v1.hex",
+            .path = "src/terminal/snapshot/testdata/continuation-ground-v2.hex",
+            .candidate = "snapshot_fixture-continuation-ground-v2.hex",
             .value = .ground,
             .expected = &test_ground_fixture,
         },
         .{
-            .path = "src/terminal/snapshot/testdata/continuation-utf8-v1.hex",
-            .candidate = "snapshot_fixture-continuation-utf8-v1.hex",
+            .path = "src/terminal/snapshot/testdata/continuation-utf8-v2.hex",
+            .candidate = "snapshot_fixture-continuation-utf8-v2.hex",
             .value = .{ .bytes = "\xF0\x9F\x98" },
             .expected = &test_utf8_fixture,
         },
         .{
-            .path = "src/terminal/snapshot/testdata/continuation-esc-v1.hex",
-            .candidate = "snapshot_fixture-continuation-esc-v1.hex",
+            .path = "src/terminal/snapshot/testdata/continuation-esc-v2.hex",
+            .candidate = "snapshot_fixture-continuation-esc-v2.hex",
             .value = .{ .bytes = "\x1b" },
             .expected = &test_esc_fixture,
         },
         .{
-            .path = "src/terminal/snapshot/testdata/continuation-csi-v1.hex",
-            .candidate = "snapshot_fixture-continuation-csi-v1.hex",
+            .path = "src/terminal/snapshot/testdata/continuation-csi-v2.hex",
+            .candidate = "snapshot_fixture-continuation-csi-v2.hex",
             .value = .{ .bytes = "\x1b[31" },
             .expected = &test_csi_fixture,
         },
         .{
-            .path = "src/terminal/snapshot/testdata/continuation-osc-v1.hex",
-            .candidate = "snapshot_fixture-continuation-osc-v1.hex",
+            .path = "src/terminal/snapshot/testdata/continuation-osc-v2.hex",
+            .candidate = "snapshot_fixture-continuation-osc-v2.hex",
             .value = .{ .bytes = "\x1b]2;title" },
             .expected = &test_osc_fixture,
         },
         .{
-            .path = "src/terminal/snapshot/testdata/continuation-dcs-v1.hex",
-            .candidate = "snapshot_fixture-continuation-dcs-v1.hex",
+            .path = "src/terminal/snapshot/testdata/continuation-dcs-v2.hex",
+            .candidate = "snapshot_fixture-continuation-dcs-v2.hex",
             .value = .{ .bytes = "\x1bPqdata" },
             .expected = &test_dcs_fixture,
         },
         .{
-            .path = "src/terminal/snapshot/testdata/continuation-apc-v1.hex",
-            .candidate = "snapshot_fixture-continuation-apc-v1.hex",
+            .path = "src/terminal/snapshot/testdata/continuation-apc-v2.hex",
+            .candidate = "snapshot_fixture-continuation-apc-v2.hex",
             .value = .{ .bytes = "\x1b_Gdata" },
             .expected = &test_apc_fixture,
         },

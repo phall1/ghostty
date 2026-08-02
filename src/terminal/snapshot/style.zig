@@ -43,7 +43,7 @@
 //! |         4 | Dotted  |
 //! |         5 | Dashed  |
 //!
-//! Underline values 6 and 7 are invalid in snapshot version 1.
+//! Underline values 6 and 7 are invalid in snapshot versions 1 and 2.
 
 const std = @import("std");
 const test_fixture = @import("fixture.zig");
@@ -82,13 +82,13 @@ const ColorKind = enum(u8) {
 
 /// Errors possible while decoding one style entry.
 pub const DecodeError = std.Io.Reader.Error || error{
-    /// A color kind is not defined by snapshot version 1.
+    /// A color kind is not defined by snapshot versions 1 or 2.
     InvalidColorKind,
 
     /// Bytes unused by the selected color kind are not zero.
     InvalidColor,
 
-    /// The encoded underline kind is not defined by snapshot version 1.
+    /// The encoded underline kind is not defined by snapshot versions 1 or 2.
     InvalidUnderline,
 
     /// One or more reserved style flag bits are set.

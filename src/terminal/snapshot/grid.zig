@@ -38,7 +38,7 @@
 //! |     1 | Prompt              |
 //! |     2 | Prompt continuation |
 //!
-//! Value 3 is not emitted in snapshot version 1. Decoders treat it as none.
+//! Value 3 is not emitted in snapshot versions 1 or 2. Decoders treat it as none.
 //!
 //! Native row cache flags are not encoded. In particular, the Kitty virtual
 //! placeholder hint is derived while decoding cells containing U+10EEEE.
@@ -97,7 +97,7 @@
 //! |     1 | Input   |
 //! |     2 | Prompt  |
 //!
-//! Value 3 is not emitted in snapshot version 1. Decoders treat it as output.
+//! Value 3 is not emitted in snapshot versions 1 or 2. Decoders treat it as output.
 //!
 //! Style and hyperlink ID zero mean no style and no hyperlink. Other IDs
 //! refer to entries in the containing record's separate style and hyperlink

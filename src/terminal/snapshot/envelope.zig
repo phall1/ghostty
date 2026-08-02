@@ -24,9 +24,16 @@ const io = @import("io.zig");
 /// any record decoding begins. All eight bytes are part of the wire value.
 pub const magic = "GHOSTSNP";
 
-/// The complete compatibility boundary for snapshot layout and behavior.
-/// Version 1 readers require this value to match exactly.
-pub const version: u16 = 1;
+/// Supported snapshot format versions. Every layout or record-semantic change
+/// requires a new value; decoders dispatch the complete record order by this.
+pub const Version = enum(u16) {
+    v1 = 1,
+    v2 = 2,
+};
+
+pub const min_decode_version: Version = .v1;
+pub const max_decode_version: Version = .v2;
+pub const default_encode_version: Version = .v2;
 
 /// Number of bytes in the fixed envelope: magic followed by version.
 pub const encoded_len = computeLen();
@@ -41,20 +48,30 @@ pub const DecodeError = std.Io.Reader.Error || error{
     UnsupportedVersion,
 };
 
-/// Encode the envelope.
+/// Encode the envelope using the default format version.
 pub fn encode(writer: *std.Io.Writer) std.Io.Writer.Error!void {
-    try writer.writeAll(magic);
-    try io.writeInt(writer, u16, version);
+    return encodeVersion(writer, default_encode_version);
 }
 
-/// Decode and validate the envelope.
-pub fn decode(reader: *std.Io.Reader) DecodeError!void {
+/// Encode the envelope for an explicitly selected supported format version.
+pub fn encodeVersion(
+    writer: *std.Io.Writer,
+    version: Version,
+) std.Io.Writer.Error!void {
+    try writer.writeAll(magic);
+    try io.writeInt(writer, u16, @intFromEnum(version));
+}
+
+/// Decode and validate the envelope, returning the version that governs every
+/// following record. This completes before record or page allocation begins.
+pub fn decode(reader: *std.Io.Reader) DecodeError!Version {
     var actual_magic: [magic.len]u8 = undefined;
     try reader.readSliceAll(&actual_magic);
     if (!std.mem.eql(u8, magic, &actual_magic)) return error.InvalidMagic;
 
     const actual_version = try io.readInt(reader, u16);
-    if (actual_version != version) return error.UnsupportedVersion;
+    return std.enums.fromInt(Version, actual_version) orelse
+        error.UnsupportedVersion;
 }
 
 fn computeLen() usize {
@@ -66,39 +83,45 @@ fn computeLen() usize {
     }
 }
 
-const test_golden_fixture = test_fixture.parse(@embedFile("testdata/envelope-v1.hex"));
+const test_v1_fixture = test_fixture.parse(@embedFile("testdata/envelope-v1.hex"));
+const test_v2_fixture = test_fixture.parse(@embedFile("testdata/envelope-v2.hex"));
 
-test "golden encoding" {
+test "golden encodings and supported decoding" {
     var buf: [encoded_len]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
     try encode(&writer);
 
     try test_fixture.expectEqual(
         .bytes,
-        "src/terminal/snapshot/testdata/envelope-v1.hex",
-        "snapshot_fixture-envelope-v1.hex",
-        &test_golden_fixture,
+        "src/terminal/snapshot/testdata/envelope-v2.hex",
+        "snapshot_fixture-envelope-v2.hex",
+        &test_v2_fixture,
         writer.buffered(),
     );
 
-    var reader: std.Io.Reader = .fixed(&test_golden_fixture);
-    try decode(&reader);
+    var v1_reader: std.Io.Reader = .fixed(&test_v1_fixture);
+    try std.testing.expectEqual(Version.v1, try decode(&v1_reader));
+
+    var v2_reader: std.Io.Reader = .fixed(&test_v2_fixture);
+    try std.testing.expectEqual(Version.v2, try decode(&v2_reader));
 }
 
-test "reject invalid magic and version" {
-    var invalid_magic: std.Io.Reader = .fixed("GHOSTSNX\x01\x00");
+test "reject invalid magic and unknown versions" {
+    var invalid_magic: std.Io.Reader = .fixed("GHOSTSNX\x02\x00");
     try std.testing.expectError(error.InvalidMagic, decode(&invalid_magic));
 
-    var invalid_version: std.Io.Reader = .fixed("GHOSTSNP\x00\x00");
-    try std.testing.expectError(
-        error.UnsupportedVersion,
-        decode(&invalid_version),
-    );
+    for ([_]u16{ 0, 3, std.math.maxInt(u16) }) |version| {
+        var bytes: [encoded_len]u8 = undefined;
+        @memcpy(bytes[0..magic.len], magic);
+        std.mem.writeInt(u16, bytes[magic.len..][0..2], version, .little);
+        var reader: std.Io.Reader = .fixed(&bytes);
+        try std.testing.expectError(error.UnsupportedVersion, decode(&reader));
+    }
 }
 
 test "reject every truncation" {
     for (0..encoded_len) |len| {
-        var reader: std.Io.Reader = .fixed(test_golden_fixture[0..len]);
+        var reader: std.Io.Reader = .fixed(test_v2_fixture[0..len]);
         try std.testing.expectError(error.EndOfStream, decode(&reader));
     }
 }

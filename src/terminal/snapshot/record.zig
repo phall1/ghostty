@@ -33,8 +33,8 @@ pub const PrefixDigest = [Blake3.digest_length]u8;
 /// parameter set after its iSCSI use.
 pub const Crc32c = std.hash.crc.Crc32Iscsi;
 
-/// Identifies the layout and meaning of a record payload.
-/// The current snapshot version rejects every value not listed here.
+/// Identifies the layout and meaning of a record payload. Version-dispatched
+/// sequence decoding rejects tags that are invalid at a given position.
 pub const Tag = enum(u16) {
     /// Terminal-wide live state and configuration.
     terminal = 1,
@@ -54,7 +54,7 @@ pub const Tag = enum(u16) {
     /// Digest validating the complete snapshot blob.
     finish = 6,
 
-    /// Canonical unfinished standard TerminalStream input.
+    /// Canonical unfinished standard TerminalStream input (version 2).
     continuation = 7,
 };
 

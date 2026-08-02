@@ -216,6 +216,7 @@ pub const selection_gesture_event_set = selection_gesture.event_set;
 pub const terminal_grid_ref = terminal.grid_ref;
 pub const terminal_grid_ref_track = terminal.grid_ref_track;
 pub const terminal_point_from_grid_ref = terminal.point_from_grid_ref;
+pub const terminal_snapshot_capabilities = snapshot.capabilities;
 pub const terminal_snapshot_encode = snapshot.encode;
 pub const terminal_snapshot_decode = snapshot.decode;
 
