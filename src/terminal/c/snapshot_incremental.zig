@@ -177,7 +177,7 @@ pub const HistoryImportEvent = extern struct {
 
 const codec_identity = "ghostty.snapshot.v1-v2.incremental.v1";
 const build_options = @import("terminal_options");
-const wasm_host_entropy = builtin.target.cpu.arch.isWasm() and
+const wasm_host_entropy = builtin.target.cpu.arch == .wasm32 and
     builtin.os.tag == .freestanding;
 const authenticated_history = builtin.os.tag != .freestanding or
     wasm_host_entropy;
@@ -255,6 +255,7 @@ fn mapError(err: anyerror) Status {
         error.RecordLimitExceeded,
         error.PageLimitExceeded,
         error.ChunkLimitExceeded,
+        error.AuthenticatedBytesLimitExceeded,
         error.LeaseLimitExceeded,
         error.LeaseGenerationExhausted,
         => .limit_exceeded,

@@ -607,6 +607,7 @@ pub const ImportError = Allocator.Error ||
     TerminalPageList.PageAllocation.FinalizeError ||
     error{
         ChunkLimitExceeded,
+        AuthenticatedBytesLimitExceeded,
         InvalidHistoryUnit,
         InvalidHandle,
         UnexpectedHistoryUnit,
@@ -804,7 +805,6 @@ pub const HistoryImporter = struct {
         }
 
         const payload = unit[UnitHeader.len..];
-        state.authenticated_bytes += payload.len;
         const expected_authenticator = unit_header.authenticate(
             state.secret,
             payload,
@@ -814,6 +814,11 @@ pub const HistoryImporter = struct {
             expected_authenticator,
             unit_header.authenticator,
         )) return error.InvalidHistoryUnit;
+        const authenticated_bytes = std.math.add(
+            usize,
+            state.authenticated_bytes,
+            payload.len,
+        ) catch return error.AuthenticatedBytesLimitExceeded;
 
         var source: std.Io.Reader = .fixed(payload);
         var decoder: page.Decoder = undefined;
@@ -829,6 +834,7 @@ pub const HistoryImporter = struct {
         try decoder.decode(allocation.page(), terminal_screen.alloc);
         const contains_prompt = hasSemanticPrompt(allocation.page());
         const retained = try state.import.prepend(&allocation);
+        state.authenticated_bytes = authenticated_bytes;
         state.imported_prompt = state.imported_prompt or
             (retained and contains_prompt);
         state.chunks += 1;
@@ -1978,13 +1984,19 @@ test "history cursor pages newest first within strict budgets" {
     var corrupt = try testing.allocator.dupe(u8, units[0]);
     defer testing.allocator.free(corrupt);
     corrupt[corrupt.len - 1] ^= 1;
-    try testing.expectError(
-        error.InvalidHistoryUnit,
-        importer.prepend(
-            &destination,
-            corrupt,
-            .{ .bytes = corrupt.len, .rows = 1 },
-        ),
+    for (0..1024) |_| {
+        try testing.expectError(
+            error.InvalidHistoryUnit,
+            importer.prepend(
+                &destination,
+                corrupt,
+                .{ .bytes = corrupt.len, .rows = 1 },
+            ),
+        );
+    }
+    try testing.expectEqual(
+        @as(usize, 0),
+        importer.authenticatedBytes(&destination),
     );
     try testing.expectEqual(rejected_pages, destination_screen.pages.totalPages());
 

@@ -192,6 +192,43 @@ class Runtime {
     this.e.ghostty_terminal_vt_write(terminal, ptr, bytes.length);
     this.free(ptr, bytes.length);
   }
+
+  terminalUsize(terminal, data) {
+    const out = this.alloc(4);
+    assert.equal(this.e.ghostty_terminal_get(terminal, data, out), SUCCESS);
+    const value = this.view().getUint32(out, true);
+    this.free(out, 4);
+    return value;
+  }
+
+  gridText(terminal, tag, y, length) {
+    const point = this.rawStruct("GhosttyPoint");
+    const ref = this.struct("GhosttyGridRef");
+    const codepoint = this.alloc(4);
+    const written = this.alloc(4);
+    const coordinate = point.ptr + this.field(point.name, "value");
+    this.view().setInt32(
+      point.ptr + this.field(point.name, "tag"), tag, true);
+    this.view().setUint32(
+      coordinate + this.field("GhosttyPointCoordinate", "y"), y, true);
+    let result = "";
+    for (let x = 0; x < length; ++x) {
+      this.view().setUint16(
+        coordinate + this.field("GhosttyPointCoordinate", "x"), x, true);
+      assert.equal(this.e.ghostty_terminal_grid_ref(
+        terminal, point.ptr, ref.ptr), SUCCESS);
+      this.view().setUint32(written, 0, true);
+      assert.equal(this.e.ghostty_grid_ref_graphemes(
+        ref.ptr, codepoint, 1, written), SUCCESS);
+      assert.equal(this.view().getUint32(written, true), 1);
+      result += String.fromCodePoint(this.view().getUint32(codepoint, true));
+    }
+    this.free(written, 4);
+    this.free(codepoint, 4);
+    this.dispose(ref);
+    this.dispose(point);
+    return result;
+  }
 }
 
 function captureOptions(rt, maxRecordBytes = 4 * 1024 * 1024) {
@@ -217,12 +254,12 @@ function historyOptions(rt) {
   return options;
 }
 
-function captureAll(rt, terminal) {
+function captureAll(rt, terminal, allocator = 0) {
   const options = captureOptions(rt);
   const slot = rt.alloc(4);
   rt.view().setUint32(slot, 0, true);
   assert.equal(rt.e.ghostty_terminal_snapshot_capture_new(
-    0, terminal, options.ptr, slot), SUCCESS);
+    allocator, terminal, options.ptr, slot), SUCCESS);
   const capture = rt.view().getUint32(slot, true);
   assert.notEqual(capture, 0);
   const records = [];
@@ -254,6 +291,10 @@ function captureAll(rt, terminal) {
       bytes: Uint8Array.from(rt.u8().subarray(buffer, buffer + required)),
       kind,
       offset,
+      index: rt.getUsize(exact, "index"),
+      count: rt.getUsize(exact, "count"),
+      screenKey: rt.view().getUint16(
+        exact.ptr + rt.field(exact.name, "screen_key"), true),
     });
     offset += required;
     rt.free(buffer, required);
@@ -306,7 +347,7 @@ function wasmSection(id, payload) {
   return [id, ...uleb(payload.length), ...payload];
 }
 
-function failAllocatorModuleBytes() {
+function allocatorProxyModuleBytes() {
   const i32 = 0x7f;
   const type = (parameters, result) => [
     0x60, ...uleb(parameters), ...Array(parameters).fill(i32),
@@ -315,11 +356,23 @@ function failAllocatorModuleBytes() {
   const types = [
     ...uleb(3), ...type(4, true), ...type(6, true), ...type(5, false),
   ];
-  const functions = [...uleb(4), 0, 1, 1, 2];
-  const exportEntry = (name, index) => {
-    const bytes = new TextEncoder().encode(name);
-    return [...uleb(bytes.length), ...bytes, 0, ...uleb(index)];
+  const string = (value) => {
+    const bytes = new TextEncoder().encode(value);
+    return [...uleb(bytes.length), ...bytes];
   };
+  const importEntry = (name, typeIndex) => [
+    ...string("host"), ...string(name), 0, ...uleb(typeIndex),
+  ];
+  const imports = [
+    ...uleb(4),
+    ...importEntry("alloc", 0),
+    ...importEntry("resize", 1),
+    ...importEntry("remap", 1),
+    ...importEntry("free", 2),
+  ];
+  const exportEntry = (name, index) => [
+    ...string(name), 0, ...uleb(index),
+  ];
   const exports = [
     ...uleb(4),
     ...exportEntry("alloc", 0),
@@ -327,35 +380,59 @@ function failAllocatorModuleBytes() {
     ...exportEntry("remap", 2),
     ...exportEntry("free", 3),
   ];
-  const body = (instructions) => {
-    const code = [0, ...instructions, 0x0b];
-    return [...uleb(code.length), ...code];
-  };
-  const code = [
-    ...uleb(4),
-    ...body([0x41, 0]),
-    ...body([0x41, 0]),
-    ...body([0x41, 0]),
-    ...body([]),
-  ];
   return new Uint8Array([
     0, 0x61, 0x73, 0x6d, 1, 0, 0, 0,
     ...wasmSection(1, types),
-    ...wasmSection(3, functions),
+    ...wasmSection(2, imports),
     ...wasmSection(7, exports),
-    ...wasmSection(10, code),
   ]);
 }
 
-async function makeFailAllocator(rt) {
-  const helper = await WebAssembly.instantiate(failAllocatorModuleBytes());
+async function makeTrackingAllocator(rt) {
+  const state = {
+    calls: { alloc: 0, resize: 0, remap: 0, free: 0 },
+    allocations: new Map(),
+    failAfter: Number.POSITIVE_INFINITY,
+    invalidFree: false,
+  };
+  const host = {
+    alloc(_ctx, len) {
+      ++state.calls.alloc;
+      if (state.calls.alloc > state.failAfter) return 0;
+      const ptr = rt.e.ghostty_alloc(0, len >>> 0);
+      if (ptr !== 0) state.allocations.set(ptr >>> 0, len >>> 0);
+      return ptr;
+    },
+    resize() {
+      ++state.calls.resize;
+      return 0;
+    },
+    remap() {
+      ++state.calls.remap;
+      return 0;
+    },
+    free(_ctx, memory, memoryLen) {
+      ++state.calls.free;
+      memory >>>= 0;
+      memoryLen >>>= 0;
+      if (state.allocations.get(memory) !== memoryLen) {
+        state.invalidFree = true;
+        return;
+      }
+      state.allocations.delete(memory);
+      rt.e.ghostty_free(0, memory, memoryLen);
+    },
+  };
+  const helper = await WebAssembly.instantiate(
+    allocatorProxyModuleBytes(), { host });
   const table = Object.values(rt.e).find(
     (value) => value instanceof WebAssembly.Table,
   );
   assert.ok(table, "standalone wasm must export its indirect function table");
   const base = table.grow(4);
   const functions = ["alloc", "resize", "remap", "free"];
-  functions.forEach((name, index) => table.set(base + index, helper.instance.exports[name]));
+  functions.forEach((name, index) =>
+    table.set(base + index, helper.instance.exports[name]));
   const context = rt.alloc(1);
   const vtable = rt.rawStruct("GhosttyAllocatorVtable");
   functions.forEach((name, index) => rt.view().setUint32(
@@ -365,7 +442,16 @@ async function makeFailAllocator(rt) {
   rt.setPtr(allocator, "vtable", vtable.ptr);
   return {
     ptr: allocator.ptr,
+    state,
+    reset(failAfter = Number.POSITIVE_INFINITY) {
+      state.calls = { alloc: 0, resize: 0, remap: 0, free: 0 };
+      state.failAfter = failAfter;
+      state.invalidFree = false;
+      assert.equal(state.allocations.size, 0);
+    },
     dispose() {
+      assert.equal(state.allocations.size, 0);
+      assert.equal(state.invalidFree, false);
       rt.dispose(allocator);
       rt.dispose(vtable);
       rt.free(context, 1);
@@ -508,10 +594,12 @@ function historyTransfer(rt, source, destination, checkpointOwner) {
     const imported = rt.struct("GhosttyTerminalHistoryImportEvent");
     if (!corrupted) {
       rt.u8()[unit + written - 1] ^= 0x40;
-      assert.equal(rt.e.ghostty_terminal_history_importer_push(
-        importerHandle, destination, unit, written, options.ptr, imported.ptr),
-      CORRUPTION);
-      assert.equal(rt.getUsize(imported, "consumed"), 0);
+      for (let attempt = 0; attempt < 1024; ++attempt) {
+        assert.equal(rt.e.ghostty_terminal_history_importer_push(
+          importerHandle, destination, unit, written, options.ptr, imported.ptr),
+        CORRUPTION);
+        assert.equal(rt.getUsize(imported, "consumed"), 0);
+      }
       rt.u8()[unit + written - 1] ^= 0x40;
       corrupted = true;
     }
@@ -545,6 +633,11 @@ function historyTransfer(rt, source, destination, checkpointOwner) {
   assert.equal(rt.e.ghostty_terminal_history_importer_commit(
     importerHandle, destination), SUCCESS);
   rt.e.ghostty_terminal_history_importer_free(importerHandle);
+  assert.ok(rt.terminalUsize(destination, 15) > 0);
+  assert.equal(rt.gridText(destination, 3, 0, 8), "row-0000");
+  const liveText = `live-pty-${unitCount}`;
+  assert.equal(rt.gridText(
+    destination, 0, Math.min(unitCount - 1, 6), liveText.length), liveText);
 
   const aborted = rt.struct("GhosttyTerminalHistoryImporterResult");
   assert.equal(rt.e.ghostty_terminal_history_importer_new(
@@ -634,29 +727,55 @@ rt.dispose(capabilities);
 
 const source = rt.terminal();
 let sourceText = "";
-for (let index = 0; index < 200; ++index) {
-  sourceText += `row-${String(index).padStart(3, "0")}\r\n`;
+for (let index = 0; index < 2000; ++index) {
+  sourceText += `row-${String(index).padStart(4, "0")}\r\n`;
 }
 rt.write(source, sourceText);
+assert.ok(rt.terminalUsize(source, 15) > 1000);
 exerciseCaptureLimit(rt, source);
-rt.write(source, "\x1b[31");
+const trackingAllocator = await makeTrackingAllocator(rt);
+trackingAllocator.reset();
+const allocatorCapture = captureAll(rt, source, trackingAllocator.ptr);
+assert.ok(allocatorCapture.records.some(
+  (record) => record.kind === CAPTURE_HISTORY_PAGE));
+for (const callback of ["alloc", "resize", "remap", "free"]) {
+  assert.ok(trackingAllocator.state.calls[callback] > 0, callback);
+}
+assert.equal(trackingAllocator.state.allocations.size, 0);
+assert.equal(trackingAllocator.state.invalidFree, false);
 
-const failAllocator = await makeFailAllocator(rt);
+trackingAllocator.reset(1);
 const oomOptions = captureOptions(rt);
 const oomSlot = rt.alloc(4);
 rt.view().setUint32(oomSlot, 0, true);
 assert.equal(rt.e.ghostty_terminal_snapshot_capture_new(
-  failAllocator.ptr, source, oomOptions.ptr, oomSlot), OUT_OF_MEMORY);
+  trackingAllocator.ptr, source, oomOptions.ptr, oomSlot), OUT_OF_MEMORY);
 assert.equal(rt.view().getUint32(oomSlot, true), 0);
-failAllocator.dispose();
+assert.ok(trackingAllocator.state.calls.alloc >= 2);
+assert.ok(trackingAllocator.state.calls.free >= 1);
+assert.equal(trackingAllocator.state.allocations.size, 0);
+assert.equal(trackingAllocator.state.invalidFree, false);
+trackingAllocator.dispose();
 rt.free(oomSlot, 4);
 rt.dispose(oomOptions);
+rt.write(source, "\x1b[31");
 
 const captured = captureAll(rt, source);
 assert.ok(captured.records.some((record) => record.kind === CAPTURE_RECORD));
 assert.ok(captured.records.some((record) => record.kind === CAPTURE_READY));
-assert.ok(captured.records.some((record) => record.kind === CAPTURE_HISTORY_BEGIN));
-assert.ok(captured.records.some((record) => record.kind === CAPTURE_HISTORY_PAGE));
+const historyBegin = captured.records.find(
+  (record) => record.kind === CAPTURE_HISTORY_BEGIN &&
+    record.screenKey === 0 && record.count > 0);
+assert.ok(historyBegin, "capture must expose nonempty primary history");
+const historyPages = captured.records.filter(
+  (record) => record.kind === CAPTURE_HISTORY_PAGE &&
+    record.screenKey === historyBegin.screenKey);
+assert.equal(historyPages.length, historyBegin.count);
+historyPages.forEach((record, index) => {
+  assert.equal(record.index, index);
+  assert.equal(record.count, historyBegin.count);
+  assert.ok(record.bytes.length > 0);
+});
 assert.equal(captured.records.at(-1).kind, CAPTURE_FINISH);
 const finishOffset = captured.records.find(
   (record) => record.kind === CAPTURE_FINISH).offset;
