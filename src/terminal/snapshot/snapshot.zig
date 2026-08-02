@@ -60,6 +60,14 @@ fn testRecordOffset(
     unreachable;
 }
 
+fn framedRecordLen(payload_len: usize) error{RecordLimitExceeded}!usize {
+    return std.math.add(
+        usize,
+        record.Header.len,
+        payload_len,
+    ) catch error.RecordLimitExceeded;
+}
+
 pub const Version = envelope.Version;
 
 /// Re-export continuation to make it a bit more ergonomic to reference.
@@ -373,16 +381,19 @@ pub const Ready = struct {
     ) !void {
         const value = self.continuation orelse
             return error.ContinuationAlreadyReplayed;
-        self.continuation = null;
 
         switch (value) {
-            .ground => {},
+            .ground => self.continuation = null,
             .bytes => |bytes| {
+                // Allocation failure is retry-safe: ownership and Stream state
+                // remain untouched until verification storage exists.
+                const verification = try self.alloc.alloc(u8, bytes.len);
+                defer self.alloc.free(verification);
+
+                self.continuation = null;
                 defer self.alloc.free(bytes);
                 stream.nextSlice(bytes);
 
-                const verification = try self.alloc.alloc(u8, bytes.len);
-                defer self.alloc.free(verification);
                 var writer: std.Io.Writer = .fixed(verification);
                 try stream.writeContinuation(&writer);
                 if (!std.mem.eql(u8, bytes, writer.buffered())) {
@@ -464,6 +475,9 @@ pub const Decoder = struct {
     screen_decoder: ?screen.Decoder = null,
     screen_seen: [2]bool = .{ false, false },
     history_seen: [2]bool = .{ false, false },
+    ready_screen_generation: [2]usize = .{ 0, 0 },
+    ready_history_generation: [2]u64 = .{ 0, 0 },
+    history_discarding: bool = false,
     history_remaining: usize = 0,
     history_decoder: ?history.Decoder = null,
     history_key: TerminalScreenKey = .primary,
@@ -561,7 +575,10 @@ pub const Decoder = struct {
                 self.fail();
                 return error.RecordLimitExceeded;
             }
-            self.expected_len = record.Header.len + payload_len;
+            self.expected_len = framedRecordLen(payload_len) catch {
+                self.fail();
+                return error.RecordLimitExceeded;
+            };
             if (self.buffer.items.len < self.expected_len) {
                 return .{ .consumed = consumed, .event = .need_input };
             }
@@ -581,8 +598,13 @@ pub const Decoder = struct {
         self: *Decoder,
         destination: *Terminal,
     ) error{ ReadyUnavailable, ReadyAlreadyTaken }!Ready {
-        if (!self.ready_available) return error.ReadyUnavailable;
         if (self.ready_taken) return error.ReadyAlreadyTaken;
+        if (!self.ready_available or
+            self.terminal_ == null or
+            self.decoded_continuation == null)
+        {
+            return error.ReadyUnavailable;
+        }
 
         destination.* = self.terminal_.?;
         self.terminal_ = null;
@@ -612,6 +634,7 @@ pub const Decoder = struct {
             .bytes => |bytes| self.alloc.free(bytes),
         };
         self.decoded_continuation = null;
+        self.ready_available = false;
         self.buffer.clearRetainingCapacity();
         self.state = .aborted;
     }
@@ -769,6 +792,17 @@ pub const Decoder = struct {
     ) DecodeError!DecodeEvent {
         if (self.version.? == .v1) self.decoded_continuation = .ground;
         try checkpoint.decodeExpected(.ready, source, self.prefixDigest());
+
+        const value = &self.terminal_.?;
+        for ([_]TerminalScreenKey{ .primary, .alternate }, 0..) |key, index| {
+            self.ready_screen_generation[index] =
+                value.screens.generation(key);
+            if (value.screens.get(key)) |restored| {
+                self.ready_history_generation[index] =
+                    restored.pages.historyGeneration();
+            }
+        }
+
         self.ready_available = true;
         self.state = .history;
         return .{ .ready = self.version.? };
@@ -786,18 +820,21 @@ pub const Decoder = struct {
             return error.PageLimitExceeded;
         }
 
-        const value = self.live_terminal.?;
-        const restored = value.screens.get(decoder.header.key) orelse
-            return error.UnexpectedHistoryKey;
         const index = keyIndex(decoder.header.key);
+        if (!self.screen_seen[index]) return error.UnexpectedHistoryKey;
         if (self.history_seen[index]) return error.DuplicateHistory;
         self.history_seen[index] = true;
+        self.history_discarding = !self.historySnapshotValid(index);
 
-        self.imports[index] = try .init(
-            &restored.pages,
-            self.alloc,
-            @as(usize, decoder.header.page_count),
-        );
+        if (!self.history_discarding) {
+            const restored =
+                self.live_terminal.?.screens.get(decoder.header.key).?;
+            self.imports[index] = try .init(
+                &restored.pages,
+                self.alloc,
+                @as(usize, decoder.header.page_count),
+            );
+        }
         self.history_decoder = decoder;
         self.history_key = decoder.header.key;
 
@@ -819,24 +856,32 @@ pub const Decoder = struct {
         source: *std.Io.Reader,
     ) DecodeError!DecodeEvent {
         var decoder = &self.history_decoder.?;
-        const value = self.live_terminal.?;
-        const restored = value.screens.get(self.history_key).?;
         const index = keyIndex(self.history_key);
+        self.refreshHistoryImport(index);
         const page_index = decoder.pages_decoded;
-        const result = try decoder.decodePage(
-            source,
-            self.alloc,
-            restored,
-            &self.imports[index].?,
-        );
-        self.imported_prompt[index] =
-            self.imported_prompt[index] or result.contains_prompt;
+        var retained = false;
+
+        if (self.history_discarding) {
+            try decoder.discardPage(source, self.alloc);
+        } else {
+            const restored =
+                self.live_terminal.?.screens.get(self.history_key).?;
+            const result = try decoder.decodePage(
+                source,
+                self.alloc,
+                restored,
+                &self.imports[index].?,
+            );
+            retained = result.retained;
+            self.imported_prompt[index] =
+                self.imported_prompt[index] or result.contains_prompt;
+        }
 
         const event: DecodeEvent = .{ .history_page = .{
             .key = self.history_key,
             .index = page_index,
             .count = decoder.header.page_count,
-            .retained = result.retained,
+            .retained = retained,
         } };
         if (!decoder.needsPage()) {
             self.history_decoder = null;
@@ -853,12 +898,14 @@ pub const Decoder = struct {
         try checkpoint.decodeExpected(.finish, source, self.prefixDigest());
         const value = self.live_terminal.?;
         for (&self.imports, 0..) |*entry, index| {
-            if (entry.*) |*import| import.commit();
+            if (!self.historySnapshotValid(index)) {
+                self.invalidateImport(index);
+            }
+            if (entry.*) |*import| {
+                if (import.isActive()) import.commit();
+            }
             if (self.imported_prompt[index]) {
-                const key: TerminalScreenKey = if (index == 0)
-                    .primary
-                else
-                    .alternate;
+                const key = keyForIndex(index);
                 if (value.screens.get(key)) |restored| {
                     restored.semantic_prompt.seen = true;
                 }
@@ -874,9 +921,51 @@ pub const Decoder = struct {
     }
 
     fn rollbackHistory(self: *Decoder) void {
-        for (&self.imports) |*entry| {
-            if (entry.*) |*value| value.rollback();
+        for (0..self.imports.len) |index| self.invalidateImport(index);
+    }
+
+    fn refreshHistoryImport(self: *Decoder, index: usize) void {
+        if (self.history_discarding) return;
+        if (self.historySnapshotValid(index)) return;
+        self.invalidateImport(index);
+        self.history_discarding = true;
+    }
+
+    fn invalidateImport(self: *Decoder, index: usize) void {
+        const entry = &self.imports[index];
+        if (entry.*) |*value| {
+            if (value.isActive()) {
+                if (self.screenStorageValid(index)) {
+                    value.rollback();
+                } else {
+                    value.abandon();
+                }
+            }
         }
+        self.imported_prompt[index] = false;
+    }
+
+    fn historySnapshotValid(self: *const Decoder, index: usize) bool {
+        if (!self.screenStorageValid(index)) return false;
+        const restored =
+            self.live_terminal.?.screens.get(keyForIndex(index)).?;
+        return restored.pages.historyGeneration() ==
+            self.ready_history_generation[index];
+    }
+
+    fn screenStorageValid(self: *const Decoder, index: usize) bool {
+        const value = self.live_terminal orelse return false;
+        const key = keyForIndex(index);
+        if (value.screens.generation(key) !=
+            self.ready_screen_generation[index])
+        {
+            return false;
+        }
+        return value.screens.get(key) != null;
+    }
+
+    fn keyForIndex(index: usize) TerminalScreenKey {
+        return if (index == 0) .primary else .alternate;
     }
 
     fn keyIndex(key: TerminalScreenKey) usize {
@@ -2393,6 +2482,166 @@ test "malformed and truncated post-READY history are isolated" {
     }
 }
 
+test "READY abort invalidates pending transfer" {
+    const testing = std.testing;
+    var decoder: Decoder = .init(
+        testing.allocator,
+        testing.io,
+        test_decode_options,
+    );
+    defer decoder.deinit();
+
+    var offset: usize = 0;
+    while (offset < test_complete_v2_fixture.len) {
+        const pushed = try decoder.push(test_complete_v2_fixture[offset..]);
+        offset += pushed.consumed;
+        if (std.meta.activeTag(pushed.event) != .ready) continue;
+
+        decoder.abort();
+        var destination: Terminal = undefined;
+        try testing.expectError(
+            error.ReadyUnavailable,
+            decoder.takeReady(&destination),
+        );
+        return;
+    }
+    return error.TestExpectedEqual;
+}
+
+test "continuation replay OOM is retry-safe" {
+    const testing = std.testing;
+    var terminal_value = try Terminal.init(
+        testing.io,
+        testing.allocator,
+        .{ .cols = 2, .rows = 1 },
+    );
+    defer terminal_value.deinit(testing.allocator);
+    var stream = TerminalStream.init(.{
+        .allocator = testing.allocator,
+        .handler = .init(&terminal_value),
+        .continuation_max_bytes = 1024,
+    });
+    defer stream.deinit();
+
+    var failing = testing.FailingAllocator.init(
+        testing.allocator,
+        .{ .fail_index = std.math.maxInt(usize) },
+    );
+    const bytes = try failing.allocator().dupe(u8, "\x1b[");
+    var ready: Ready = .{
+        .alloc = failing.allocator(),
+        .version = .v2,
+        .continuation = .{ .bytes = bytes },
+    };
+    defer ready.deinit();
+
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(error.OutOfMemory, ready.replay(&stream));
+    try testing.expect(ready.continuation != null);
+    var ground_buf: [1]u8 = undefined;
+    var ground_writer: std.Io.Writer = .fixed(&ground_buf);
+    try stream.writeContinuation(&ground_writer);
+    try testing.expectEqual(@as(usize, 0), ground_writer.end);
+
+    failing.fail_index = std.math.maxInt(usize);
+    try ready.replay(&stream);
+}
+
+test "live history clear and reset discard authenticated snapshot history" {
+    const testing = std.testing;
+    var decoder: Decoder = .init(
+        testing.allocator,
+        testing.io,
+        test_decode_options,
+    );
+    defer decoder.deinit();
+    var restored: Terminal = undefined;
+    var restored_owned = false;
+    defer if (restored_owned) restored.deinit(testing.allocator);
+    var ready: ?Ready = null;
+    defer if (ready) |*value| value.deinit();
+    var stream: ?TerminalStream = null;
+    defer if (stream) |*value| value.deinit();
+
+    var offset: usize = 0;
+    var pages_after_clear: usize = 0;
+    var discarded_pages: usize = 0;
+    var saw_finish = false;
+    while (offset < test_complete_v2_fixture.len) {
+        const pushed = try decoder.push(test_complete_v2_fixture[offset..]);
+        offset += pushed.consumed;
+        switch (pushed.event) {
+            .ready => {
+                ready = try decoder.takeReady(&restored);
+                restored_owned = true;
+                stream = TerminalStream.init(.{
+                    .allocator = testing.allocator,
+                    .handler = .init(&restored),
+                    .continuation_max_bytes = 1024,
+                });
+                try ready.?.replay(&stream.?);
+                stream.?.nextSlice("\x1b[3J\x1bc");
+                pages_after_clear =
+                    restored.screens.get(.primary).?.pages.totalPages();
+            },
+            .history_page => |event| {
+                if (event.key == .primary) {
+                    try testing.expect(!event.retained);
+                    discarded_pages += 1;
+                }
+            },
+            .finish => saw_finish = true,
+            else => {},
+        }
+    }
+
+    try testing.expect(discarded_pages >= 2);
+    try testing.expect(saw_finish);
+    try testing.expectEqual(
+        pages_after_clear,
+        restored.screens.get(.primary).?.pages.totalPages(),
+    );
+}
+
+test "alternate screen replacement abandons stale history import" {
+    const testing = std.testing;
+    var terminal_value = try Terminal.init(
+        testing.io,
+        testing.allocator,
+        .{ .cols = 2, .rows = 1 },
+    );
+    defer terminal_value.deinit(testing.allocator);
+    var stream = TerminalStream.init(.{
+        .allocator = testing.allocator,
+        .handler = .init(&terminal_value),
+        .continuation_max_bytes = 1024,
+    });
+    defer stream.deinit();
+    stream.nextSlice("\x1b[?1049h");
+
+    var decoder: Decoder = .init(
+        testing.allocator,
+        testing.io,
+        test_decode_options,
+    );
+    defer decoder.deinit();
+    decoder.live_terminal = &terminal_value;
+    decoder.ready_screen_generation[1] =
+        terminal_value.screens.generation(.alternate);
+    const alternate = terminal_value.screens.get(.alternate).?;
+    decoder.ready_history_generation[1] =
+        alternate.pages.historyGeneration();
+    decoder.imports[1] = try .init(
+        &alternate.pages,
+        testing.allocator,
+        0,
+    );
+
+    terminal_value.fullReset();
+    decoder.abort();
+    try testing.expect(!decoder.imports[1].?.isActive());
+}
+
 test "incremental decoder enforces caller bounds and one-record work" {
     const testing = std.testing;
 
@@ -2406,6 +2655,10 @@ test "incremental decoder enforces caller bounds and one-record work" {
     try testing.expectEqual(envelope.encoded_len, first.consumed);
     try testing.expect(std.meta.activeTag(first.event) == .progress);
     try testing.expectEqual(@as(usize, 0), decoder.buffer.items.len);
+    try testing.expectError(
+        error.RecordLimitExceeded,
+        framedRecordLen(std.math.maxInt(usize)),
+    );
 
     var record_limited: std.Io.Reader = .fixed(&test_complete_v2_fixture);
     try testing.expectError(

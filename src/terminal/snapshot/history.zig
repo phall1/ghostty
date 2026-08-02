@@ -289,6 +289,18 @@ pub const Decoder = struct {
             .contains_prompt = retained and contains_prompt,
         };
     }
+
+    /// Decode and authenticate one PAGE without publishing it.
+    pub fn discardPage(
+        self: *Decoder,
+        source: *std.Io.Reader,
+        alloc: Allocator,
+    ) RestoreError!void {
+        std.debug.assert(self.needsPage());
+        var discarded = try page.decode(source, alloc);
+        defer discarded.deinit();
+        self.pages_decoded += 1;
+    }
 };
 
 /// Restore one HISTORY and its declared PAGE records into a native Screen.

@@ -393,6 +393,10 @@ page_serial: u64,
 /// checked against the live list before its coordinates are used.
 page_serial_epoch: u64,
 
+/// Monotonic invalidation token for commands which explicitly discard
+/// scrollback or reset the complete page list.
+history_generation: u64 = 0,
+
 /// Byte size of the raw backing mappings owned by active page nodes. This is
 /// logical scrollback accounting and does not change while a mapping is
 /// decommitted. It excludes encoded storage and unused preheated pool items.
@@ -901,6 +905,10 @@ pub fn deinit(self: *PageList) void {
     self.pool.deinit();
 }
 
+pub fn historyGeneration(self: *const PageList) u64 {
+    return self.history_generation;
+}
+
 /// Reset the PageList back to an empty state. This is similar to
 /// deinit and reinit but it importantly preserves the pointer
 /// stability of tracked pins (they're moved to the top-left since
@@ -918,6 +926,7 @@ pub fn reset(self: *PageList) void {
     // Every old reference now has a serial below the epoch and can be rejected
     // in O(1), even if the node pool later reuses its pointer address.
     self.page_serial_epoch = self.page_serial;
+    self.history_generation +%= 1;
 
     // We need enough pages/nodes to keep our active area. This should
     // never fail since we by definition have allocated a page already
@@ -4347,6 +4356,7 @@ pub const HistoryImport = struct {
     destination: *PageList,
     alloc: Allocator,
     serials: []u64,
+    discarding: bool = false,
     count: usize = 0,
     active: bool = true,
 
@@ -4372,12 +4382,16 @@ pub const HistoryImport = struct {
         allocation: *PageAllocation,
     ) PageAllocation.FinalizeError!bool {
         assert(self.active);
+        if (self.discarding) return false;
         assert(self.count < self.serials.len);
         const serial = allocation.node.?.serial;
         allocation.finalize(.prepend) catch |err| switch (err) {
             error.MaxSizeExceeded,
             error.MaxLinesExceeded,
-            => return false,
+            => {
+                self.discarding = true;
+                return false;
+            },
             else => return err,
         };
         self.serials[self.count] = serial;
@@ -4389,6 +4403,16 @@ pub const HistoryImport = struct {
     pub fn commit(self: *HistoryImport) void {
         assert(self.active);
         self.active = false;
+    }
+
+    /// Stop rollback without touching the destination. This is only valid when
+    /// the owning ScreenSet generation proves the destination was destroyed.
+    pub fn abandon(self: *HistoryImport) void {
+        self.active = false;
+    }
+
+    pub fn isActive(self: *const HistoryImport) bool {
+        return self.active;
     }
 
     /// Remove surviving imported history without disturbing later live writes.
@@ -5431,6 +5455,7 @@ pub fn eraseHistory(
     self: *PageList,
     bl_pt: ?point.Point,
 ) void {
+    self.history_generation +%= 1;
     self.eraseRows(.{ .history = .{} }, bl_pt);
 }
 
@@ -7916,6 +7941,42 @@ test "PageList PageAllocation rejects limits before modifying the destination" {
     try testing.expectEqual(before_total_rows, result.total_rows);
     try testing.expectEqual(before_page_size, result.page_size);
     result.assertIntegrity();
+}
+
+test "PageList HistoryImport latches discard after a bounded rejection" {
+    const testing = std.testing;
+    var result = try init(testing.allocator, .{
+        .cols = 1,
+        .rows = 1,
+        .max_size = 0,
+        .max_lines = null,
+    });
+    defer result.deinit();
+
+    // Fill the effective one-page history allowance.
+    {
+        var allocation = try result.allocatePage(.{ .cols = 1, .rows = 1 });
+        defer allocation.deinit();
+        allocation.page().size.rows = 1;
+        try allocation.finalize(.prepend);
+    }
+
+    var import = try HistoryImport.init(&result, testing.allocator, 2);
+    defer import.deinit();
+    var rejected = try result.allocatePage(.{ .cols = 1, .rows = 1 });
+    defer rejected.deinit();
+    rejected.page().size.rows = 1;
+    try testing.expect(!try import.prepend(&rejected));
+    try testing.expect(import.discarding);
+
+    // Older pages are decoded into detached storage but never finalized once a
+    // newer page was omitted, even if later capacity policy were to change.
+    result.limits.set(.bytes, null);
+    var older = try result.allocatePage(.{ .cols = 1, .rows = 1 });
+    defer older.deinit();
+    older.page().size.rows = 1;
+    try testing.expect(!try import.prepend(&older));
+    try testing.expect(older.node != null);
 }
 
 test "PageList PageAllocation allocation failure leaves list unchanged" {
