@@ -398,6 +398,18 @@ page_serial_epoch: u64,
 /// Monotonic invalidation token for commands which explicitly discard
 /// scrollback or reset the complete page list.
 history_generation: u64 = 0,
+/// Reason the latest history generation was invalidated.
+///
+/// This is deliberately independent from page generations: a history cursor
+/// needs to distinguish terminal lifecycle events from ordinary page pruning.
+pub const HistoryInvalidation = enum {
+    none,
+    reset,
+    resize,
+    stale,
+};
+
+history_invalidation: HistoryInvalidation = .none,
 
 /// Byte size of the raw backing mappings owned by active page nodes. This is
 /// logical scrollback accounting and does not change while a mapping is
@@ -911,6 +923,10 @@ pub fn historyGeneration(self: *const PageList) u64 {
     return self.history_generation;
 }
 
+pub fn historyInvalidation(self: *const PageList) HistoryInvalidation {
+    return self.history_invalidation;
+}
+
 /// Reset the PageList back to an empty state. This is similar to
 /// deinit and reinit but it importantly preserves the pointer
 /// stability of tracked pins (they're moved to the top-left since
@@ -929,6 +945,7 @@ pub fn reset(self: *PageList) void {
     // in O(1), even if the node pool later reuses its pointer address.
     self.page_serial_epoch = self.page_serial;
     self.history_generation +%= 1;
+    self.history_invalidation = .reset;
 
     // We need enough pages/nodes to keep our active area. This should
     // never fail since we by definition have allocated a page already
@@ -1269,6 +1286,7 @@ pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
     if (cols_changed or rows_changed) {
         self.discardSnapshotHistoryImport();
         self.history_generation +%= 1;
+        self.history_invalidation = .resize;
     }
 
     // Resizing (especially with reflow) can cause our row offset to
@@ -5508,6 +5526,7 @@ pub fn eraseHistory(
     bl_pt: ?point.Point,
 ) void {
     self.history_generation +%= 1;
+    self.history_invalidation = .stale;
     self.eraseRows(.{ .history = .{} }, bl_pt);
 }
 

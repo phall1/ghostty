@@ -67,6 +67,488 @@ const TerminalPage = @import("../page.zig").Page;
 const TerminalPageList = @import("../PageList.zig");
 const TerminalScreen = @import("../Screen.zig");
 const TerminalScreenKey = @import("../ScreenSet.zig").Key;
+const Terminal = @import("../Terminal.zig");
+
+/// A caller-provided upper bound for one incremental history operation.
+pub const Budget = struct {
+    bytes: usize,
+    rows: usize,
+};
+
+/// Result of requesting the next engine-owned history unit.
+pub const NextResult = union(enum) {
+    /// The checkpoint contains no more history.
+    end,
+    /// At least one budget dimension is zero. The cursor did not advance.
+    zero_budget,
+    /// One row cannot fit within the byte budget. The cursor did not advance.
+    too_small: struct {
+        minimum_bytes: usize,
+    },
+    /// One complete PAGE record was emitted.
+    chunk: struct {
+        bytes: usize,
+        rows: usize,
+        page_complete: bool,
+    },
+};
+
+pub const CursorError = Allocator.Error ||
+    page.EncodeError ||
+    TerminalPage.CloneFromError ||
+    std.Io.Writer.Error ||
+    error{
+        Stale,
+        Pruned,
+        WrongTerminal,
+        WrongGeneration,
+        Reset,
+        Resize,
+    };
+
+/// Stable identity for one captured history cut.
+///
+/// Fields intentionally remain private. Callers can compare checkpoints but
+/// cannot infer native page layout or addresses from them.
+pub const HistoryCheckpoint = struct {
+    screen_generation: usize,
+    history_generation: u64,
+    newest_serial: u64,
+    oldest_serial: u64,
+
+    pub fn eql(a: HistoryCheckpoint, b: HistoryCheckpoint) bool {
+        return std.meta.eql(a, b);
+    }
+};
+
+/// Engine-owned lease over one screen's complete historical prefix.
+///
+/// The current page and oldest checkpoint boundary are tracked independently.
+/// This is constant-sized state: it never retains or clones the full history.
+/// A lease must be deinitialized before its Terminal unless that screen
+/// generation has already been removed.
+pub const HistoryLease = struct {
+    terminal: *Terminal,
+    key: TerminalScreenKey,
+    checkpoint_: HistoryCheckpoint,
+    current: ?*TerminalPageList.Pin,
+    boundary: ?*TerminalPageList.Pin,
+    current_serial: u64,
+    boundary_serial: u64,
+    pages_inspected: usize = 0,
+    cursor_taken: bool = false,
+    active: bool = true,
+
+    pub const InitError = Allocator.Error || error{ScreenUnavailable};
+
+    pub fn init(
+        terminal_: *Terminal,
+        key: TerminalScreenKey,
+    ) InitError!HistoryLease {
+        const terminal_screen = terminal_.screens.get(key) orelse
+            return error.ScreenUnavailable;
+        const current_node = terminal_screen.pages.getTopLeft(.active).node.prev;
+        const current_serial = if (current_node) |node| node.serial else 0;
+        const oldest_node = if (current_node != null)
+            terminal_screen.pages.getTopLeft(.screen).node
+        else
+            null;
+        const oldest_serial = if (oldest_node) |node| node.serial else 0;
+
+        var current: ?*TerminalPageList.Pin = null;
+        errdefer if (current) |pin_| terminal_screen.pages.untrackPin(pin_);
+        if (current_node) |node| {
+            current = try terminal_screen.pages.trackPin(.{
+                .node = node,
+                .y = node.rows() - 1,
+            });
+        }
+
+        var boundary: ?*TerminalPageList.Pin = null;
+        if (oldest_node) |node| {
+            if (node != current_node.?) {
+                boundary = try terminal_screen.pages.trackPin(.{ .node = node });
+            }
+        }
+
+        const screen_generation = terminal_.screens.generation(key);
+        return .{
+            .terminal = terminal_,
+            .key = key,
+            .checkpoint_ = .{
+                .screen_generation = screen_generation,
+                .history_generation = terminal_screen.pages.historyGeneration(),
+                .newest_serial = current_serial,
+                .oldest_serial = oldest_serial,
+            },
+            .current = current,
+            .boundary = boundary,
+            .current_serial = current_serial,
+            .boundary_serial = oldest_serial,
+        };
+    }
+
+    pub fn checkpoint(self: *const HistoryLease) HistoryCheckpoint {
+        return self.checkpoint_;
+    }
+
+    /// Create the lease's single opaque cursor.
+    pub fn cursor(self: *HistoryLease) error{CursorAlreadyTaken}!HistoryCursor {
+        if (self.cursor_taken) return error.CursorAlreadyTaken;
+        self.cursor_taken = true;
+        return .{ .lease = self };
+    }
+
+    /// Diagnostic work counter used to verify continuation remains O(1) in
+    /// history depth. It counts source pages, not rows or encoding retries.
+    pub fn inspectedPages(self: *const HistoryLease) usize {
+        return self.pages_inspected;
+    }
+
+    pub fn abort(self: *HistoryLease) void {
+        self.deinit();
+    }
+
+    pub fn deinit(self: *HistoryLease) void {
+        if (!self.active) return;
+        self.active = false;
+
+        if (self.terminal.screens.generation(self.key) !=
+            self.checkpoint_.screen_generation) return;
+        const terminal_screen = self.terminal.screens.get(self.key) orelse return;
+        if (self.current) |pin_| terminal_screen.pages.untrackPin(pin_);
+        if (self.boundary) |pin_| terminal_screen.pages.untrackPin(pin_);
+        self.current = null;
+        self.boundary = null;
+    }
+
+    fn validate(
+        self: *HistoryLease,
+        terminal_: *Terminal,
+    ) CursorError!*TerminalScreen {
+        if (!self.active) return error.Stale;
+        if (terminal_ != self.terminal) return error.WrongTerminal;
+        if (terminal_.screens.generation(self.key) !=
+            self.checkpoint_.screen_generation) return error.WrongGeneration;
+        const terminal_screen = terminal_.screens.get(self.key) orelse
+            return error.WrongGeneration;
+        if (terminal_screen.pages.historyGeneration() !=
+            self.checkpoint_.history_generation)
+        {
+            return switch (terminal_screen.pages.historyInvalidation()) {
+                .reset => error.Reset,
+                .resize => error.Resize,
+                .none, .stale => error.Stale,
+            };
+        }
+        if (self.boundary) |pin_| {
+            if (pin_.garbage or pin_.node.serial != self.boundary_serial) {
+                return error.Pruned;
+            }
+        }
+        if (self.current) |pin_| {
+            if (pin_.garbage) return error.Pruned;
+            if (pin_.node.serial != self.current_serial) return error.Stale;
+        }
+        return terminal_screen;
+    }
+};
+
+/// Opaque newest-to-oldest continuation over a HistoryLease.
+pub const HistoryCursor = struct {
+    lease: *HistoryLease,
+
+    /// Emit one complete PAGE codec unit without advancing on a budget outcome
+    /// or allocation/encoding failure.
+    pub fn next(
+        self: *HistoryCursor,
+        terminal_: *Terminal,
+        budget: Budget,
+        destination: *std.Io.Writer,
+    ) CursorError!NextResult {
+        const terminal_screen = try self.lease.validate(terminal_);
+        const pin_ = self.lease.current orelse return .end;
+        if (budget.bytes == 0 or budget.rows == 0) return .zero_budget;
+
+        const source_node = pin_.node;
+        const row_end: usize = @as(usize, pin_.y) + 1;
+        const max_rows = @min(row_end, budget.rows);
+        var preserved = try source_node.pagePreservingState(terminal_screen.alloc);
+        defer preserved.deinit();
+        const source_page = preserved.page();
+
+        var one = try encodePageSlice(
+            terminal_screen.alloc,
+            source_page,
+            row_end - 1,
+            row_end,
+        );
+        defer one.deinit();
+        if (one.written().len > budget.bytes) {
+            return .{ .too_small = .{ .minimum_bytes = one.written().len } };
+        }
+
+        var low: usize = 1;
+        var high: usize = max_rows;
+        while (low < high) {
+            const candidate = low + (high - low + 1) / 2;
+            const fits = fits: {
+                var candidate_bytes = try encodePageSlice(
+                    terminal_screen.alloc,
+                    source_page,
+                    row_end - candidate,
+                    row_end,
+                );
+                defer candidate_bytes.deinit();
+                break :fits candidate_bytes.written().len <= budget.bytes;
+            };
+            if (fits) {
+                low = candidate;
+            } else {
+                high = candidate - 1;
+            }
+        }
+
+        const rows = low;
+        var encoded = try encodePageSlice(
+            terminal_screen.alloc,
+            source_page,
+            row_end - rows,
+            row_end,
+        );
+        defer encoded.deinit();
+        const encoded_len = encoded.written().len;
+        std.debug.assert(encoded_len <= budget.bytes);
+        try destination.writeAll(encoded.written());
+
+        self.lease.pages_inspected += @intFromBool(row_end == source_node.rows());
+        const row_start = row_end - rows;
+        const page_complete = row_start == 0;
+        if (page_complete) {
+            if (source_node.serial == self.lease.boundary_serial) {
+                terminal_screen.pages.untrackPin(pin_);
+                if (self.lease.boundary) |boundary| {
+                    terminal_screen.pages.untrackPin(boundary);
+                    self.lease.boundary = null;
+                }
+                self.lease.current = null;
+            } else if (source_node.prev) |previous| {
+                pin_.node = previous;
+                pin_.y = previous.rows() - 1;
+                pin_.x = 0;
+                self.lease.current_serial = previous.serial;
+            } else {
+                return error.Pruned;
+            }
+        } else {
+            pin_.y = @intCast(row_start - 1);
+        }
+
+        return .{ .chunk = .{
+            .bytes = encoded_len,
+            .rows = rows,
+            .page_complete = page_complete,
+        } };
+    }
+};
+
+fn encodePageSlice(
+    alloc: Allocator,
+    source: *const TerminalPage,
+    row_start: usize,
+    row_end: usize,
+) !std.Io.Writer.Allocating {
+    std.debug.assert(row_start < row_end);
+    std.debug.assert(row_end <= source.size.rows);
+
+    var output: std.Io.Writer.Allocating = .init(alloc);
+    errdefer output.deinit();
+    var stream: record.Writer = .init(alloc, &output.writer);
+    defer stream.deinit();
+
+    if (row_start == 0 and row_end == source.size.rows) {
+        try page.encode(source, &stream);
+    } else {
+        var sliced = try TerminalPage.init(
+            source.exactRowCapacity(row_start, row_end),
+        );
+        defer sliced.deinit();
+        sliced.size.rows = @intCast(row_end - row_start);
+        try sliced.cloneFrom(source, row_start, row_end);
+        try page.encode(&sliced, &stream);
+    }
+    return output;
+}
+
+pub const ImportResult = union(enum) {
+    zero_budget,
+    too_small: struct {
+        required_bytes: usize,
+        required_rows: usize,
+    },
+    imported: struct {
+        rows: usize,
+        retained: bool,
+    },
+};
+
+pub const ImportError = Allocator.Error ||
+    record.Header.DecodeError ||
+    page.DecodeError ||
+    TerminalPageList.PageAllocation.FinalizeError ||
+    error{
+        ChunkLimitExceeded,
+        InvalidChunk,
+        Stale,
+        WrongTerminal,
+        WrongGeneration,
+        Reset,
+        Resize,
+    };
+
+/// Transactional, independently bounded importer for engine-produced PAGE
+/// units. Imported pages are prepended while live writes continue at the
+/// active end of the destination.
+pub const HistoryImporter = struct {
+    terminal: *Terminal,
+    key: TerminalScreenKey,
+    screen_generation: usize,
+    history_generation: u64,
+    import: TerminalPageList.HistoryImport,
+    deinitialized: bool = false,
+    chunks: usize = 0,
+    max_chunks: usize,
+    imported_prompt: bool = false,
+    active: bool = true,
+
+    pub const InitError = Allocator.Error || error{ScreenUnavailable};
+
+    pub fn init(
+        terminal_: *Terminal,
+        key: TerminalScreenKey,
+        max_chunks: usize,
+    ) InitError!HistoryImporter {
+        const terminal_screen = terminal_.screens.get(key) orelse
+            return error.ScreenUnavailable;
+        return .{
+            .terminal = terminal_,
+            .key = key,
+            .screen_generation = terminal_.screens.generation(key),
+            .history_generation = terminal_screen.pages.historyGeneration(),
+            .import = try .init(
+                &terminal_screen.pages,
+                terminal_screen.alloc,
+                max_chunks,
+            ),
+            .max_chunks = max_chunks,
+        };
+    }
+
+    /// Decode and prepend exactly one PAGE record.
+    ///
+    /// Budget failures and malformed units publish nothing. A retained result
+    /// is visible immediately, but remains rollback-owned until commit.
+    pub fn prepend(
+        self: *HistoryImporter,
+        terminal_: *Terminal,
+        unit: []const u8,
+        budget: Budget,
+    ) ImportError!ImportResult {
+        const terminal_screen = try self.validate(terminal_);
+        if (budget.bytes == 0 or budget.rows == 0) return .zero_budget;
+        if (self.chunks == self.max_chunks) return error.ChunkLimitExceeded;
+
+        if (unit.len < record.Header.len) return error.InvalidChunk;
+        var header_source: std.Io.Reader = .fixed(unit);
+        const record_header = try record.Header.decode(&header_source);
+        const expected_len = std.math.add(
+            usize,
+            record.Header.len,
+            @as(usize, record_header.payload_len),
+        ) catch return error.InvalidChunk;
+        if (expected_len != unit.len or record_header.tag != .page) {
+            return error.InvalidChunk;
+        }
+
+        var source: std.Io.Reader = .fixed(unit);
+        var decoder: page.Decoder = undefined;
+        try decoder.init(&source);
+        const rows: usize = decoder.header.rows;
+        if (unit.len > budget.bytes or rows > budget.rows) {
+            return .{ .too_small = .{
+                .required_bytes = unit.len,
+                .required_rows = rows,
+            } };
+        }
+
+        var allocation = try terminal_screen.pages.allocatePage(
+            decoder.capacity(),
+        );
+        defer allocation.deinit();
+        try decoder.decode(allocation.page(), terminal_screen.alloc);
+        const contains_prompt = hasSemanticPrompt(allocation.page());
+        const retained = try self.import.prepend(&allocation);
+        self.imported_prompt = self.imported_prompt or
+            (retained and contains_prompt);
+        self.chunks += 1;
+        return .{ .imported = .{
+            .rows = rows,
+            .retained = retained,
+        } };
+    }
+
+    pub fn commit(
+        self: *HistoryImporter,
+        terminal_: *Terminal,
+    ) ImportError!void {
+        const terminal_screen = try self.validate(terminal_);
+        self.import.commit();
+        if (self.imported_prompt) terminal_screen.semantic_prompt.seen = true;
+        self.active = false;
+    }
+
+    pub fn abort(self: *HistoryImporter) void {
+        self.deinit();
+    }
+
+    pub fn deinit(self: *HistoryImporter) void {
+        if (self.deinitialized) return;
+        self.deinitialized = true;
+        if (self.active) {
+            self.active = false;
+            if (self.terminal.screens.generation(self.key) !=
+                self.screen_generation or
+                self.terminal.screens.get(self.key) == null)
+            {
+                self.import.abandon();
+            }
+        }
+        self.import.deinit();
+    }
+
+    fn validate(
+        self: *HistoryImporter,
+        terminal_: *Terminal,
+    ) ImportError!*TerminalScreen {
+        if (!self.active) return error.Stale;
+        if (terminal_ != self.terminal) return error.WrongTerminal;
+        if (terminal_.screens.generation(self.key) != self.screen_generation) {
+            return error.WrongGeneration;
+        }
+        const terminal_screen = terminal_.screens.get(self.key) orelse
+            return error.WrongGeneration;
+        if (terminal_screen.pages.historyGeneration() !=
+            self.history_generation)
+        {
+            return switch (terminal_screen.pages.historyInvalidation()) {
+                .reset => error.Reset,
+                .resize => error.Resize,
+                .none, .stale => error.Stale,
+            };
+        }
+        return terminal_screen;
+    }
+};
 
 /// The complete fixed payload of one HISTORY record.
 pub const Header = struct {
@@ -757,4 +1239,457 @@ test "HISTORY rejects invalid routing and incomplete sequences" {
         terminal_screen.pages.assertIntegrity();
         terminal_screen.assertIntegrity();
     }
+}
+
+fn testCursorTerminal(
+    alloc: Allocator,
+    history_pages: usize,
+    base: u21,
+) !Terminal {
+    var terminal_value = try Terminal.init(std.testing.io, alloc, .{
+        .cols = 2,
+        .rows = 2,
+        .max_scrollback_bytes = null,
+        .max_scrollback_lines = null,
+    });
+    errdefer terminal_value.deinit(alloc);
+    const primary = terminal_value.screens.get(.primary).?;
+
+    var builder = try TerminalPageList.Builder.init(alloc, .{
+        .cols = 2,
+        .rows = 2,
+        .max_size = null,
+        .max_lines = null,
+    });
+    defer builder.deinit();
+
+    for (0..history_pages) |page_index| {
+        const terminal_page = try builder.allocatePage(.{
+            .cols = 2,
+            .rows = 2,
+        });
+        terminal_page.size.rows = 2;
+        for (0..2) |row| {
+            const offset: u21 = @intCast(page_index * 2 + row);
+            terminal_page.getRowAndCell(0, row).cell.* = .init(base + offset);
+        }
+    }
+    const active = try builder.allocatePage(.{ .cols = 2, .rows = 2 });
+    active.size.rows = 2;
+    active.getRowAndCell(0, 0).cell.* = .init('x');
+    active.getRowAndCell(0, 1).cell.* = .init('y');
+
+    var pages = try builder.finish();
+    errdefer pages.deinit();
+    const cursor_pin = try pages.trackPin(pages.pin(.{ .active = .{} }).?);
+    const cursor_rac = cursor_pin.rowAndCell();
+    var replacement: TerminalScreen = .{
+        .io = std.testing.io,
+        .alloc = alloc,
+        .pages = pages,
+        .cursor = .{
+            .page_pin = cursor_pin,
+            .page_row = cursor_rac.row,
+            .page_cell = cursor_rac.cell,
+        },
+    };
+    primary.deinit();
+    primary.* = replacement;
+    replacement = undefined;
+    return terminal_value;
+}
+
+fn testDecodedFirstCodepoint(unit: []const u8) !u21 {
+    var source: std.Io.Reader = .fixed(unit);
+    var decoded = try page.decode(&source, std.testing.allocator);
+    defer decoded.deinit();
+    try std.testing.expectError(error.EndOfStream, source.takeByte());
+    return decoded.getRowAndCell(0, 0).cell.codepoint();
+}
+
+test "history cursor pages newest first within strict budgets" {
+    const testing = std.testing;
+    var source = try testCursorTerminal(testing.allocator, 3, 'A');
+    defer source.deinit(testing.allocator);
+    const source_screen = source.screens.get(.primary).?;
+    const newest = source_screen.pages.getTopLeft(.active).node.prev.?;
+    const middle = newest.prev.?;
+    const oldest = middle.prev.?;
+
+    _ = source_screen.pages.compress(.full);
+    const storage = [_]TerminalPageList.List.Node.Storage{
+        newest.storage(),
+        middle.storage(),
+        oldest.storage(),
+    };
+
+    const pins_before = source_screen.pages.countTrackedPins();
+    var lease = try HistoryLease.init(&source, .primary);
+    defer lease.deinit();
+    try testing.expectEqual(pins_before + 2, source_screen.pages.countTrackedPins());
+    const checkpoint_value = lease.checkpoint();
+    try testing.expect(checkpoint_value.eql(lease.checkpoint()));
+    var cursor_value = try lease.cursor();
+    try testing.expectError(error.CursorAlreadyTaken, lease.cursor());
+
+    var no_output: [1]u8 = undefined;
+    var no_output_writer: std.Io.Writer = .fixed(&no_output);
+    try testing.expectEqual(
+        @as(std.meta.Tag(NextResult), .zero_budget),
+        std.meta.activeTag(try cursor_value.next(
+            &source,
+            .{ .bytes = 0, .rows = 1 },
+            &no_output_writer,
+        )),
+    );
+    try testing.expectEqual(@as(usize, 0), no_output_writer.end);
+
+    const too_small = try cursor_value.next(
+        &source,
+        .{ .bytes = 1, .rows = 1 },
+        &no_output_writer,
+    );
+    const minimum_bytes = switch (too_small) {
+        .too_small => |value| value.minimum_bytes,
+        else => return error.TestExpectedTooSmall,
+    };
+    try testing.expect(minimum_bytes > 1);
+    try testing.expectEqual(@as(usize, 0), no_output_writer.end);
+
+    var units: [6][]u8 = undefined;
+    var unit_count: usize = 0;
+    defer for (units[0..unit_count]) |unit| testing.allocator.free(unit);
+    const expected = [_]u21{ 'F', 'E', 'D', 'C', 'B', 'A' };
+    while (unit_count < units.len) : (unit_count += 1) {
+        var output: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer output.deinit();
+        const result = try cursor_value.next(
+            &source,
+            .{ .bytes = minimum_bytes + 4096, .rows = 1 },
+            &output.writer,
+        );
+        const chunk = switch (result) {
+            .chunk => |value| value,
+            else => return error.TestExpectedChunk,
+        };
+        try testing.expectEqual(@as(usize, 1), chunk.rows);
+        try testing.expectEqual(unit_count % 2 == 1, chunk.page_complete);
+        try testing.expect(chunk.bytes <= minimum_bytes + 4096);
+        try testing.expectEqual(chunk.bytes, output.written().len);
+        try testing.expectEqual(
+            expected[unit_count],
+            try testDecodedFirstCodepoint(output.written()),
+        );
+        units[unit_count] = try testing.allocator.dupe(u8, output.written());
+
+        if (unit_count == 0) {
+            source_screen.cursorAbsolute(0, 1);
+            try source_screen.testWriteString("\n");
+        }
+    }
+    var end_output: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer end_output.deinit();
+    try testing.expectEqual(
+        @as(std.meta.Tag(NextResult), .end),
+        std.meta.activeTag(try cursor_value.next(
+            &source,
+            .{ .bytes = 4096, .rows = 1 },
+            &end_output.writer,
+        )),
+    );
+    try testing.expectEqual(@as(usize, 3), lease.inspectedPages());
+    try testing.expectEqual(pins_before, source_screen.pages.countTrackedPins());
+    try testing.expectEqual(storage[0], newest.storage());
+    try testing.expectEqual(storage[1], middle.storage());
+    try testing.expectEqual(storage[2], oldest.storage());
+
+    var destination = try testCursorTerminal(testing.allocator, 1, 'm');
+    defer destination.deinit(testing.allocator);
+    const destination_screen = destination.screens.get(.primary).?;
+    try destination.printString("L");
+    try destination.setTitle("live destination");
+    destination.modes.values.bracketed_paste = true;
+    const active_node = destination_screen.pages.getTopLeft(.active).node;
+    const active_first = active_node.page().getRowAndCell(0, 0).cell.codepoint();
+    const pages_before_import = destination_screen.pages.totalPages();
+
+    var importer = try HistoryImporter.init(
+        &destination,
+        .primary,
+        units.len,
+    );
+    defer importer.deinit();
+    try testing.expectEqual(
+        @as(std.meta.Tag(ImportResult), .zero_budget),
+        std.meta.activeTag(try importer.prepend(
+            &destination,
+            units[0],
+            .{ .bytes = 0, .rows = 1 },
+        )),
+    );
+    const import_too_small = try importer.prepend(
+        &destination,
+        units[0],
+        .{ .bytes = units[0].len - 1, .rows = 1 },
+    );
+    try testing.expectEqual(
+        @as(std.meta.Tag(ImportResult), .too_small),
+        std.meta.activeTag(import_too_small),
+    );
+
+    for (units) |unit| {
+        const result = try importer.prepend(
+            &destination,
+            unit,
+            .{ .bytes = unit.len, .rows = 1 },
+        );
+        const imported = switch (result) {
+            .imported => |value| value,
+            else => return error.TestExpectedImport,
+        };
+        try testing.expect(imported.retained);
+        try testing.expectEqual(@as(usize, 1), imported.rows);
+    }
+    try importer.commit(&destination);
+
+    try testing.expectEqualStrings("live destination", destination.getTitle().?);
+    try testing.expect(destination.modes.values.bracketed_paste);
+    try testing.expectEqual(
+        active_node,
+        destination_screen.pages.getTopLeft(.active).node,
+    );
+    try testing.expectEqual(
+        active_first,
+        active_node.page().getRowAndCell(0, 0).cell.codepoint(),
+    );
+    try testing.expectEqual(
+        pages_before_import + units.len,
+        destination_screen.pages.totalPages(),
+    );
+
+    const exact_order = [_]u21{ 'A', 'B', 'C', 'D', 'E', 'F', 'm', 'n' };
+    var order_index: usize = 0;
+    var node = destination_screen.pages.getTopLeft(.screen).node;
+    while (node != active_node) : (node = node.next.?) {
+        for (0..node.rows()) |row| {
+            try testing.expectEqual(
+                exact_order[order_index],
+                node.page().getRowAndCell(0, row).cell.codepoint(),
+            );
+            order_index += 1;
+        }
+    }
+    try testing.expectEqual(exact_order.len, order_index);
+}
+
+test "history cursor invalidation and transactional abort outcomes" {
+    const testing = std.testing;
+    var source = try testCursorTerminal(testing.allocator, 3, 'A');
+    defer source.deinit(testing.allocator);
+    var other = try testCursorTerminal(testing.allocator, 1, 'Q');
+    defer other.deinit(testing.allocator);
+
+    {
+        var lease = try HistoryLease.init(&source, .primary);
+        defer lease.deinit();
+        var cursor_value = try lease.cursor();
+        var output: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer output.deinit();
+        try testing.expectError(
+            error.WrongTerminal,
+            cursor_value.next(
+                &other,
+                .{ .bytes = 4096, .rows = 2 },
+                &output.writer,
+            ),
+        );
+    }
+    {
+        var lease = try HistoryLease.init(&source, .primary);
+        defer lease.deinit();
+        var cursor_value = try lease.cursor();
+        source.screens.get(.primary).?.pages.setMaxLines(6);
+        var output: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer output.deinit();
+        try testing.expectError(
+            error.Pruned,
+            cursor_value.next(
+                &source,
+                .{ .bytes = 4096, .rows = 2 },
+                &output.writer,
+            ),
+        );
+    }
+
+    var reset_source = try testCursorTerminal(testing.allocator, 1, 'A');
+    defer reset_source.deinit(testing.allocator);
+    {
+        var lease = try HistoryLease.init(&reset_source, .primary);
+        defer lease.deinit();
+        var cursor_value = try lease.cursor();
+        reset_source.screens.get(.primary).?.pages.reset();
+        var output: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer output.deinit();
+        try testing.expectError(
+            error.Reset,
+            cursor_value.next(
+                &reset_source,
+                .{ .bytes = 4096, .rows = 2 },
+                &output.writer,
+            ),
+        );
+    }
+
+    var resize_source = try testCursorTerminal(testing.allocator, 1, 'A');
+    defer resize_source.deinit(testing.allocator);
+    {
+        var lease = try HistoryLease.init(&resize_source, .primary);
+        defer lease.deinit();
+        var cursor_value = try lease.cursor();
+        try resize_source.screens.get(.primary).?.pages.resize(.{ .cols = 3 });
+        var output: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer output.deinit();
+        try testing.expectError(
+            error.Resize,
+            cursor_value.next(
+                &resize_source,
+                .{ .bytes = 4096, .rows = 2 },
+                &output.writer,
+            ),
+        );
+    }
+
+    var stale_source = try testCursorTerminal(testing.allocator, 1, 'A');
+    defer stale_source.deinit(testing.allocator);
+    {
+        var lease = try HistoryLease.init(&stale_source, .primary);
+        defer lease.deinit();
+        var cursor_value = try lease.cursor();
+        stale_source.screens.get(.primary).?.pages.eraseHistory(null);
+        var output: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer output.deinit();
+        try testing.expectError(
+            error.Stale,
+            cursor_value.next(
+                &stale_source,
+                .{ .bytes = 4096, .rows = 2 },
+                &output.writer,
+            ),
+        );
+    }
+
+    var generation_source = try testCursorTerminal(testing.allocator, 1, 'A');
+    defer generation_source.deinit(testing.allocator);
+    _ = try generation_source.switchScreen(.alternate);
+    var generation_lease = try HistoryLease.init(&generation_source, .alternate);
+    defer generation_lease.deinit();
+    var generation_cursor = try generation_lease.cursor();
+    _ = try generation_source.switchScreen(.primary);
+    generation_source.screens.remove(testing.allocator, .alternate);
+    _ = try generation_source.switchScreen(.alternate);
+    var generation_output: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer generation_output.deinit();
+    try testing.expectError(
+        error.WrongGeneration,
+        generation_cursor.next(
+            &generation_source,
+            .{ .bytes = 4096, .rows = 2 },
+            &generation_output.writer,
+        ),
+    );
+
+    var abort_source = try testCursorTerminal(testing.allocator, 1, 'A');
+    defer abort_source.deinit(testing.allocator);
+    var abort_lease = try HistoryLease.init(&abort_source, .primary);
+    defer abort_lease.deinit();
+    var abort_cursor = try abort_lease.cursor();
+    var unit: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer unit.deinit();
+    _ = try abort_cursor.next(
+        &abort_source,
+        .{ .bytes = 4096, .rows = 2 },
+        &unit.writer,
+    );
+
+    var abort_destination = try testCursorTerminal(testing.allocator, 1, 'm');
+    defer abort_destination.deinit(testing.allocator);
+    const abort_screen = abort_destination.screens.get(.primary).?;
+    const abort_pages = abort_screen.pages.totalPages();
+    const abort_active = abort_screen.pages.getTopLeft(.active).node;
+    var abort_import = try HistoryImporter.init(
+        &abort_destination,
+        .primary,
+        1,
+    );
+    defer abort_import.deinit();
+    _ = try abort_import.prepend(
+        &abort_destination,
+        unit.written(),
+        .{ .bytes = unit.written().len, .rows = 2 },
+    );
+    abort_import.abort();
+    try testing.expectEqual(abort_pages, abort_screen.pages.totalPages());
+    try testing.expectEqual(
+        abort_active,
+        abort_screen.pages.getTopLeft(.active).node,
+    );
+}
+
+test "history lease and cursor OOM release bounded state without advancing" {
+    const testing = std.testing;
+    var failing = testing.FailingAllocator.init(
+        testing.allocator,
+        .{ .fail_index = std.math.maxInt(usize) },
+    );
+    const alloc = failing.allocator();
+    var source = try testCursorTerminal(alloc, 3, 'A');
+    defer {
+        failing.fail_index = std.math.maxInt(usize);
+        source.deinit(alloc);
+    }
+    const source_screen = source.screens.get(.primary).?;
+    const initial_pins = source_screen.pages.countTrackedPins();
+
+    var first = try HistoryLease.init(&source, .primary);
+    defer first.deinit();
+    const pins_with_first = source_screen.pages.countTrackedPins();
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(
+        error.OutOfMemory,
+        HistoryLease.init(&source, .primary),
+    );
+    try testing.expectEqual(
+        pins_with_first,
+        source_screen.pages.countTrackedPins(),
+    );
+
+    failing.fail_index = std.math.maxInt(usize);
+    var cursor_value = try first.cursor();
+    const y_before = first.current.?.y;
+    failing.fail_index = failing.alloc_index;
+    var output: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer output.deinit();
+    try testing.expectError(
+        error.OutOfMemory,
+        cursor_value.next(
+            &source,
+            .{ .bytes = 4096, .rows = 1 },
+            &output.writer,
+        ),
+    );
+    try testing.expectEqual(y_before, first.current.?.y);
+    try testing.expectEqual(@as(usize, 0), output.written().len);
+
+    failing.fail_index = std.math.maxInt(usize);
+    const result = try cursor_value.next(
+        &source,
+        .{ .bytes = 4096, .rows = 1 },
+        &output.writer,
+    );
+    try testing.expectEqual(
+        @as(std.meta.Tag(NextResult), .chunk),
+        std.meta.activeTag(result),
+    );
+    first.abort();
+    try testing.expectEqual(initial_pins, source_screen.pages.countTrackedPins());
 }
