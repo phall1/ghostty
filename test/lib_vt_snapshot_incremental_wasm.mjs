@@ -1464,6 +1464,9 @@ rt.write(
     "\x1b]8;;\x1b\\\x1b[0m\x1b]133;B\x07",
 );
 rt.write(source, alternateOff);
+// DEC 47 preserves the alternate screen but shares the cursor column. Reset
+// primary to column zero without changing its exact history boundary.
+rt.write(source, "\r");
 assert.equal(rt.gridText(source, 3, 0, 8), "row-0000");
 assert.equal(
   rt.gridText(source, 3, seededHistoryRows - 1, 8), "row-1992");
