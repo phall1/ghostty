@@ -1073,7 +1073,7 @@ async function exerciseSharedCodecCorpus(rt) {
   const cases = [
     ["shell-80x24-v2.hex", 31920, 0x794094e8f39f40d8n],
     ["rich-200x60-v2.hex", 385539, 0x9b746bfb359a5eebn],
-    ["history-multipage-v2.hex", 771100, 0x963accc40a87c60dn],
+    ["history-multipage-v2.hex", 2469736, 0x557529ed7661a40bn],
   ];
   for (const [name, length, checksum] of cases) {
     const bytes = await loadCorpusFixture(name);
