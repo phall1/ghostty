@@ -76,6 +76,7 @@ async function instantiateRuntime(entropyProvider = secureEntropy) {
 }
 
 const SUCCESS = 0;
+const RESULT_OUT_OF_SPACE = -3;
 const UNSUPPORTED_FEATURE = -1;
 const UNKNOWN_VERSION = -2;
 const CORRUPTION = -3;
@@ -235,6 +236,271 @@ class Runtime {
     this.dispose(point);
     return result;
   }
+}
+
+function terminalData(rt, terminal, kind, shape) {
+  const output = typeof shape === "string"
+    ? (shape === "GhosttyString" ? rt.rawStruct(shape) : rt.struct(shape))
+    : { ptr: rt.alloc(shape), size: shape, name: null };
+  rt.u8().fill(0, output.ptr, output.ptr + output.size);
+  if (output.name && rt.layout(output.name).fields.size) {
+    rt.view().setUint32(
+      output.ptr + rt.field(output.name, "size"), output.size, true);
+  }
+  const status = rt.e.ghostty_terminal_get(terminal, kind, output.ptr);
+  let value = new Uint8Array();
+  if (status === SUCCESS && shape === "GhosttyString") {
+    const ptr = rt.view().getUint32(
+      output.ptr + rt.field(shape, "ptr"), true);
+    const len = rt.view().getUint32(
+      output.ptr + rt.field(shape, "len"), true);
+    value = Uint8Array.from(rt.u8().subarray(ptr, ptr + len));
+  } else if (status === SUCCESS) {
+    value = Uint8Array.from(
+      rt.u8().subarray(output.ptr, output.ptr + output.size));
+  }
+  rt.free(output.ptr, output.size);
+  return { status, value };
+}
+
+function assertTerminalMetadataEqual(rt, left, right) {
+  const rgbSize = rt.layout("GhosttyColorRgb").size;
+  const fields = [
+    [1, 2], [2, 2], [3, 2], [4, 2], [5, 1], [6, 4], [7, 1], [8, 1],
+    [9, "GhosttyTerminalScrollbar"], [10, "GhosttyStyle"], [11, 1],
+    [12, "GhosttyString"], [13, "GhosttyString"], [14, 4], [15, 4],
+    [16, 4], [17, 4], [18, rgbSize], [19, rgbSize], [20, rgbSize],
+    [21, rgbSize * 256], [22, rgbSize], [23, rgbSize], [24, rgbSize],
+    [25, rgbSize * 256], [32, 1], [33, 1], [34, 4], [35, 4],
+  ];
+  for (const [kind, shape] of fields) {
+    assert.deepEqual(
+      terminalData(rt, right, kind, shape),
+      terminalData(rt, left, kind, shape),
+      `terminal data ${kind}`,
+    );
+  }
+
+  const ansiModes = [2, 4, 12, 20];
+  const decModes = [
+    1, 3, 4, 5, 6, 7, 8, 9, 12, 25, 40, 45, 47, 66, 67, 69,
+    1000, 1002, 1003, 1004, 1005, 1006, 1007, 1015, 1016, 1035,
+    1036, 1039, 1045, 1047, 1048, 1049, 2004, 2026, 2027, 2031,
+    2033, 2048,
+  ];
+  const leftValue = rt.alloc(1);
+  const rightValue = rt.alloc(1);
+  for (const mode of [
+    ...ansiModes.map((value) => value | 0x8000),
+    ...decModes,
+  ]) {
+    rt.u8()[leftValue] = 0;
+    rt.u8()[rightValue] = 0;
+    const leftStatus = rt.e.ghostty_terminal_mode_get(left, mode, leftValue);
+    const rightStatus = rt.e.ghostty_terminal_mode_get(right, mode, rightValue);
+    assert.equal(rightStatus, leftStatus, `mode ${mode} status`);
+    if (leftStatus === SUCCESS) {
+      assert.equal(rt.u8()[rightValue], rt.u8()[leftValue], `mode ${mode}`);
+    }
+  }
+  rt.free(rightValue, 1);
+  rt.free(leftValue, 1);
+}
+
+function setPoint(rt, point, tag, x, y) {
+  const coordinate = point.ptr + rt.field(point.name, "value");
+  rt.view().setInt32(point.ptr + rt.field(point.name, "tag"), tag, true);
+  rt.view().setUint16(
+    coordinate + rt.field("GhosttyPointCoordinate", "x"), x, true);
+  rt.view().setUint32(
+    coordinate + rt.field("GhosttyPointCoordinate", "y"), y, true);
+}
+
+function gridRef(rt, terminal, point, ref) {
+  assert.equal(
+    rt.e.ghostty_terminal_grid_ref(terminal, point.ptr, ref.ptr),
+    SUCCESS,
+  );
+}
+
+function cellData(rt, cell, kind, output) {
+  rt.u8().fill(0, output, output + 16);
+  const status = rt.e.ghostty_cell_get(cell, kind, output);
+  return {
+    status,
+    value: status === SUCCESS
+      ? Uint8Array.from(rt.u8().subarray(output, output + 16))
+      : new Uint8Array(),
+  };
+}
+
+function rowData(rt, row, kind, output) {
+  rt.u8().fill(0, output, output + 8);
+  const status = rt.e.ghostty_row_get(row, kind, output);
+  return {
+    status,
+    value: status === SUCCESS
+      ? Uint8Array.from(rt.u8().subarray(output, output + 8))
+      : new Uint8Array(),
+  };
+}
+
+function graphemes(rt, ref, buffer, written) {
+  rt.view().setUint32(written, 0, true);
+  const status = rt.e.ghostty_grid_ref_graphemes(
+    ref.ptr, buffer, 64, written);
+  assert.equal(status, SUCCESS);
+  const count = rt.view().getUint32(written, true);
+  assert.ok(count <= 64);
+  return Uint8Array.from(rt.u8().subarray(buffer, buffer + count * 4));
+}
+
+function hyperlink(rt, ref, written) {
+  rt.view().setUint32(written, 0, true);
+  const status = rt.e.ghostty_grid_ref_hyperlink_uri(
+    ref.ptr, 0, 0, written);
+  const required = rt.view().getUint32(written, true);
+  if (status === SUCCESS) {
+    assert.equal(required, 0);
+    return new Uint8Array();
+  }
+  assert.equal(status, RESULT_OUT_OF_SPACE);
+  assert.ok(required > 0 && required <= 1024 * 1024);
+  const buffer = rt.alloc(required);
+  rt.view().setUint32(written, 0, true);
+  assert.equal(rt.e.ghostty_grid_ref_hyperlink_uri(
+    ref.ptr, buffer, required, written), SUCCESS);
+  assert.equal(rt.view().getUint32(written, true), required);
+  const value = Uint8Array.from(rt.u8().subarray(buffer, buffer + required));
+  rt.free(buffer, required);
+  return value;
+}
+
+function resetSized(rt, value) {
+  rt.u8().fill(0, value.ptr, value.ptr + value.size);
+  rt.view().setUint32(
+    value.ptr + rt.field(value.name, "size"), value.size, true);
+}
+
+function assertGridEqual(rt, left, right) {
+  const leftCols = terminalData(rt, left, 1, 2);
+  const leftRows = terminalData(rt, left, 2, 2);
+  const rightCols = terminalData(rt, right, 1, 2);
+  const rightRows = terminalData(rt, right, 2, 2);
+  assert.deepEqual(rightCols, leftCols);
+  assert.deepEqual(rightRows, leftRows);
+  const cols = leftCols.value[0] | (leftCols.value[1] << 8);
+  const rows = leftRows.value[0] | (leftRows.value[1] << 8);
+  const historyRows = rt.terminalUsize(left, 15);
+  assert.equal(rt.terminalUsize(right, 15), historyRows);
+  assert.equal(rt.terminalUsize(left, 14), historyRows + rows);
+  assert.equal(rt.terminalUsize(right, 14), historyRows + rows);
+
+  const leftPoint = rt.rawStruct("GhosttyPoint");
+  const rightPoint = rt.rawStruct("GhosttyPoint");
+  const leftRef = rt.struct("GhosttyGridRef");
+  const rightRef = rt.struct("GhosttyGridRef");
+  const leftCell = rt.alloc(8);
+  const rightCell = rt.alloc(8);
+  const leftRow = rt.alloc(8);
+  const rightRow = rt.alloc(8);
+  const leftOutput = rt.alloc(16);
+  const rightOutput = rt.alloc(16);
+  const leftGraphemes = rt.alloc(64 * 4);
+  const rightGraphemes = rt.alloc(64 * 4);
+  const leftWritten = rt.alloc(4);
+  const rightWritten = rt.alloc(4);
+  const leftStyle = rt.struct("GhosttyStyle");
+  const rightStyle = rt.struct("GhosttyStyle");
+
+  const compareRegion = (tag, regionRows, regionName) => {
+    for (let y = 0; y < regionRows; ++y) {
+      for (let x = 0; x < cols; ++x) {
+        setPoint(rt, leftPoint, tag, x, y);
+        setPoint(rt, rightPoint, tag, x, y);
+        gridRef(rt, left, leftPoint, leftRef);
+        gridRef(rt, right, rightPoint, rightRef);
+        const label = `${regionName}[${y},${x}]`;
+
+        assert.equal(rt.e.ghostty_grid_ref_cell(
+          leftRef.ptr, leftCell), SUCCESS);
+        assert.equal(rt.e.ghostty_grid_ref_cell(
+          rightRef.ptr, rightCell), SUCCESS);
+        const leftCellValue = rt.view().getBigUint64(leftCell, true);
+        const rightCellValue = rt.view().getBigUint64(rightCell, true);
+        let hasStyling = false;
+        let hasHyperlink = false;
+        for (let kind = 1; kind <= 11; ++kind) {
+          const leftData = cellData(rt, leftCellValue, kind, leftOutput);
+          const rightData = cellData(rt, rightCellValue, kind, rightOutput);
+          assert.deepEqual(rightData, leftData, `${label} cell data ${kind}`);
+          if (kind === 5) hasStyling = leftData.value[0] !== 0;
+          if (kind === 7) hasHyperlink = leftData.value[0] !== 0;
+        }
+        assert.deepEqual(
+          graphemes(rt, rightRef, rightGraphemes, rightWritten),
+          graphemes(rt, leftRef, leftGraphemes, leftWritten),
+          `${label} graphemes`,
+        );
+        if (hasStyling) {
+          resetSized(rt, leftStyle);
+          resetSized(rt, rightStyle);
+          assert.equal(rt.e.ghostty_grid_ref_style(
+            leftRef.ptr, leftStyle.ptr), SUCCESS);
+          assert.equal(rt.e.ghostty_grid_ref_style(
+            rightRef.ptr, rightStyle.ptr), SUCCESS);
+          assert.deepEqual(
+            rt.u8().subarray(rightStyle.ptr, rightStyle.ptr + rightStyle.size),
+            rt.u8().subarray(leftStyle.ptr, leftStyle.ptr + leftStyle.size),
+            `${label} style`,
+          );
+        }
+        if (hasHyperlink) {
+          assert.deepEqual(
+            hyperlink(rt, rightRef, rightWritten),
+            hyperlink(rt, leftRef, leftWritten),
+            `${label} hyperlink`,
+          );
+        }
+
+        if (x === 0) {
+          assert.equal(rt.e.ghostty_grid_ref_row(
+            leftRef.ptr, leftRow), SUCCESS);
+          assert.equal(rt.e.ghostty_grid_ref_row(
+            rightRef.ptr, rightRow), SUCCESS);
+          const leftRowValue = rt.view().getBigUint64(leftRow, true);
+          const rightRowValue = rt.view().getBigUint64(rightRow, true);
+          for (let kind = 1; kind <= 7; ++kind) {
+            assert.deepEqual(
+              rowData(rt, rightRowValue, kind, rightOutput),
+              rowData(rt, leftRowValue, kind, leftOutput),
+              `${regionName}[${y}] row data ${kind}`,
+            );
+          }
+        }
+      }
+    }
+  };
+
+  compareRegion(3, historyRows, "history");
+  compareRegion(0, rows, "active");
+
+  rt.dispose(rightStyle);
+  rt.dispose(leftStyle);
+  rt.free(rightWritten, 4);
+  rt.free(leftWritten, 4);
+  rt.free(rightGraphemes, 64 * 4);
+  rt.free(leftGraphemes, 64 * 4);
+  rt.free(rightOutput, 16);
+  rt.free(leftOutput, 16);
+  rt.free(rightRow, 8);
+  rt.free(leftRow, 8);
+  rt.free(rightCell, 8);
+  rt.free(leftCell, 8);
+  rt.dispose(rightRef);
+  rt.dispose(leftRef);
+  rt.dispose(rightPoint);
+  rt.dispose(leftPoint);
 }
 
 function captureOptions(rt, maxRecordBytes = 4 * 1024 * 1024) {
@@ -910,65 +1176,20 @@ assert.equal(offset, captured.encoded.length);
 assert.equal(decodedHistoryPages, decodedHistoryCount);
 rt.e.ghostty_terminal_snapshot_decoder_free(decoder);
 
-const sourceAfterReplay = captureAll(rt, source);
-const decodedAfterReplay = captureAll(rt, decodedTerminal);
-const recordEqual = (left, right) =>
-  left.kind === right.kind &&
-  left.screenKey === right.screenKey &&
-  left.index === right.index &&
-  left.count === right.count &&
-  left.bytes.length === right.bytes.length &&
-  left.bytes.every((byte, index) => byte === right.bytes[index]);
-let firstDifferentRecord = 0;
-while (firstDifferentRecord < sourceAfterReplay.records.length &&
-    firstDifferentRecord < decodedAfterReplay.records.length &&
-    recordEqual(
-      sourceAfterReplay.records[firstDifferentRecord],
-      decodedAfterReplay.records[firstDifferentRecord])) {
-  ++firstDifferentRecord;
-}
-if (firstDifferentRecord !== sourceAfterReplay.records.length ||
-    firstDifferentRecord !== decodedAfterReplay.records.length) {
-  const sourceRecord = sourceAfterReplay.records[firstDifferentRecord] ?? null;
-  const decodedRecord = decodedAfterReplay.records[firstDifferentRecord] ?? null;
-  let firstDifferentByte = null;
-  if (sourceRecord && decodedRecord) {
-    const common = Math.min(sourceRecord.bytes.length, decodedRecord.bytes.length);
-    firstDifferentByte = 0;
-    while (firstDifferentByte < common &&
-        sourceRecord.bytes[firstDifferentByte] ===
-          decodedRecord.bytes[firstDifferentByte]) ++firstDifferentByte;
-  }
-  console.error("snapshot recapture mismatch", JSON.stringify({
-    firstDifferentRecord,
-    firstDifferentByte,
-    source: {
-      totalRows: rt.terminalUsize(source, 14),
-      historyRows: rt.terminalUsize(source, 15),
-      recordCount: sourceAfterReplay.records.length,
-      record: sourceRecord && {
-        kind: sourceRecord.kind,
-        screenKey: sourceRecord.screenKey,
-        index: sourceRecord.index,
-        count: sourceRecord.count,
-        bytes: sourceRecord.bytes.length,
-      },
-    },
-    decoded: {
-      totalRows: rt.terminalUsize(decodedTerminal, 14),
-      historyRows: rt.terminalUsize(decodedTerminal, 15),
-      recordCount: decodedAfterReplay.records.length,
-      record: decodedRecord && {
-        kind: decodedRecord.kind,
-        screenKey: decodedRecord.screenKey,
-        index: decodedRecord.index,
-        count: decodedRecord.count,
-        bytes: decodedRecord.bytes.length,
-      },
-    },
-  }));
-}
-assert.deepEqual(decodedAfterReplay.encoded, sourceAfterReplay.encoded);
+// PAGE record boundaries reflect private PageList storage partitioning. Live
+// writes during incremental prepend can repartition equivalent rows, so raw
+// recapture bytes are not canonical. Prove the public terminal contract
+// exhaustively instead: canonical metadata/modes plus every history and active
+// cell's graphemes, cell/row invariants, style, and bounded hyperlink bytes.
+const continuationText = "parser-continuation-replayed";
+assert.equal(
+  rt.gridText(source, 0, 6, continuationText.length), continuationText);
+assert.equal(
+  rt.gridText(decodedTerminal, 0, 6, continuationText.length),
+  continuationText,
+);
+assertTerminalMetadataEqual(rt, source, decodedTerminal);
+assertGridEqual(rt, source, decodedTerminal);
 
 const unknownVersion = Uint8Array.from(captured.encoded);
 unknownVersion[8] = 0xff;
