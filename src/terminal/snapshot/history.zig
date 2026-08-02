@@ -670,8 +670,7 @@ pub const HistoryImporter = struct {
         if (!std.meta.eql(
             unit_header.checkpoint,
             self.expected_checkpoint,
-        ) or unit_header.sequence != self.expected_sequence)
-        {
+        ) or unit_header.sequence != self.expected_sequence) {
             return error.UnexpectedHistoryUnit;
         }
         const payload_len: usize = @intCast(unit_header.payload_len);
