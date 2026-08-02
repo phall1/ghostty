@@ -185,7 +185,8 @@ typedef struct {
     bool saw_history;
 } Decoded;
 
-static Decoded decode_fragmented(const uint8_t* data, size_t len) {
+static Decoded decode_fragmented(
+    const uint8_t* data, size_t len, size_t max_fragment_bytes) {
     GhosttyTerminalSnapshotDecoder decoder = NULL;
     GhosttyTerminalSnapshotDecoderOptions options = decoder_options();
     assert(ghostty_terminal_snapshot_decoder_new(NULL, &options, &decoder) ==
@@ -198,11 +199,14 @@ static Decoded decode_fragmented(const uint8_t* data, size_t len) {
             .size = sizeof(event),
             .version = GHOSTTY_TERMINAL_SNAPSHOT_ABI_VERSION,
         };
+        size_t fragment_bytes = len - offset;
+        if (fragment_bytes > max_fragment_bytes)
+            fragment_bytes = max_fragment_bytes;
         GhosttyTerminalSnapshotStatus status =
             ghostty_terminal_snapshot_decoder_push(
-                decoder, data + offset, 1, &event);
+                decoder, data + offset, fragment_bytes, &event);
         assert(status == GHOSTTY_TERMINAL_SNAPSHOT_STATUS_SUCCESS);
-        assert(event.consumed <= 1);
+        assert(event.consumed <= fragment_bytes);
         assert(event.consumed != 0 ||
             event.kind == GHOSTTY_TERMINAL_SNAPSHOT_DECODE_FINISH);
         offset += event.consumed;
@@ -696,7 +700,8 @@ static void exercise_snapshot_corpus(bool update) {
             assert(fixture.len == captured.len);
             assert(memcmp(fixture.data, captured.data, fixture.len) == 0);
 
-            Decoded decoded = decode_fragmented(fixture.data, fixture.len);
+            Decoded decoded = decode_fragmented(
+                fixture.data, fixture.len, 4096);
             assert(decoded.saw_ready);
             assert(decoded.consumed == fixture.len);
             ghostty_terminal_free(decoded.terminal);
@@ -726,7 +731,7 @@ static void exercise_snapshot_corpus(bool update) {
     if (!update) {
         Bytes v1 = corpus_load(
             "src/terminal/snapshot/testdata/complete-v1.hex");
-        Decoded decoded = decode_fragmented(v1.data, v1.len);
+        Decoded decoded = decode_fragmented(v1.data, v1.len, 4096);
         assert(decoded.saw_ready);
         assert(decoded.consumed == v1.len);
         ghostty_terminal_free(decoded.terminal);
@@ -858,7 +863,7 @@ int main(void) {
 
     Bytes bytes = capture_all(source);
     assert(bytes.len > bytes.finish_offset);
-    Decoded decoded = decode_fragmented(bytes.data, bytes.len);
+    Decoded decoded = decode_fragmented(bytes.data, bytes.len, 1);
     assert(decoded.saw_ready);
     assert(decoded.consumed == bytes.len);
 

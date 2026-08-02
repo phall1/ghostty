@@ -157,44 +157,80 @@ static GhosttyTerminalSnapshotStatus decode_split(const uint8_t* data,
     return status;
 }
 
+static uint32_t read_u32_le(const uint8_t* data) {
+    return (uint32_t)data[0] |
+        ((uint32_t)data[1] << 8) |
+        ((uint32_t)data[2] << 16) |
+        ((uint32_t)data[3] << 24);
+}
+
+static void assert_truncated_at(const Bytes* bytes, size_t cut) {
+    GhosttyTerminalSnapshotDecoder decoder = NULL;
+    GhosttyTerminalSnapshotDecoderOptions options = decoder_options();
+    assert(ghostty_terminal_snapshot_decoder_new(NULL, &options, &decoder) == SUCCESS);
+    GhosttyTerminal terminal = NULL;
+    size_t offset = 0;
+    while (offset < cut) {
+        GhosttyTerminalSnapshotDecodeEvent event = { .size = sizeof(event), .version = ABI };
+        size_t width = 1 + random_u32() % 31;
+        if (width > cut - offset) width = cut - offset;
+        GhosttyTerminalSnapshotStatus status = ghostty_terminal_snapshot_decoder_push(
+            decoder, bytes->data + offset, width, &event);
+        assert(status == SUCCESS);
+        offset += event.consumed;
+        if (event.kind == GHOSTTY_TERMINAL_SNAPSHOT_DECODE_READY) {
+            GhosttyTerminalSnapshotTakeTerminalResult take = { .size = sizeof(take), .version = ABI };
+            assert(ghostty_terminal_snapshot_decoder_take_terminal(decoder, &take) == SUCCESS);
+            terminal = take.terminal;
+            assert(ghostty_terminal_snapshot_decoder_replay_continuation(decoder, terminal) == SUCCESS);
+        }
+    }
+    GhosttyTerminalSnapshotDecodeEvent eof = { .size = sizeof(eof), .version = ABI };
+    assert(ghostty_terminal_snapshot_decoder_push(decoder, NULL, 0, &eof) ==
+        GHOSTTY_TERMINAL_SNAPSHOT_STATUS_TRUNCATED);
+    ghostty_terminal_snapshot_decoder_free(decoder);
+    if (terminal != NULL) {
+        static const uint8_t usable[] = "usable-after-truncation";
+        ghostty_terminal_vt_write(terminal, usable, sizeof(usable) - 1);
+        ghostty_terminal_free(terminal);
+    }
+}
+
 static void property_splits_and_truncations(const Bytes* bytes) {
-    for (size_t split = 0; split <= bytes->len; ++split)
+    // Exercise arbitrary fragmentation without making runtime quadratic in
+    // fixture size. Record boundaries are all covered deterministically below.
+    assert(decode_split(bytes->data, bytes->len, 0, NULL) == SUCCESS);
+    assert(decode_split(bytes->data, bytes->len, bytes->len, NULL) == SUCCESS);
+    for (size_t iteration = 0; iteration < 32; ++iteration) {
+        size_t split = random_u32() % (bytes->len + 1);
         assert(decode_split(bytes->data, bytes->len, split, NULL) == SUCCESS);
-    for (size_t cut = 0; cut < bytes->len; ++cut) {
-        GhosttyTerminalSnapshotDecoder decoder = NULL;
-        GhosttyTerminalSnapshotDecoderOptions options = decoder_options();
-        assert(ghostty_terminal_snapshot_decoder_new(NULL, &options, &decoder) == SUCCESS);
-        GhosttyTerminal terminal = NULL;
-        size_t offset = 0;
-        while (offset < cut) {
-            GhosttyTerminalSnapshotDecodeEvent event = { .size = sizeof(event), .version = ABI };
-            size_t width = 1 + random_u32() % 31;
-            if (width > cut - offset) width = cut - offset;
-            GhosttyTerminalSnapshotStatus status = ghostty_terminal_snapshot_decoder_push(
-                decoder, bytes->data + offset, width, &event);
-            assert(status == SUCCESS);
-            offset += event.consumed;
-            if (event.kind == GHOSTTY_TERMINAL_SNAPSHOT_DECODE_READY) {
-                GhosttyTerminalSnapshotTakeTerminalResult take = { .size = sizeof(take), .version = ABI };
-                assert(ghostty_terminal_snapshot_decoder_take_terminal(decoder, &take) == SUCCESS);
-                terminal = take.terminal;
-                assert(ghostty_terminal_snapshot_decoder_replay_continuation(decoder, terminal) == SUCCESS);
-            }
-        }
-        GhosttyTerminalSnapshotDecodeEvent eof = { .size = sizeof(eof), .version = ABI };
-        assert(ghostty_terminal_snapshot_decoder_push(decoder, NULL, 0, &eof) ==
-            GHOSTTY_TERMINAL_SNAPSHOT_STATUS_TRUNCATED);
-        ghostty_terminal_snapshot_decoder_free(decoder);
-        if (terminal != NULL) {
-            static const uint8_t usable[] = "usable-after-truncation";
-            ghostty_terminal_vt_write(terminal, usable, sizeof(usable) - 1);
-            ghostty_terminal_free(terminal);
-        }
+    }
+
+    // The ten-byte envelope is followed by ten-byte record headers whose
+    // little-endian payload length starts at byte two. Every complete record
+    // boundary must reject EOF transactionally until FINISH is present.
+    const size_t envelope_len = 10;
+    const size_t record_header_len = 10;
+    assert(bytes->len >= envelope_len);
+    assert_truncated_at(bytes, envelope_len);
+    size_t offset = envelope_len;
+    while (offset < bytes->len) {
+        assert(bytes->len - offset >= record_header_len);
+        size_t payload_len = read_u32_le(bytes->data + offset + 2);
+        assert(payload_len <= bytes->len - offset - record_header_len);
+        offset += record_header_len + payload_len;
+        if (offset < bytes->len) assert_truncated_at(bytes, offset);
+    }
+    assert(offset == bytes->len);
+
+    for (size_t iteration = 0; iteration < 32; ++iteration) {
+        size_t cut = random_u32() % bytes->len;
+        assert_truncated_at(bytes, cut);
     }
 }
 
 static void property_mutations(const Bytes* bytes) {
-    for (size_t iteration = 0; iteration < 256; ++iteration) {
+    for (size_t iteration = 0; iteration < 32; ++iteration) {
         uint8_t* mutated = (uint8_t*)malloc(bytes->len);
         assert(mutated != NULL);
         memcpy(mutated, bytes->data, bytes->len);

@@ -178,7 +178,7 @@ pub fn build(b: *std.Build) !void {
             .name = "lib-vt-snapshot-incremental-c-test",
             .root_module = b.createModule(.{
                 .target = config.target,
-                .optimize = .Debug,
+                .optimize = .ReleaseSafe,
                 .link_libc = true,
             }),
         });
@@ -195,7 +195,7 @@ pub fn build(b: *std.Build) !void {
             .name = "lib-vt-snapshot-incremental-property-test",
             .root_module = b.createModule(.{
                 .target = config.target,
-                .optimize = .Debug,
+                .optimize = .ReleaseSafe,
                 .link_libc = true,
             }),
         });
