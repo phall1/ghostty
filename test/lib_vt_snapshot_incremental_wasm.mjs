@@ -272,7 +272,8 @@ class Runtime {
       } else {
         for (let index = 0; index < count; ++index) {
           result += String.fromCodePoint(
-            this.view().getUint32(codepoints + index * 4, true));
+            this.view().getUint32(codepoints + index * 4, true),
+          );
         }
       }
     }
@@ -1451,8 +1452,7 @@ rt.free(oomSlot, 4);
 rt.dispose(oomOptions);
 const seededHistoryRows = rt.terminalUsize(source, 15);
 assert.equal(rt.gridText(source, 3, 0, 8), "row-0000");
-assert.equal(
-  rt.gridText(source, 3, seededHistoryRows - 1, 8), "row-1992");
+assert.equal(rt.gridText(source, 3, seededHistoryRows - 1, 8), "row-1992");
 const alternateOn = "\x1b[?47h";
 const alternateOff = "\x1b[?47l";
 rt.write(source, alternateOn);
@@ -1461,7 +1461,8 @@ rt.write(
   source,
   "\x1b[?2027h\x1b]133;A\x07\x1b[1;31m" +
     "\x1b]8;;https://example.test/checkpoint\x1b\\" +
-    "ALT-e\u0301-界-" + "wrapped-".repeat(12) +
+    "ALT-e\u0301-界-" +
+    "wrapped-".repeat(12) +
     "\x1b]8;;\x1b\\\x1b[0m\x1b]133;B\x07",
 );
 rt.write(source, alternateOff);
@@ -1469,8 +1470,7 @@ rt.write(source, alternateOff);
 // Restore this fixed 40x8 fixture to primary bottom-left without scrolling.
 rt.write(source, "\x1b[8;1H");
 assert.equal(rt.gridText(source, 3, 0, 8), "row-0000");
-assert.equal(
-  rt.gridText(source, 3, seededHistoryRows - 1, 8), "row-1992");
+assert.equal(rt.gridText(source, 3, seededHistoryRows - 1, 8), "row-1992");
 rt.write(source, "\x1b[31");
 
 const captured = captureAll(rt, source);
@@ -1608,8 +1608,7 @@ assert.ok(sourceHistoryRows > 1000);
 assert.equal(rt.gridText(source, 3, 0, 8), "row-0000");
 // Column-zero normalization keeps the completed SGR text on one row, so its
 // CRLF advances exactly row-1993 into history on both READY/source terminals.
-assert.equal(rt.gridText(
-  source, 3, sourceHistoryRows - 1, 8), "row-1993");
+assert.equal(rt.gridText(source, 3, sourceHistoryRows - 1, 8), "row-1993");
 const checkpointOwner = { value: null };
 historyTransfer(rt, source, historyDestination, checkpointOwner);
 assert.ok(checkpointOwner.value.some((byte) => byte !== 0));
