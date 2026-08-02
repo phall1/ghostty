@@ -1092,7 +1092,7 @@ async function exerciseSharedCodecCorpus(rt) {
   expectDecodeError(rt, future, UNKNOWN_VERSION);
 
   const corrupt = Uint8Array.from(control);
-  corrupt[20] ^= 0x80;
+  corrupt[16] ^= 0x80;
   expectDecodeError(rt, corrupt, CORRUPTION);
   expectDecodeError(rt, control.subarray(0, 20), TRUNCATED);
 }
