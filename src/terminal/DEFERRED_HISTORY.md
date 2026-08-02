@@ -667,7 +667,7 @@ newest_page:u64`. It is followed in this exact order by:
 
 1. `segment_ref_count` 72-byte entries
    `segment_id:u64, object_offset:u64, byte_length:u64, first_page:u64,
-   last_page:u64, digest:[32]byte`;
+last_page:u64, digest:[32]byte`;
 2. `quarantine_ref_count` 48-byte entries
    `object_offset:u64, byte_length:u64, digest:[32]byte`; and
 3. `delta_record_count` 56-byte entries
@@ -1188,25 +1188,25 @@ resize waiting for compression. A miss blocks default enablement.
 
 ## Test, fuzz, and benchmark matrix
 
-| Area          | Tests and properties                                                                     | Benchmark                   |
-| ------------- | ---------------------------------------------------------------------------------------- | --------------------------- |
-| identity      | survive compression/move/compact/reopen/width; line spans and sliced pages never alias   | index overhead 1K..10M rows |
-| anchors       | round trips for affinity; frozen segmentation keeps anchors across Unicode upgrades      | warm/cold lookup            |
-| Unicode       | combining/ZWJ/VS/zero/wide edge/width one; malformed cells; span fences                  | grapheme/reflow throughput  |
-| semantics     | prompt/style/hyperlink/protection/blank runs survive split/merge                         | projected run memory        |
-| Kitty/glyph   | placeholders atomic; missing/live unsupported state rejects before output                | placeholder-heavy reflow    |
-| resize        | provisional tail seal/anchor rollback; layout-gap visibility; exact hot bounds           | both overscan gates         |
-| budgets       | zero/exact/one-less; bounded-write admission is atomic; checkpoint cap backpressures     | step/write overhead         |
-| cancellation  | cancel at every block boundary; <=64 KiB consumed/produced; no late publish              | cancellation latency        |
-| cache/pins    | eviction caps; pin expiration/status/renewal/sublease reclaim schedules                  | hit rate at fixed bytes     |
-| concurrency   | deterministic owner/handle use-cancel-close-completion and mutation schedules            | VT throughput during work   |
-| container     | independent TLV/golden parser; manifest delta refs; exact offsets/digests/LZ4 mutations  | encode/decode/ratio         |
-| crashes       | fail/tear/reorder every host op; CAS/reference and each flush old-or-new only            | recovery/tail size          |
-| recovery      | no-manifest failed-closed; demand quarantine races/failure/reopen/cap/removal            | open/header scan            |
-| repair        | exact authenticated replacement only; slice gaps/overlap/replay/wrong stream rejected    | repair/headroom             |
-| ABI           | handle tombstone reuse/limits/exhaustion and thread races; fuzz wasm/native pointers     | boundary copy overhead      |
-| compatibility | v1/v2 and `GHUNIT2` goldens unchanged; mixed units reject                                | snapshot regression         |
-| security      | token/request forgery, bombs, arithmetic edges, hostile completions                      | auth/checksum cost          |
+| Area          | Tests and properties                                                                    | Benchmark                   |
+| ------------- | --------------------------------------------------------------------------------------- | --------------------------- |
+| identity      | survive compression/move/compact/reopen/width; line spans and sliced pages never alias  | index overhead 1K..10M rows |
+| anchors       | round trips for affinity; frozen segmentation keeps anchors across Unicode upgrades     | warm/cold lookup            |
+| Unicode       | combining/ZWJ/VS/zero/wide edge/width one; malformed cells; span fences                 | grapheme/reflow throughput  |
+| semantics     | prompt/style/hyperlink/protection/blank runs survive split/merge                        | projected run memory        |
+| Kitty/glyph   | placeholders atomic; missing/live unsupported state rejects before output               | placeholder-heavy reflow    |
+| resize        | provisional tail seal/anchor rollback; layout-gap visibility; exact hot bounds          | both overscan gates         |
+| budgets       | zero/exact/one-less; bounded-write admission is atomic; checkpoint cap backpressures    | step/write overhead         |
+| cancellation  | cancel at every block boundary; <=64 KiB consumed/produced; no late publish             | cancellation latency        |
+| cache/pins    | eviction caps; pin expiration/status/renewal/sublease reclaim schedules                 | hit rate at fixed bytes     |
+| concurrency   | deterministic owner/handle use-cancel-close-completion and mutation schedules           | VT throughput during work   |
+| container     | independent TLV/golden parser; manifest delta refs; exact offsets/digests/LZ4 mutations | encode/decode/ratio         |
+| crashes       | fail/tear/reorder every host op; CAS/reference and each flush old-or-new only           | recovery/tail size          |
+| recovery      | no-manifest failed-closed; demand quarantine races/failure/reopen/cap/removal           | open/header scan            |
+| repair        | exact authenticated replacement only; slice gaps/overlap/replay/wrong stream rejected   | repair/headroom             |
+| ABI           | handle tombstone reuse/limits/exhaustion and thread races; fuzz wasm/native pointers    | boundary copy overhead      |
+| compatibility | v1/v2 and `GHUNIT2` goldens unchanged; mixed units reject                               | snapshot regression         |
+| security      | token/request forgery, bombs, arithmetic edges, hostile completions                     | auth/checksum cost          |
 
 Every persistent version has checked-in golden bytes and an independent parser
 fixture. Crash tests use a fake transport that records and tears operations.
