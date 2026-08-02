@@ -565,10 +565,13 @@ pub fn captureDetachReady(
     }
     const terminal = terminal_c.zigTerminal(state.terminal) orelse
         return .wrong_terminal;
+    if (state.page_records > state.max_pages) return .invalid_state;
+    const remaining_pages = state.max_pages - state.page_records;
+    const detached_page_limit = @min(options.max_pages, remaining_pages);
     var detached = snapshot.history.DetachedHistories.init(
         state.alloc,
         terminal,
-        options.max_pages,
+        detached_page_limit,
         options.max_total_bytes,
         state.output_buffer.len,
         options.max_rows,

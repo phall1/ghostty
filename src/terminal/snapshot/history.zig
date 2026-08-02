@@ -1046,8 +1046,7 @@ pub const DetachedHistories = struct {
         max_record_bytes: usize,
         max_rows: usize,
     ) InitError!DetachedHistories {
-        if (max_pages == 0 or
-            max_total_bytes == 0 or
+        if (max_total_bytes == 0 or
             max_record_bytes < record.Header.len or
             max_rows == 0)
         {
