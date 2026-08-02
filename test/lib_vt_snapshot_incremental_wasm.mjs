@@ -25,7 +25,9 @@ assert.deepEqual(
 for (const entry of moduleImports) {
   assert.ok(
     entry.module === "ghostty" ||
-      (entry.module === "env" && entry.name === "log" && entry.kind === "function"),
+      (entry.module === "env" &&
+        entry.name === "log" &&
+        entry.kind === "function"),
     `unexpected standalone wasm import ${entry.module}.${entry.name}:${entry.kind}`,
   );
 }
@@ -57,7 +59,10 @@ async function instantiateRuntime(entropyProvider = secureEntropy) {
   const imports = {};
   for (const entry of moduleImports) {
     imports[entry.module] ??= {};
-    if (entry.module === entropyImport.module && entry.name === entropyImport.name) {
+    if (
+      entry.module === entropyImport.module &&
+      entry.name === entropyImport.name
+    ) {
       imports[entry.module][entry.name] = (ptr, len) => {
         try {
           return entropyProvider(() => memory, ptr >>> 0, len >>> 0) | 0;
@@ -107,8 +112,12 @@ class Runtime {
     this.layouts = JSON.parse(this.cString(exports.ghostty_type_json()));
   }
 
-  u8() { return new Uint8Array(this.e.memory.buffer); }
-  view() { return new DataView(this.e.memory.buffer); }
+  u8() {
+    return new Uint8Array(this.e.memory.buffer);
+  }
+  view() {
+    return new DataView(this.e.memory.buffer);
+  }
 
   alloc(len) {
     const ptr = this.e.ghostty_alloc(0, len);
@@ -149,32 +158,52 @@ class Runtime {
   struct(name) {
     const result = this.rawStruct(name);
     const fields = this.layout(name).fields;
-    if (fields.size) this.view().setUint32(
-      result.ptr + fields.size.offset, result.size, true);
-    if (fields.version) this.view().setUint32(
-      result.ptr + fields.version.offset, 1, true);
+    if (fields.size)
+      this.view().setUint32(result.ptr + fields.size.offset, result.size, true);
+    if (fields.version)
+      this.view().setUint32(result.ptr + fields.version.offset, 1, true);
     return result;
   }
 
-  dispose(value) { this.free(value.ptr, value.size); }
+  dispose(value) {
+    this.free(value.ptr, value.size);
+  }
   getUsize(value, member) {
-    return this.view().getUint32(value.ptr + this.field(value.name, member), true);
+    return this.view().getUint32(
+      value.ptr + this.field(value.name, member),
+      true,
+    );
   }
   setUsize(value, member, number) {
-    this.view().setUint32(value.ptr + this.field(value.name, member), number, true);
+    this.view().setUint32(
+      value.ptr + this.field(value.name, member),
+      number,
+      true,
+    );
   }
   getI32(value, member) {
-    return this.view().getInt32(value.ptr + this.field(value.name, member), true);
+    return this.view().getInt32(
+      value.ptr + this.field(value.name, member),
+      true,
+    );
   }
   setPtr(value, member, ptr) {
-    this.view().setUint32(value.ptr + this.field(value.name, member), ptr, true);
+    this.view().setUint32(
+      value.ptr + this.field(value.name, member),
+      ptr,
+      true,
+    );
   }
   inlineString(value, member) {
     const stringPtr = value.ptr + this.field(value.name, member);
     const ptr = this.view().getUint32(
-      stringPtr + this.field("GhosttyString", "ptr"), true);
+      stringPtr + this.field("GhosttyString", "ptr"),
+      true,
+    );
     const len = this.view().getUint32(
-      stringPtr + this.field("GhosttyString", "len"), true);
+      stringPtr + this.field("GhosttyString", "len"),
+      true,
+    );
     return new TextDecoder().decode(this.u8().subarray(ptr, ptr + len));
   }
 
@@ -189,7 +218,8 @@ class Runtime {
   }
 
   write(terminal, input) {
-    const bytes = typeof input === "string" ? new TextEncoder().encode(input) : input;
+    const bytes =
+      typeof input === "string" ? new TextEncoder().encode(input) : input;
     const ptr = this.alloc(bytes.length);
     this.u8().set(bytes, ptr);
     this.e.ghostty_terminal_vt_write(terminal, ptr, bytes.length);
@@ -214,19 +244,28 @@ class Runtime {
     const codepoint = this.alloc(4);
     const written = this.alloc(4);
     const coordinate = point.ptr + this.field(point.name, "value");
-    this.view().setInt32(
-      point.ptr + this.field(point.name, "tag"), tag, true);
+    this.view().setInt32(point.ptr + this.field(point.name, "tag"), tag, true);
     this.view().setUint32(
-      coordinate + this.field("GhosttyPointCoordinate", "y"), y, true);
+      coordinate + this.field("GhosttyPointCoordinate", "y"),
+      y,
+      true,
+    );
     let result = "";
     for (let x = 0; x < length; ++x) {
       this.view().setUint16(
-        coordinate + this.field("GhosttyPointCoordinate", "x"), x, true);
-      assert.equal(this.e.ghostty_terminal_grid_ref(
-        terminal, point.ptr, ref.ptr), SUCCESS);
+        coordinate + this.field("GhosttyPointCoordinate", "x"),
+        x,
+        true,
+      );
+      assert.equal(
+        this.e.ghostty_terminal_grid_ref(terminal, point.ptr, ref.ptr),
+        SUCCESS,
+      );
       this.view().setUint32(written, 0, true);
-      assert.equal(this.e.ghostty_grid_ref_graphemes(
-        ref.ptr, codepoint, 1, written), SUCCESS);
+      assert.equal(
+        this.e.ghostty_grid_ref_graphemes(ref.ptr, codepoint, 1, written),
+        SUCCESS,
+      );
       assert.equal(this.view().getUint32(written, true), 1);
       result += String.fromCodePoint(this.view().getUint32(codepoint, true));
     }
@@ -239,25 +278,30 @@ class Runtime {
 }
 
 function terminalData(rt, terminal, kind, shape) {
-  const output = typeof shape === "string"
-    ? (shape === "GhosttyString" ? rt.rawStruct(shape) : rt.struct(shape))
-    : { ptr: rt.alloc(shape), size: shape, name: null };
+  const output =
+    typeof shape === "string"
+      ? shape === "GhosttyString"
+        ? rt.rawStruct(shape)
+        : rt.struct(shape)
+      : { ptr: rt.alloc(shape), size: shape, name: null };
   rt.u8().fill(0, output.ptr, output.ptr + output.size);
   if (output.name && rt.layout(output.name).fields.size) {
     rt.view().setUint32(
-      output.ptr + rt.field(output.name, "size"), output.size, true);
+      output.ptr + rt.field(output.name, "size"),
+      output.size,
+      true,
+    );
   }
   const status = rt.e.ghostty_terminal_get(terminal, kind, output.ptr);
   let value = new Uint8Array();
   if (status === SUCCESS && shape === "GhosttyString") {
-    const ptr = rt.view().getUint32(
-      output.ptr + rt.field(shape, "ptr"), true);
-    const len = rt.view().getUint32(
-      output.ptr + rt.field(shape, "len"), true);
+    const ptr = rt.view().getUint32(output.ptr + rt.field(shape, "ptr"), true);
+    const len = rt.view().getUint32(output.ptr + rt.field(shape, "len"), true);
     value = Uint8Array.from(rt.u8().subarray(ptr, ptr + len));
   } else if (status === SUCCESS) {
     value = Uint8Array.from(
-      rt.u8().subarray(output.ptr, output.ptr + output.size));
+      rt.u8().subarray(output.ptr, output.ptr + output.size),
+    );
   }
   rt.free(output.ptr, output.size);
   return { status, value };
@@ -266,12 +310,35 @@ function terminalData(rt, terminal, kind, shape) {
 function assertTerminalMetadataEqual(rt, left, right) {
   const rgbSize = rt.layout("GhosttyColorRgb").size;
   const fields = [
-    [1, 2], [2, 2], [3, 2], [4, 2], [5, 1], [6, 4], [7, 1], [8, 1],
-    [9, "GhosttyTerminalScrollbar"], [10, "GhosttyStyle"], [11, 1],
-    [12, "GhosttyString"], [13, "GhosttyString"], [14, 4], [15, 4],
-    [16, 4], [17, 4], [18, rgbSize], [19, rgbSize], [20, rgbSize],
-    [21, rgbSize * 256], [22, rgbSize], [23, rgbSize], [24, rgbSize],
-    [25, rgbSize * 256], [32, 1], [33, 1], [34, 4], [35, 4],
+    [1, 2],
+    [2, 2],
+    [3, 2],
+    [4, 2],
+    [5, 1],
+    [6, 4],
+    [7, 1],
+    [8, 1],
+    [9, "GhosttyTerminalScrollbar"],
+    [10, "GhosttyStyle"],
+    [11, 1],
+    [12, "GhosttyString"],
+    [13, "GhosttyString"],
+    [14, 4],
+    [15, 4],
+    [16, 4],
+    [17, 4],
+    [18, rgbSize],
+    [19, rgbSize],
+    [20, rgbSize],
+    [21, rgbSize * 256],
+    [22, rgbSize],
+    [23, rgbSize],
+    [24, rgbSize],
+    [25, rgbSize * 256],
+    [32, 1],
+    [33, 1],
+    [34, 4],
+    [35, 4],
   ];
   for (const [kind, shape] of fields) {
     assert.deepEqual(
@@ -283,10 +350,9 @@ function assertTerminalMetadataEqual(rt, left, right) {
 
   const ansiModes = [2, 4, 12, 20];
   const decModes = [
-    1, 3, 4, 5, 6, 7, 8, 9, 12, 25, 40, 45, 47, 66, 67, 69,
-    1000, 1002, 1003, 1004, 1005, 1006, 1007, 1015, 1016, 1035,
-    1036, 1039, 1045, 1047, 1048, 1049, 2004, 2026, 2027, 2031,
-    2033, 2048,
+    1, 3, 4, 5, 6, 7, 8, 9, 12, 25, 40, 45, 47, 66, 67, 69, 1000, 1002, 1003,
+    1004, 1005, 1006, 1007, 1015, 1016, 1035, 1036, 1039, 1045, 1047, 1048,
+    1049, 2004, 2026, 2027, 2031, 2033, 2048,
   ];
   const leftValue = rt.alloc(1);
   const rightValue = rt.alloc(1);
@@ -311,9 +377,15 @@ function setPoint(rt, point, tag, x, y) {
   const coordinate = point.ptr + rt.field(point.name, "value");
   rt.view().setInt32(point.ptr + rt.field(point.name, "tag"), tag, true);
   rt.view().setUint16(
-    coordinate + rt.field("GhosttyPointCoordinate", "x"), x, true);
+    coordinate + rt.field("GhosttyPointCoordinate", "x"),
+    x,
+    true,
+  );
   rt.view().setUint32(
-    coordinate + rt.field("GhosttyPointCoordinate", "y"), y, true);
+    coordinate + rt.field("GhosttyPointCoordinate", "y"),
+    y,
+    true,
+  );
 }
 
 function gridRef(rt, terminal, point, ref) {
@@ -328,9 +400,10 @@ function cellData(rt, cell, kind, output) {
   const status = rt.e.ghostty_cell_get(cell, kind, output);
   return {
     status,
-    value: status === SUCCESS
-      ? Uint8Array.from(rt.u8().subarray(output, output + 16))
-      : new Uint8Array(),
+    value:
+      status === SUCCESS
+        ? Uint8Array.from(rt.u8().subarray(output, output + 16))
+        : new Uint8Array(),
   };
 }
 
@@ -339,16 +412,16 @@ function rowData(rt, row, kind, output) {
   const status = rt.e.ghostty_row_get(row, kind, output);
   return {
     status,
-    value: status === SUCCESS
-      ? Uint8Array.from(rt.u8().subarray(output, output + 8))
-      : new Uint8Array(),
+    value:
+      status === SUCCESS
+        ? Uint8Array.from(rt.u8().subarray(output, output + 8))
+        : new Uint8Array(),
   };
 }
 
 function graphemes(rt, ref, buffer, written) {
   rt.view().setUint32(written, 0, true);
-  const status = rt.e.ghostty_grid_ref_graphemes(
-    ref.ptr, buffer, 64, written);
+  const status = rt.e.ghostty_grid_ref_graphemes(ref.ptr, buffer, 64, written);
   assert.equal(status, SUCCESS);
   const count = rt.view().getUint32(written, true);
   assert.ok(count <= 64);
@@ -357,8 +430,7 @@ function graphemes(rt, ref, buffer, written) {
 
 function hyperlink(rt, ref, written) {
   rt.view().setUint32(written, 0, true);
-  const status = rt.e.ghostty_grid_ref_hyperlink_uri(
-    ref.ptr, 0, 0, written);
+  const status = rt.e.ghostty_grid_ref_hyperlink_uri(ref.ptr, 0, 0, written);
   const required = rt.view().getUint32(written, true);
   if (status === SUCCESS) {
     assert.equal(required, 0);
@@ -368,8 +440,10 @@ function hyperlink(rt, ref, written) {
   assert.ok(required > 0 && required <= 1024 * 1024);
   const buffer = rt.alloc(required);
   rt.view().setUint32(written, 0, true);
-  assert.equal(rt.e.ghostty_grid_ref_hyperlink_uri(
-    ref.ptr, buffer, required, written), SUCCESS);
+  assert.equal(
+    rt.e.ghostty_grid_ref_hyperlink_uri(ref.ptr, buffer, required, written),
+    SUCCESS,
+  );
   assert.equal(rt.view().getUint32(written, true), required);
   const value = Uint8Array.from(rt.u8().subarray(buffer, buffer + required));
   rt.free(buffer, required);
@@ -379,7 +453,10 @@ function hyperlink(rt, ref, written) {
 function resetSized(rt, value) {
   rt.u8().fill(0, value.ptr, value.ptr + value.size);
   rt.view().setUint32(
-    value.ptr + rt.field(value.name, "size"), value.size, true);
+    value.ptr + rt.field(value.name, "size"),
+    value.size,
+    true,
+  );
 }
 
 function assertGridEqual(rt, left, right) {
@@ -422,10 +499,14 @@ function assertGridEqual(rt, left, right) {
         gridRef(rt, right, rightPoint, rightRef);
         const label = `${regionName}[${y},${x}]`;
 
-        assert.equal(rt.e.ghostty_grid_ref_cell(
-          leftRef.ptr, leftCell), SUCCESS);
-        assert.equal(rt.e.ghostty_grid_ref_cell(
-          rightRef.ptr, rightCell), SUCCESS);
+        assert.equal(
+          rt.e.ghostty_grid_ref_cell(leftRef.ptr, leftCell),
+          SUCCESS,
+        );
+        assert.equal(
+          rt.e.ghostty_grid_ref_cell(rightRef.ptr, rightCell),
+          SUCCESS,
+        );
         const leftCellValue = rt.view().getBigUint64(leftCell, true);
         const rightCellValue = rt.view().getBigUint64(rightCell, true);
         let hasStyling = false;
@@ -445,10 +526,14 @@ function assertGridEqual(rt, left, right) {
         if (hasStyling) {
           resetSized(rt, leftStyle);
           resetSized(rt, rightStyle);
-          assert.equal(rt.e.ghostty_grid_ref_style(
-            leftRef.ptr, leftStyle.ptr), SUCCESS);
-          assert.equal(rt.e.ghostty_grid_ref_style(
-            rightRef.ptr, rightStyle.ptr), SUCCESS);
+          assert.equal(
+            rt.e.ghostty_grid_ref_style(leftRef.ptr, leftStyle.ptr),
+            SUCCESS,
+          );
+          assert.equal(
+            rt.e.ghostty_grid_ref_style(rightRef.ptr, rightStyle.ptr),
+            SUCCESS,
+          );
           assert.deepEqual(
             rt.u8().subarray(rightStyle.ptr, rightStyle.ptr + rightStyle.size),
             rt.u8().subarray(leftStyle.ptr, leftStyle.ptr + leftStyle.size),
@@ -464,10 +549,14 @@ function assertGridEqual(rt, left, right) {
         }
 
         if (x === 0) {
-          assert.equal(rt.e.ghostty_grid_ref_row(
-            leftRef.ptr, leftRow), SUCCESS);
-          assert.equal(rt.e.ghostty_grid_ref_row(
-            rightRef.ptr, rightRow), SUCCESS);
+          assert.equal(
+            rt.e.ghostty_grid_ref_row(leftRef.ptr, leftRow),
+            SUCCESS,
+          );
+          assert.equal(
+            rt.e.ghostty_grid_ref_row(rightRef.ptr, rightRow),
+            SUCCESS,
+          );
           const leftRowValue = rt.view().getBigUint64(leftRow, true);
           const rightRowValue = rt.view().getBigUint64(rightRow, true);
           for (let kind = 1; kind <= 7; ++kind) {
@@ -530,16 +619,25 @@ function captureAll(rt, terminal, allocator = 0) {
   const options = captureOptions(rt);
   const slot = rt.alloc(4);
   rt.view().setUint32(slot, 0, true);
-  assert.equal(rt.e.ghostty_terminal_snapshot_capture_new(
-    allocator, terminal, options.ptr, slot), SUCCESS);
+  assert.equal(
+    rt.e.ghostty_terminal_snapshot_capture_new(
+      allocator,
+      terminal,
+      options.ptr,
+      slot,
+    ),
+    SUCCESS,
+  );
   const capture = rt.view().getUint32(slot, true);
   assert.notEqual(capture, 0);
   const records = [];
   let offset = 0;
   for (;;) {
     const probe = rt.struct("GhosttyTerminalSnapshotCaptureEvent");
-    assert.equal(rt.e.ghostty_terminal_snapshot_capture_next(
-      capture, 0, 0, probe.ptr), OUT_OF_SPACE);
+    assert.equal(
+      rt.e.ghostty_terminal_snapshot_capture_next(capture, 0, 0, probe.ptr),
+      OUT_OF_SPACE,
+    );
     assert.equal(rt.getUsize(probe, "written"), 0);
     const required = rt.getUsize(probe, "required_bytes");
     const kind = rt.getI32(probe, "kind");
@@ -547,16 +645,30 @@ function captureAll(rt, terminal, allocator = 0) {
     const buffer = rt.alloc(required);
     if (required > 1) {
       const short = rt.struct("GhosttyTerminalSnapshotCaptureEvent");
-      assert.equal(rt.e.ghostty_terminal_snapshot_capture_next(
-        capture, buffer, required - 1, short.ptr), OUT_OF_SPACE);
+      assert.equal(
+        rt.e.ghostty_terminal_snapshot_capture_next(
+          capture,
+          buffer,
+          required - 1,
+          short.ptr,
+        ),
+        OUT_OF_SPACE,
+      );
       assert.equal(rt.getUsize(short, "written"), 0);
       assert.equal(rt.getUsize(short, "required_bytes"), required);
       assert.equal(rt.getI32(short, "kind"), kind);
       rt.dispose(short);
     }
     const exact = rt.struct("GhosttyTerminalSnapshotCaptureEvent");
-    assert.equal(rt.e.ghostty_terminal_snapshot_capture_next(
-      capture, buffer, required, exact.ptr), SUCCESS);
+    assert.equal(
+      rt.e.ghostty_terminal_snapshot_capture_next(
+        capture,
+        buffer,
+        required,
+        exact.ptr,
+      ),
+      SUCCESS,
+    );
     assert.equal(rt.getUsize(exact, "written"), required);
     assert.equal(rt.getI32(exact, "kind"), kind);
     records.push({
@@ -565,8 +677,9 @@ function captureAll(rt, terminal, allocator = 0) {
       offset,
       index: rt.getUsize(exact, "index"),
       count: rt.getUsize(exact, "count"),
-      screenKey: rt.view().getUint16(
-        exact.ptr + rt.field(exact.name, "screen_key"), true),
+      screenKey: rt
+        .view()
+        .getUint16(exact.ptr + rt.field(exact.name, "screen_key"), true),
     });
     offset += required;
     rt.free(buffer, required);
@@ -587,16 +700,22 @@ function exerciseCaptureLimit(rt, terminal) {
   const options = captureOptions(rt, 10);
   const slot = rt.alloc(4);
   rt.view().setUint32(slot, 0, true);
-  assert.equal(rt.e.ghostty_terminal_snapshot_capture_new(
-    0, terminal, options.ptr, slot), SUCCESS);
+  assert.equal(
+    rt.e.ghostty_terminal_snapshot_capture_new(0, terminal, options.ptr, slot),
+    SUCCESS,
+  );
   const capture = rt.view().getUint32(slot, true);
   const event = rt.struct("GhosttyTerminalSnapshotCaptureEvent");
   const buffer = rt.alloc(10);
-  assert.equal(rt.e.ghostty_terminal_snapshot_capture_next(
-    capture, buffer, 10, event.ptr), SUCCESS);
+  assert.equal(
+    rt.e.ghostty_terminal_snapshot_capture_next(capture, buffer, 10, event.ptr),
+    SUCCESS,
+  );
   assert.equal(rt.getUsize(event, "written"), 10);
-  assert.equal(rt.e.ghostty_terminal_snapshot_capture_next(
-    capture, buffer, 10, event.ptr), LIMIT_EXCEEDED);
+  assert.equal(
+    rt.e.ghostty_terminal_snapshot_capture_next(capture, buffer, 10, event.ptr),
+    LIMIT_EXCEEDED,
+  );
   rt.e.ghostty_terminal_snapshot_capture_free(capture);
   rt.free(buffer, 10);
   rt.dispose(event);
@@ -622,18 +741,27 @@ function wasmSection(id, payload) {
 function allocatorProxyModuleBytes() {
   const i32 = 0x7f;
   const type = (parameters, result) => [
-    0x60, ...uleb(parameters), ...Array(parameters).fill(i32),
-    result ? 1 : 0, ...(result ? [i32] : []),
+    0x60,
+    ...uleb(parameters),
+    ...Array(parameters).fill(i32),
+    result ? 1 : 0,
+    ...(result ? [i32] : []),
   ];
   const types = [
-    ...uleb(3), ...type(4, true), ...type(6, true), ...type(5, false),
+    ...uleb(3),
+    ...type(4, true),
+    ...type(6, true),
+    ...type(5, false),
   ];
   const string = (value) => {
     const bytes = new TextEncoder().encode(value);
     return [...uleb(bytes.length), ...bytes];
   };
   const importEntry = (name, typeIndex) => [
-    ...string("host"), ...string(name), 0, ...uleb(typeIndex),
+    ...string("host"),
+    ...string(name),
+    0,
+    ...uleb(typeIndex),
   ];
   const imports = [
     ...uleb(4),
@@ -642,9 +770,7 @@ function allocatorProxyModuleBytes() {
     ...importEntry("remap", 1),
     ...importEntry("free", 2),
   ];
-  const exportEntry = (name, index) => [
-    ...string(name), 0, ...uleb(index),
-  ];
+  const exportEntry = (name, index) => [...string(name), 0, ...uleb(index)];
   const exports = [
     ...uleb(4),
     ...exportEntry("alloc", 0),
@@ -653,7 +779,14 @@ function allocatorProxyModuleBytes() {
     ...exportEntry("free", 3),
   ];
   return new Uint8Array([
-    0, 0x61, 0x73, 0x6d, 1, 0, 0, 0,
+    0,
+    0x61,
+    0x73,
+    0x6d,
+    1,
+    0,
+    0,
+    0,
     ...wasmSection(1, types),
     ...wasmSection(2, imports),
     ...wasmSection(7, exports),
@@ -695,8 +828,9 @@ async function makeTrackingAllocator(rt) {
       rt.e.ghostty_free(0, memory, memoryLen);
     },
   };
-  const helper = await WebAssembly.instantiate(
-    allocatorProxyModuleBytes(), { host });
+  const helper = await WebAssembly.instantiate(allocatorProxyModuleBytes(), {
+    host,
+  });
   const table = Object.values(rt.e).find(
     (value) => value instanceof WebAssembly.Table,
   );
@@ -745,12 +879,19 @@ async function makeTrackingAllocator(rt) {
   };
 }
 
-function expectDecodeError(rt, bytes, expected, maxRecordBytes = 4 * 1024 * 1024) {
+function expectDecodeError(
+  rt,
+  bytes,
+  expected,
+  maxRecordBytes = 4 * 1024 * 1024,
+) {
   const options = decoderOptions(rt, maxRecordBytes);
   const slot = rt.alloc(4);
   rt.view().setUint32(slot, 0, true);
-  assert.equal(rt.e.ghostty_terminal_snapshot_decoder_new(
-    0, options.ptr, slot), SUCCESS);
+  assert.equal(
+    rt.e.ghostty_terminal_snapshot_decoder_new(0, options.ptr, slot),
+    SUCCESS,
+  );
   const decoder = rt.view().getUint32(slot, true);
   const input = rt.alloc(bytes.length);
   rt.u8().set(bytes, input);
@@ -760,16 +901,28 @@ function expectDecodeError(rt, bytes, expected, maxRecordBytes = 4 * 1024 * 1024
   while (offset < bytes.length && status === SUCCESS) {
     const event = rt.struct("GhosttyTerminalSnapshotDecodeEvent");
     status = rt.e.ghostty_terminal_snapshot_decoder_push(
-      decoder, input + offset, bytes.length - offset, event.ptr);
+      decoder,
+      input + offset,
+      bytes.length - offset,
+      event.ptr,
+    );
     offset += rt.getUsize(event, "consumed");
     if (status === SUCCESS && rt.getI32(event, "kind") === DECODE_READY) {
       const take = rt.struct("GhosttyTerminalSnapshotTakeTerminalResult");
-      assert.equal(rt.e.ghostty_terminal_snapshot_decoder_take_terminal(
-        decoder, take.ptr), SUCCESS);
-      terminal = rt.view().getUint32(
-        take.ptr + rt.field(take.name, "terminal"), true);
-      assert.equal(rt.e.ghostty_terminal_snapshot_decoder_replay_continuation(
-        decoder, terminal), SUCCESS);
+      assert.equal(
+        rt.e.ghostty_terminal_snapshot_decoder_take_terminal(decoder, take.ptr),
+        SUCCESS,
+      );
+      terminal = rt
+        .view()
+        .getUint32(take.ptr + rt.field(take.name, "terminal"), true);
+      assert.equal(
+        rt.e.ghostty_terminal_snapshot_decoder_replay_continuation(
+          decoder,
+          terminal,
+        ),
+        SUCCESS,
+      );
       rt.dispose(take);
     }
     rt.dispose(event);
@@ -786,64 +939,127 @@ function expectDecodeError(rt, bytes, expected, maxRecordBytes = 4 * 1024 * 1024
 function historyTransfer(rt, source, destination, checkpointOwner) {
   const options = historyOptions(rt);
   const wrongGeneration = rt.struct("GhosttyTerminalHistoryLeaseResult");
-  assert.equal(rt.e.ghostty_terminal_history_lease_new(
-    0, source, 0xffff, wrongGeneration.ptr), WRONG_GENERATION);
+  assert.equal(
+    rt.e.ghostty_terminal_history_lease_new(
+      0,
+      source,
+      0xffff,
+      wrongGeneration.ptr,
+    ),
+    WRONG_GENERATION,
+  );
   rt.dispose(wrongGeneration);
 
   const lease = rt.struct("GhosttyTerminalHistoryLeaseResult");
-  assert.equal(rt.e.ghostty_terminal_history_lease_new(
-    0, source, 0, lease.ptr), SUCCESS);
-  const leaseHandle = rt.view().getUint32(
-    lease.ptr + rt.field(lease.name, "lease"), true);
+  assert.equal(
+    rt.e.ghostty_terminal_history_lease_new(0, source, 0, lease.ptr),
+    SUCCESS,
+  );
+  const leaseHandle = rt
+    .view()
+    .getUint32(lease.ptr + rt.field(lease.name, "lease"), true);
   const checkpoint = lease.ptr + rt.field(lease.name, "checkpoint");
   assert.notEqual(leaseHandle, 0);
 
   const cursor = rt.struct("GhosttyTerminalHistoryCursorResult");
-  assert.equal(rt.e.ghostty_terminal_history_lease_cursor(
-    leaseHandle, source, cursor.ptr), SUCCESS);
-  const cursorHandle = rt.view().getUint32(
-    cursor.ptr + rt.field(cursor.name, "cursor"), true);
+  assert.equal(
+    rt.e.ghostty_terminal_history_lease_cursor(leaseHandle, source, cursor.ptr),
+    SUCCESS,
+  );
+  const cursorHandle = rt
+    .view()
+    .getUint32(cursor.ptr + rt.field(cursor.name, "cursor"), true);
   assert.notEqual(cursorHandle, 0);
   const secondCursor = rt.struct("GhosttyTerminalHistoryCursorResult");
-  assert.equal(rt.e.ghostty_terminal_history_lease_cursor(
-    leaseHandle, source, secondCursor.ptr), INVALID_STATE);
+  assert.equal(
+    rt.e.ghostty_terminal_history_lease_cursor(
+      leaseHandle,
+      source,
+      secondCursor.ptr,
+    ),
+    INVALID_STATE,
+  );
   rt.dispose(secondCursor);
 
   const wrongCursorEvent = rt.struct("GhosttyTerminalHistoryEvent");
-  assert.equal(rt.e.ghostty_terminal_history_cursor_next(
-    cursorHandle, destination, options.ptr, 0, 0, wrongCursorEvent.ptr),
-  WRONG_TERMINAL);
+  assert.equal(
+    rt.e.ghostty_terminal_history_cursor_next(
+      cursorHandle,
+      destination,
+      options.ptr,
+      0,
+      0,
+      wrongCursorEvent.ptr,
+    ),
+    WRONG_TERMINAL,
+  );
   rt.dispose(wrongCursorEvent);
 
   const token = rt.rawStruct("GhosttyTerminalHistoryToken");
-  rt.u8().set(
-    rt.u8().subarray(checkpoint, checkpoint + token.size), token.ptr);
+  rt.u8().set(rt.u8().subarray(checkpoint, checkpoint + token.size), token.ptr);
   const tokenBytes = token.ptr + rt.field(token.name, "bytes");
   rt.u8()[tokenBytes + 31] ^= 0x80;
   const rejected = rt.struct("GhosttyTerminalHistoryImporterResult");
-  assert.equal(rt.e.ghostty_terminal_history_importer_new(
-    0, destination, 0, source, token.ptr, options.ptr, rejected.ptr),
-  INVALID_HANDLE);
+  assert.equal(
+    rt.e.ghostty_terminal_history_importer_new(
+      0,
+      destination,
+      0,
+      source,
+      token.ptr,
+      options.ptr,
+      rejected.ptr,
+    ),
+    INVALID_HANDLE,
+  );
   rt.dispose(rejected);
   rt.dispose(token);
 
   const wrongImporter = rt.struct("GhosttyTerminalHistoryImporterResult");
-  assert.equal(rt.e.ghostty_terminal_history_importer_new(
-    0, destination, 0xffff, source, checkpoint, options.ptr,
-    wrongImporter.ptr), WRONG_GENERATION);
+  assert.equal(
+    rt.e.ghostty_terminal_history_importer_new(
+      0,
+      destination,
+      0xffff,
+      source,
+      checkpoint,
+      options.ptr,
+      wrongImporter.ptr,
+    ),
+    WRONG_GENERATION,
+  );
   rt.dispose(wrongImporter);
 
   const importer = rt.struct("GhosttyTerminalHistoryImporterResult");
-  assert.equal(rt.e.ghostty_terminal_history_importer_new(
-    0, destination, 0, source, checkpoint, options.ptr, importer.ptr),
-  SUCCESS);
-  const importerHandle = rt.view().getUint32(
-    importer.ptr + rt.field(importer.name, "importer"), true);
+  assert.equal(
+    rt.e.ghostty_terminal_history_importer_new(
+      0,
+      destination,
+      0,
+      source,
+      checkpoint,
+      options.ptr,
+      importer.ptr,
+    ),
+    SUCCESS,
+  );
+  const importerHandle = rt
+    .view()
+    .getUint32(importer.ptr + rt.field(importer.name, "importer"), true);
   assert.notEqual(importerHandle, 0);
   const busy = rt.struct("GhosttyTerminalHistoryImporterResult");
-  assert.equal(rt.e.ghostty_terminal_history_importer_new(
-    0, destination, 0, source, checkpoint, options.ptr, busy.ptr),
-  IMPORT_BUSY);
+  assert.equal(
+    rt.e.ghostty_terminal_history_importer_new(
+      0,
+      destination,
+      0,
+      source,
+      checkpoint,
+      options.ptr,
+      busy.ptr,
+    ),
+    IMPORT_BUSY,
+  );
   rt.dispose(busy);
 
   let unitCount = 0;
@@ -851,7 +1067,13 @@ function historyTransfer(rt, source, destination, checkpointOwner) {
   for (;;) {
     const probe = rt.struct("GhosttyTerminalHistoryEvent");
     const probeStatus = rt.e.ghostty_terminal_history_cursor_next(
-      cursorHandle, source, options.ptr, 0, 0, probe.ptr);
+      cursorHandle,
+      source,
+      options.ptr,
+      0,
+      0,
+      probe.ptr,
+    );
     if (probeStatus === SUCCESS) {
       assert.equal(rt.getI32(probe, "kind"), HISTORY_END);
       rt.dispose(probe);
@@ -863,16 +1085,33 @@ function historyTransfer(rt, source, destination, checkpointOwner) {
     const unit = rt.alloc(required);
     if (required > 1) {
       const short = rt.struct("GhosttyTerminalHistoryEvent");
-      assert.equal(rt.e.ghostty_terminal_history_cursor_next(
-        cursorHandle, source, options.ptr, unit, required - 1, short.ptr),
-      OUT_OF_SPACE);
+      assert.equal(
+        rt.e.ghostty_terminal_history_cursor_next(
+          cursorHandle,
+          source,
+          options.ptr,
+          unit,
+          required - 1,
+          short.ptr,
+        ),
+        OUT_OF_SPACE,
+      );
       assert.equal(rt.getUsize(short, "written"), 0);
       assert.equal(rt.getUsize(short, "required_bytes"), required);
       rt.dispose(short);
     }
     const exact = rt.struct("GhosttyTerminalHistoryEvent");
-    assert.equal(rt.e.ghostty_terminal_history_cursor_next(
-      cursorHandle, source, options.ptr, unit, required, exact.ptr), SUCCESS);
+    assert.equal(
+      rt.e.ghostty_terminal_history_cursor_next(
+        cursorHandle,
+        source,
+        options.ptr,
+        unit,
+        required,
+        exact.ptr,
+      ),
+      SUCCESS,
+    );
     assert.equal(rt.getI32(exact, "kind"), HISTORY_UNIT);
     const written = rt.getUsize(exact, "written");
     assert.equal(written, required);
@@ -881,35 +1120,71 @@ function historyTransfer(rt, source, destination, checkpointOwner) {
     if (!corrupted) {
       rt.u8()[unit + written - 1] ^= 0x40;
       for (let attempt = 0; attempt < 1024; ++attempt) {
-        assert.equal(rt.e.ghostty_terminal_history_importer_push(
-          importerHandle, destination, unit, written, options.ptr, imported.ptr),
-        CORRUPTION);
+        assert.equal(
+          rt.e.ghostty_terminal_history_importer_push(
+            importerHandle,
+            destination,
+            unit,
+            written,
+            options.ptr,
+            imported.ptr,
+          ),
+          CORRUPTION,
+        );
         assert.equal(rt.getUsize(imported, "consumed"), 0);
       }
       rt.u8()[unit + written - 1] ^= 0x40;
       corrupted = true;
     }
-    assert.equal(rt.e.ghostty_terminal_history_importer_push(
-      importerHandle, source, unit, written, options.ptr, imported.ptr),
-    WRONG_TERMINAL);
+    assert.equal(
+      rt.e.ghostty_terminal_history_importer_push(
+        importerHandle,
+        source,
+        unit,
+        written,
+        options.ptr,
+        imported.ptr,
+      ),
+      WRONG_TERMINAL,
+    );
     if (written > 1) {
       rt.setUsize(options, "max_unit_bytes", written - 1);
-      assert.equal(rt.e.ghostty_terminal_history_importer_push(
-        importerHandle, destination, unit, written, options.ptr, imported.ptr),
-      OUT_OF_SPACE);
+      assert.equal(
+        rt.e.ghostty_terminal_history_importer_push(
+          importerHandle,
+          destination,
+          unit,
+          written,
+          options.ptr,
+          imported.ptr,
+        ),
+        OUT_OF_SPACE,
+      );
       assert.equal(rt.getUsize(imported, "consumed"), 0);
       assert.equal(rt.getUsize(imported, "required_bytes"), written);
       rt.setUsize(options, "max_unit_bytes", 256 * 1024);
     }
-    assert.equal(rt.e.ghostty_terminal_history_importer_push(
-      importerHandle, destination, unit, written, options.ptr, imported.ptr),
-    SUCCESS);
+    assert.equal(
+      rt.e.ghostty_terminal_history_importer_push(
+        importerHandle,
+        destination,
+        unit,
+        written,
+        options.ptr,
+        imported.ptr,
+      ),
+      SUCCESS,
+    );
     assert.equal(rt.getUsize(imported, "consumed"), written);
-    assert.equal(rt.view().getUint8(
-      imported.ptr + rt.field(imported.name, "retained")), 1);
+    assert.equal(
+      rt.view().getUint8(imported.ptr + rt.field(imported.name, "retained")),
+      1,
+    );
     ++unitCount;
-    rt.write(destination, new TextEncoder().encode(
-      `\x1b[32mlive-pty-${unitCount}\x1b[0m\r\n`));
+    rt.write(
+      destination,
+      new TextEncoder().encode(`\x1b[32mlive-pty-${unitCount}\x1b[0m\r\n`),
+    );
 
     rt.dispose(imported);
     rt.dispose(exact);
@@ -918,30 +1193,55 @@ function historyTransfer(rt, source, destination, checkpointOwner) {
   }
   assert.ok(corrupted);
   assert.ok(unitCount > 1, "history smoke requires multiple bounded units");
-  assert.equal(rt.e.ghostty_terminal_history_importer_commit(
-    importerHandle, destination), SUCCESS);
+  assert.equal(
+    rt.e.ghostty_terminal_history_importer_commit(importerHandle, destination),
+    SUCCESS,
+  );
   rt.e.ghostty_terminal_history_importer_free(importerHandle);
   assert.ok(rt.terminalUsize(destination, 15) > 0);
   assert.equal(rt.gridText(destination, 3, 0, 8), "row-0000");
   const liveText = `live-pty-${unitCount}`;
-  assert.equal(rt.gridText(
-    destination, 0, Math.min(unitCount - 1, 6), liveText.length), liveText);
+  assert.equal(
+    rt.gridText(destination, 0, Math.min(unitCount - 1, 6), liveText.length),
+    liveText,
+  );
 
   const aborted = rt.struct("GhosttyTerminalHistoryImporterResult");
-  assert.equal(rt.e.ghostty_terminal_history_importer_new(
-    0, destination, 0, source, checkpoint, options.ptr, aborted.ptr), SUCCESS);
-  const abortedHandle = rt.view().getUint32(
-    aborted.ptr + rt.field(aborted.name, "importer"), true);
-  assert.equal(rt.e.ghostty_terminal_history_importer_abort(
-    abortedHandle, source), WRONG_TERMINAL);
-  assert.equal(rt.e.ghostty_terminal_history_importer_abort(
-    abortedHandle, destination), SUCCESS);
+  assert.equal(
+    rt.e.ghostty_terminal_history_importer_new(
+      0,
+      destination,
+      0,
+      source,
+      checkpoint,
+      options.ptr,
+      aborted.ptr,
+    ),
+    SUCCESS,
+  );
+  const abortedHandle = rt
+    .view()
+    .getUint32(aborted.ptr + rt.field(aborted.name, "importer"), true);
+  assert.equal(
+    rt.e.ghostty_terminal_history_importer_abort(abortedHandle, source),
+    WRONG_TERMINAL,
+  );
+  assert.equal(
+    rt.e.ghostty_terminal_history_importer_abort(abortedHandle, destination),
+    SUCCESS,
+  );
   rt.e.ghostty_terminal_history_importer_free(abortedHandle);
 
   rt.e.ghostty_terminal_history_cursor_free(cursorHandle);
   rt.e.ghostty_terminal_history_lease_free(leaseHandle);
   checkpointOwner.value = Uint8Array.from(
-    rt.u8().subarray(checkpoint, checkpoint + rt.layout("GhosttyTerminalHistoryToken").size));
+    rt
+      .u8()
+      .subarray(
+        checkpoint,
+        checkpoint + rt.layout("GhosttyTerminalHistoryToken").size,
+      ),
+  );
   rt.dispose(aborted);
   rt.dispose(importer);
   rt.dispose(cursor);
@@ -952,29 +1252,59 @@ function historyTransfer(rt, source, destination, checkpointOwner) {
 async function exerciseEntropyFailure() {
   let failEntropy = false;
   const rt = await instantiateRuntime((getMemory, ptr, len) =>
-    failEntropy ? -1 : secureEntropy(getMemory, ptr, len));
+    failEntropy ? -1 : secureEntropy(getMemory, ptr, len),
+  );
   const source = rt.terminal();
   const destination = rt.terminal();
   rt.write(source, "entropy-contract\r\n".repeat(20));
   const lease = rt.struct("GhosttyTerminalHistoryLeaseResult");
-  assert.equal(rt.e.ghostty_terminal_history_lease_new(
-    0, source, 0, lease.ptr), SUCCESS);
-  const leaseHandle = rt.view().getUint32(
-    lease.ptr + rt.field(lease.name, "lease"), true);
+  assert.equal(
+    rt.e.ghostty_terminal_history_lease_new(0, source, 0, lease.ptr),
+    SUCCESS,
+  );
+  const leaseHandle = rt
+    .view()
+    .getUint32(lease.ptr + rt.field(lease.name, "lease"), true);
   const checkpoint = lease.ptr + rt.field(lease.name, "checkpoint");
   failEntropy = true;
   const unavailableLease = rt.struct("GhosttyTerminalHistoryLeaseResult");
-  assert.equal(rt.e.ghostty_terminal_history_lease_new(
-    0, source, 0, unavailableLease.ptr), ENTROPY_UNAVAILABLE);
-  assert.equal(rt.view().getUint32(
-    unavailableLease.ptr + rt.field(unavailableLease.name, "lease"), true), 0);
+  assert.equal(
+    rt.e.ghostty_terminal_history_lease_new(0, source, 0, unavailableLease.ptr),
+    ENTROPY_UNAVAILABLE,
+  );
+  assert.equal(
+    rt
+      .view()
+      .getUint32(
+        unavailableLease.ptr + rt.field(unavailableLease.name, "lease"),
+        true,
+      ),
+    0,
+  );
   const options = historyOptions(rt);
   const unavailableImporter = rt.struct("GhosttyTerminalHistoryImporterResult");
-  assert.equal(rt.e.ghostty_terminal_history_importer_new(
-    0, destination, 0, source, checkpoint, options.ptr,
-    unavailableImporter.ptr), ENTROPY_UNAVAILABLE);
-  assert.equal(rt.view().getUint32(
-    unavailableImporter.ptr + rt.field(unavailableImporter.name, "importer"), true), 0);
+  assert.equal(
+    rt.e.ghostty_terminal_history_importer_new(
+      0,
+      destination,
+      0,
+      source,
+      checkpoint,
+      options.ptr,
+      unavailableImporter.ptr,
+    ),
+    ENTROPY_UNAVAILABLE,
+  );
+  assert.equal(
+    rt
+      .view()
+      .getUint32(
+        unavailableImporter.ptr +
+          rt.field(unavailableImporter.name, "importer"),
+        true,
+      ),
+    0,
+  );
   rt.e.ghostty_terminal_history_lease_free(leaseHandle);
   rt.e.ghostty_terminal_free(destination);
   rt.e.ghostty_terminal_free(source);
@@ -985,30 +1315,58 @@ async function exerciseEntropyFailure() {
 }
 
 const rt = await instantiateRuntime();
-const capabilities = rt.struct("GhosttyTerminalSnapshotIncrementalCapabilities");
-assert.equal(rt.e.ghostty_terminal_snapshot_incremental_capabilities(
-  capabilities.ptr), SUCCESS);
+const capabilities = rt.struct(
+  "GhosttyTerminalSnapshotIncrementalCapabilities",
+);
+assert.equal(
+  rt.e.ghostty_terminal_snapshot_incremental_capabilities(capabilities.ptr),
+  SUCCESS,
+);
 for (const member of [
-  "incremental", "ready", "history", "authenticated_tokens",
-  "bounded_records", "bounded_pages", "bounded_units",
+  "incremental",
+  "ready",
+  "history",
+  "authenticated_tokens",
+  "bounded_records",
+  "bounded_pages",
+  "bounded_units",
 ]) {
-  assert.equal(rt.view().getUint8(
-    capabilities.ptr + rt.field(capabilities.name, member)), 1, member);
+  assert.equal(
+    rt.view().getUint8(capabilities.ptr + rt.field(capabilities.name, member)),
+    1,
+    member,
+  );
 }
-assert.equal(rt.view().getUint16(
-  capabilities.ptr + rt.field(capabilities.name, "default_encode_version"),
-  true), 2);
+assert.equal(
+  rt
+    .view()
+    .getUint16(
+      capabilities.ptr + rt.field(capabilities.name, "default_encode_version"),
+      true,
+    ),
+  2,
+);
 const codecIdentity = rt.inlineString(capabilities, "codec_identity");
 const buildIdentity = rt.inlineString(capabilities, "build_identity");
 assert.equal(codecIdentity, "ghostty.snapshot.v1-v2.incremental.v1");
 assert.ok(buildIdentity.length > 0);
 const buildInfo = rt.rawStruct("GhosttyString");
 assert.equal(rt.e.ghostty_build_info(5, buildInfo.ptr), SUCCESS);
-const queriedBuildIdentity = new TextDecoder().decode(rt.u8().subarray(
-  rt.view().getUint32(buildInfo.ptr + rt.field(buildInfo.name, "ptr"), true),
-  rt.view().getUint32(buildInfo.ptr + rt.field(buildInfo.name, "ptr"), true) +
-    rt.view().getUint32(buildInfo.ptr + rt.field(buildInfo.name, "len"), true),
-));
+const queriedBuildIdentity = new TextDecoder().decode(
+  rt
+    .u8()
+    .subarray(
+      rt
+        .view()
+        .getUint32(buildInfo.ptr + rt.field(buildInfo.name, "ptr"), true),
+      rt
+        .view()
+        .getUint32(buildInfo.ptr + rt.field(buildInfo.name, "ptr"), true) +
+        rt
+          .view()
+          .getUint32(buildInfo.ptr + rt.field(buildInfo.name, "len"), true),
+    ),
+);
 assert.equal(buildIdentity, queriedBuildIdentity);
 rt.dispose(buildInfo);
 rt.dispose(capabilities);
@@ -1026,8 +1384,11 @@ const trackingAllocator = await makeTrackingAllocator(rt);
 trackingAllocator.probeResizeSignatures();
 trackingAllocator.reset();
 const allocatorCapture = captureAll(rt, source, trackingAllocator.ptr);
-assert.ok(allocatorCapture.records.some(
-  (record) => record.kind === CAPTURE_HISTORY_PAGE));
+assert.ok(
+  allocatorCapture.records.some(
+    (record) => record.kind === CAPTURE_HISTORY_PAGE,
+  ),
+);
 for (const callback of ["alloc", "free"]) {
   assert.ok(trackingAllocator.state.calls[callback] > 0, callback);
 }
@@ -1038,8 +1399,15 @@ trackingAllocator.reset(1);
 const oomOptions = captureOptions(rt);
 const oomSlot = rt.alloc(4);
 rt.view().setUint32(oomSlot, 0, true);
-assert.equal(rt.e.ghostty_terminal_snapshot_capture_new(
-  trackingAllocator.ptr, source, oomOptions.ptr, oomSlot), OUT_OF_MEMORY);
+assert.equal(
+  rt.e.ghostty_terminal_snapshot_capture_new(
+    trackingAllocator.ptr,
+    source,
+    oomOptions.ptr,
+    oomSlot,
+  ),
+  OUT_OF_MEMORY,
+);
 assert.equal(rt.view().getUint32(oomSlot, true), 0);
 assert.ok(trackingAllocator.state.calls.alloc >= 2);
 assert.ok(trackingAllocator.state.calls.free >= 1);
@@ -1054,12 +1422,17 @@ const captured = captureAll(rt, source);
 assert.ok(captured.records.some((record) => record.kind === CAPTURE_RECORD));
 assert.ok(captured.records.some((record) => record.kind === CAPTURE_READY));
 const historyBegin = captured.records.find(
-  (record) => record.kind === CAPTURE_HISTORY_BEGIN &&
-    record.screenKey === 0 && record.count > 0);
+  (record) =>
+    record.kind === CAPTURE_HISTORY_BEGIN &&
+    record.screenKey === 0 &&
+    record.count > 0,
+);
 assert.ok(historyBegin, "capture must expose nonempty primary history");
 const historyPages = captured.records.filter(
-  (record) => record.kind === CAPTURE_HISTORY_PAGE &&
-    record.screenKey === historyBegin.screenKey);
+  (record) =>
+    record.kind === CAPTURE_HISTORY_PAGE &&
+    record.screenKey === historyBegin.screenKey,
+);
 assert.equal(historyPages.length, historyBegin.count);
 historyPages.forEach((record, index) => {
   assert.equal(record.index, index);
@@ -1068,15 +1441,18 @@ historyPages.forEach((record, index) => {
 });
 assert.equal(captured.records.at(-1).kind, CAPTURE_FINISH);
 const finishOffset = captured.records.find(
-  (record) => record.kind === CAPTURE_FINISH).offset;
+  (record) => record.kind === CAPTURE_FINISH,
+).offset;
 
 const encodedPtr = rt.alloc(captured.encoded.length);
 rt.u8().set(captured.encoded, encodedPtr);
 const decodeOptions = decoderOptions(rt);
 const decoderSlot = rt.alloc(4);
 rt.view().setUint32(decoderSlot, 0, true);
-assert.equal(rt.e.ghostty_terminal_snapshot_decoder_new(
-  0, decodeOptions.ptr, decoderSlot), SUCCESS);
+assert.equal(
+  rt.e.ghostty_terminal_snapshot_decoder_new(0, decodeOptions.ptr, decoderSlot),
+  SUCCESS,
+);
 const decoder = rt.view().getUint32(decoderSlot, true);
 const fragments = [1, 7, 2, 31, 3, 64, 5, 127, 11, 4];
 let fragmentIndex = 0;
@@ -1087,38 +1463,77 @@ let sawFinish = false;
 while (!sawReady) {
   const event = rt.struct("GhosttyTerminalSnapshotDecodeEvent");
   const offered = Math.min(
-    fragments[fragmentIndex++ % fragments.length], captured.encoded.length - offset);
+    fragments[fragmentIndex++ % fragments.length],
+    captured.encoded.length - offset,
+  );
   assert.ok(offered > 0);
-  assert.equal(rt.e.ghostty_terminal_snapshot_decoder_push(
-    decoder, encodedPtr + offset, offered, event.ptr), SUCCESS);
+  assert.equal(
+    rt.e.ghostty_terminal_snapshot_decoder_push(
+      decoder,
+      encodedPtr + offset,
+      offered,
+      event.ptr,
+    ),
+    SUCCESS,
+  );
   const consumed = rt.getUsize(event, "consumed");
   assert.ok(consumed > 0 && consumed <= offered);
   offset += consumed;
   if (rt.getI32(event, "kind") === DECODE_READY) {
     const blocked = rt.struct("GhosttyTerminalSnapshotDecodeEvent");
-    assert.equal(rt.e.ghostty_terminal_snapshot_decoder_push(
-      decoder, encodedPtr + offset, 1, blocked.ptr), INVALID_STATE);
+    assert.equal(
+      rt.e.ghostty_terminal_snapshot_decoder_push(
+        decoder,
+        encodedPtr + offset,
+        1,
+        blocked.ptr,
+      ),
+      INVALID_STATE,
+    );
     assert.equal(rt.getUsize(blocked, "consumed"), 0);
     rt.dispose(blocked);
     const take = rt.struct("GhosttyTerminalSnapshotTakeTerminalResult");
-    assert.equal(rt.e.ghostty_terminal_snapshot_decoder_take_terminal(
-      decoder, take.ptr), SUCCESS);
-    decodedTerminal = rt.view().getUint32(
-      take.ptr + rt.field(take.name, "terminal"), true);
+    assert.equal(
+      rt.e.ghostty_terminal_snapshot_decoder_take_terminal(decoder, take.ptr),
+      SUCCESS,
+    );
+    decodedTerminal = rt
+      .view()
+      .getUint32(take.ptr + rt.field(take.name, "terminal"), true);
     assert.notEqual(decodedTerminal, 0);
     rt.unlimitedScrollback(decodedTerminal);
     const secondTake = rt.struct("GhosttyTerminalSnapshotTakeTerminalResult");
-    assert.equal(rt.e.ghostty_terminal_snapshot_decoder_take_terminal(
-      decoder, secondTake.ptr), INVALID_STATE);
+    assert.equal(
+      rt.e.ghostty_terminal_snapshot_decoder_take_terminal(
+        decoder,
+        secondTake.ptr,
+      ),
+      INVALID_STATE,
+    );
     rt.dispose(secondTake);
     const wrong = rt.terminal();
-    assert.equal(rt.e.ghostty_terminal_snapshot_decoder_replay_continuation(
-      decoder, wrong), WRONG_TERMINAL);
+    assert.equal(
+      rt.e.ghostty_terminal_snapshot_decoder_replay_continuation(
+        decoder,
+        wrong,
+      ),
+      WRONG_TERMINAL,
+    );
     rt.e.ghostty_terminal_free(wrong);
-    assert.equal(rt.e.ghostty_terminal_snapshot_decoder_replay_continuation(
-      decoder, decodedTerminal), SUCCESS);
-    assert.equal(rt.e.ghostty_terminal_snapshot_decoder_replay_continuation(
-      decoder, decodedTerminal), INVALID_STATE);
+    assert.equal(
+      rt.e.ghostty_terminal_snapshot_decoder_replay_continuation(
+        decoder,
+        decodedTerminal,
+      ),
+      SUCCESS,
+    );
+    assert.equal(
+      rt.e.ghostty_terminal_snapshot_decoder_replay_continuation(
+        decoder,
+        decodedTerminal,
+      ),
+      INVALID_STATE,
+    );
     rt.dispose(take);
     sawReady = true;
   }
@@ -1136,8 +1551,7 @@ rt.unlimitedScrollback(historyDestination);
 const sourceHistoryRows = rt.terminalUsize(source, 15);
 assert.ok(sourceHistoryRows > 1000);
 assert.equal(rt.gridText(source, 3, 0, 8), "row-0000");
-assert.equal(rt.gridText(
-  source, 3, sourceHistoryRows - 1, 8), "row-1993");
+assert.equal(rt.gridText(source, 3, sourceHistoryRows - 1, 8), "row-1993");
 const checkpointOwner = { value: null };
 historyTransfer(rt, source, historyDestination, checkpointOwner);
 assert.ok(checkpointOwner.value.some((byte) => byte !== 0));
@@ -1147,26 +1561,40 @@ let decodedHistoryPages = 0;
 while (!sawFinish) {
   const event = rt.struct("GhosttyTerminalSnapshotDecodeEvent");
   const offered = Math.min(
-    fragments[fragmentIndex++ % fragments.length], captured.encoded.length - offset);
+    fragments[fragmentIndex++ % fragments.length],
+    captured.encoded.length - offset,
+  );
   assert.ok(offered > 0);
-  assert.equal(rt.e.ghostty_terminal_snapshot_decoder_push(
-    decoder, encodedPtr + offset, offered, event.ptr), SUCCESS);
+  assert.equal(
+    rt.e.ghostty_terminal_snapshot_decoder_push(
+      decoder,
+      encodedPtr + offset,
+      offered,
+      event.ptr,
+    ),
+    SUCCESS,
+  );
   const consumed = rt.getUsize(event, "consumed");
   assert.ok(consumed > 0 && consumed <= offered);
   offset += consumed;
   const kind = rt.getI32(event, "kind");
-  const screenKey = rt.view().getUint16(
-    event.ptr + rt.field(event.name, "screen_key"), true);
+  const screenKey = rt
+    .view()
+    .getUint16(event.ptr + rt.field(event.name, "screen_key"), true);
   if (kind === DECODE_HISTORY_BEGIN && screenKey === historyBegin.screenKey) {
     decodedHistoryCount = rt.getUsize(event, "count");
     assert.equal(decodedHistoryCount, historyBegin.count);
-  } else if (kind === DECODE_HISTORY_PAGE &&
-      screenKey === historyBegin.screenKey) {
+  } else if (
+    kind === DECODE_HISTORY_PAGE &&
+    screenKey === historyBegin.screenKey
+  ) {
     assert.notEqual(decodedHistoryCount, null);
     assert.equal(rt.getUsize(event, "index"), decodedHistoryPages);
     assert.equal(rt.getUsize(event, "count"), decodedHistoryCount);
-    assert.equal(rt.view().getUint8(
-      event.ptr + rt.field(event.name, "retained")), 1);
+    assert.equal(
+      rt.view().getUint8(event.ptr + rt.field(event.name, "retained")),
+      1,
+    );
     ++decodedHistoryPages;
   }
   sawFinish = kind === DECODE_FINISH;
@@ -1183,7 +1611,9 @@ rt.e.ghostty_terminal_snapshot_decoder_free(decoder);
 // cell's graphemes, cell/row invariants, style, and bounded hyperlink bytes.
 const continuationText = "parser-continuation-replayed";
 assert.equal(
-  rt.gridText(source, 0, 6, continuationText.length), continuationText);
+  rt.gridText(source, 0, 6, continuationText.length),
+  continuationText,
+);
 assert.equal(
   rt.gridText(decodedTerminal, 0, 6, continuationText.length),
   continuationText,
