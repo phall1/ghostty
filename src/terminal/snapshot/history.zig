@@ -68,6 +68,13 @@ const TerminalPageList = @import("../PageList.zig");
 const TerminalScreen = @import("../Screen.zig");
 const TerminalScreenKey = @import("../ScreenSet.zig").Key;
 const Terminal = @import("../Terminal.zig");
+const tripwire = @import("../../tripwire.zig");
+
+const history_tw = tripwire.module(enum {
+    current_pin,
+    boundary_pin,
+    encode_page,
+}, Allocator.Error);
 
 /// A caller-provided upper bound for one incremental history operation.
 pub const Budget = struct {
@@ -161,6 +168,7 @@ pub const HistoryLease = struct {
         var current: ?*TerminalPageList.Pin = null;
         errdefer if (current) |pin_| terminal_screen.pages.untrackPin(pin_);
         if (current_node) |node| {
+            try history_tw.check(.current_pin);
             current = try terminal_screen.pages.trackPin(.{
                 .node = node,
                 .y = node.rows() - 1,
@@ -170,6 +178,7 @@ pub const HistoryLease = struct {
         var boundary: ?*TerminalPageList.Pin = null;
         if (oldest_node) |node| {
             if (node != current_node.?) {
+                try history_tw.check(.boundary_pin);
                 boundary = try terminal_screen.pages.trackPin(.{ .node = node });
             }
         }
@@ -280,6 +289,7 @@ pub const HistoryCursor = struct {
         defer preserved.deinit();
         const source_page = preserved.page();
 
+        try history_tw.check(.encode_page);
         var one = try encodePageSlice(
             terminal_screen.alloc,
             source_page,
@@ -1687,36 +1697,37 @@ test "history cursor invalidation and transactional abort outcomes" {
 
 test "history lease and cursor OOM release bounded state without advancing" {
     const testing = std.testing;
-    var failing = testing.FailingAllocator.init(
-        testing.allocator,
-        .{ .fail_index = std.math.maxInt(usize) },
-    );
-    const alloc = failing.allocator();
-    var source = try testCursorTerminal(alloc, 3, 'A');
-    defer {
-        failing.fail_index = std.math.maxInt(usize);
-        source.deinit(alloc);
-    }
+    const tw = history_tw;
+    defer tw.end(.reset) catch unreachable;
+
+    var source = try testCursorTerminal(testing.allocator, 3, 'A');
+    defer source.deinit(testing.allocator);
     const source_screen = source.screens.get(.primary).?;
     const initial_pins = source_screen.pages.countTrackedPins();
 
-    var first = try HistoryLease.init(&source, .primary);
-    defer first.deinit();
-    const pins_with_first = source_screen.pages.countTrackedPins();
-    failing.fail_index = failing.alloc_index;
+    // Fail after the current pin was installed but before the boundary pin.
+    // HistoryLease.init must release the first pin on this exact seam.
+    tw.errorAlways(.boundary_pin, error.OutOfMemory);
     try testing.expectError(
         error.OutOfMemory,
         HistoryLease.init(&source, .primary),
     );
-    try testing.expectEqual(
-        pins_with_first,
-        source_screen.pages.countTrackedPins(),
-    );
+    try testing.expectEqual(initial_pins, source_screen.pages.countTrackedPins());
+    try tw.end(.reset);
 
-    failing.fail_index = std.math.maxInt(usize);
-    var cursor_value = try first.cursor();
-    const y_before = first.current.?.y;
-    failing.fail_index = failing.alloc_index;
+    var lease = try HistoryLease.init(&source, .primary);
+    defer lease.deinit();
+    var cursor_value = try lease.cursor();
+    const y_before = lease.current.?.y;
+    const serial_before = lease.current_serial;
+    const codepoint_before =
+        lease.current.?.node.page().getRowAndCell(0, y_before).cell.codepoint();
+    const storage_before = lease.current.?.node.storage();
+    const pins_with_lease = source_screen.pages.countTrackedPins();
+
+    // Fail before any PAGE scratch encoding. No bytes, page state, pin, or
+    // continuation coordinate may change, and the same call must be retryable.
+    tw.errorAlways(.encode_page, error.OutOfMemory);
     var output: std.Io.Writer.Allocating = .init(testing.allocator);
     defer output.deinit();
     try testing.expectError(
@@ -1727,10 +1738,17 @@ test "history lease and cursor OOM release bounded state without advancing" {
             &output.writer,
         ),
     );
-    try testing.expectEqual(y_before, first.current.?.y);
+    try testing.expectEqual(y_before, lease.current.?.y);
+    try testing.expectEqual(serial_before, lease.current_serial);
+    try testing.expectEqual(storage_before, lease.current.?.node.storage());
+    try testing.expectEqual(
+        codepoint_before,
+        lease.current.?.node.page().getRowAndCell(0, y_before).cell.codepoint(),
+    );
+    try testing.expectEqual(pins_with_lease, source_screen.pages.countTrackedPins());
     try testing.expectEqual(@as(usize, 0), output.written().len);
+    try tw.end(.reset);
 
-    failing.fail_index = std.math.maxInt(usize);
     const result = try cursor_value.next(
         &source,
         .{ .bytes = 4096, .rows = 1 },
@@ -1740,6 +1758,6 @@ test "history lease and cursor OOM release bounded state without advancing" {
         @as(std.meta.Tag(NextResult), .chunk),
         std.meta.activeTag(result),
     );
-    first.abort();
+    lease.abort();
     try testing.expectEqual(initial_pins, source_screen.pages.countTrackedPins());
 }
