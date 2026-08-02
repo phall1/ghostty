@@ -206,7 +206,8 @@ A stale projection does not stale the anchor; map it in the current generation.
 ## Reflow generations and active resize
 
 A width profile includes columns, cell-width policy version, Unicode width-table
-version, tab policy, and projection format version. Grapheme segmentation is not
+version, and projection format version. Tabs are not a profile input because the
+VT parser materializes them before logical sealing. Grapheme segmentation is not
 a projection input: every logical page uses its persisted canonical boundaries.
 Any field that changes physical row boundaries is part of the profile key. A
 monotonic `projection_generation` distinguishes publications with identical
@@ -341,6 +342,14 @@ blank cells are explicit; incidental right padding is not.
   are corruption or unsupported fidelity, never decoder replacement.
 - Zero-width atoms remain attached to their canonical base. State that cannot
   represent this exactly is rejected before persistence or history output.
+
+Horizontal tab is resolved by the VT mutation owner against the then-current
+cursor column and tab stops before a row can enter logical backing. Every
+traversed grid cell is persisted as the same ordinary explicit blank atom that
+copy and selection observe; no dynamic tab atom, tab byte, or tab-stop reference
+is stored. Logical source identity begins at these post-parser cells, so changing
+tab stops later cannot affect an old identity or projection. Reflow treats the
+materialized cells exactly like other width-one atoms.
 
 A width-two atom in the last cell wraps as a whole. At a one-column width the
 projection emits a one-cell `wide_unplaceable` render marker referencing the
@@ -681,6 +690,23 @@ every other referenced record, and before this manifest. Counts, products, and
 the delta-byte cap validate before allocation or referenced I/O. No other v1
 manifest body bytes are permitted.
 
+V1 hard-limits `segment_ref_count` to 16,384 and the complete manifest
+`total_record_length` to 2 MiB; the existing quarantine and delta caps apply
+inside the same byte limit. Counts and manifest length are checked from the
+96-byte header before allocating reference tables. Clean open therefore reads at
+most 2 MiB of manifest and validates at most 16,384 segment references.
+
+The engine begins background compaction at 4096 segment references or a 512 KiB
+prospective manifest. A commit that would exceed either hard cap is not allowed
+to append its segment first: append admission must complete the copy-on-write
+compaction transaction below and produce a prospective manifest at or below the
+background threshold. If cooperative work is unavailable, append returns
+`compaction_required` with minimum work and transient-byte charges and publishes
+nothing durable. If retained pinned history cannot fit the hard reference/byte
+caps even after maximal segment packing, it returns
+`retained_history_too_large`; the caller must release pins or prune. These are
+durable-write backpressure outcomes, not permission to exceed an open bound.
+
 Clean open reads only the manifest-listed delta ranges, never scans across
 interleaved segment payloads. Every reference must resolve to `GHIDX001` with the
 same common-header sequence, byte length, and digest; its record digest and index
@@ -760,9 +786,33 @@ reports that crash durability is unavailable.
 
 Recovery ignores bytes after the chosen manifest. A torn newest superblock falls
 back. An unreferenced segment is garbage. A manifest never references a segment
-before durability. Compaction writes new segments and a manifest before retiring
-old extents, so interruption selects either complete set. In-place rewrite is
-forbidden.
+before durability. Compaction never attempts to reclaim interior extents of the
+append-only active object. It is a complete copy-on-write object transaction:
+
+1. calculate the exact packed live-segment size, metadata, alignment, and one
+   maximum write quantum; reserve that staging charge before creating an object;
+2. derive a deterministic staging object ID from stream ID and current host
+   reference generation, `create_exclusive` it, and CAS the reference from
+   `{active=old}` to `{active=old, staging=new, state=building}`;
+3. copy or re-encode only live logical identities into the new object, write its
+   checkpoint, quarantine set, manifest, and superblock, then acknowledge
+   `flush_data` and `flush_metadata`;
+4. CAS the complete reference to
+   `{active=new, staging=none, retiring=old}`, then `flush_namespace`; new opens
+   can now choose only the new object;
+5. after in-process readers release old-object subleases, delete old, flush the
+   namespace, CAS away `retiring`, and flush the namespace again.
+
+The host reference value is versioned and atomically replaced as one body. It
+contains generation, active object ID/digest, optional staging object ID/state,
+and optional retiring object ID/digest. CAS compares the complete prior body.
+The deterministic staging ID makes a crash after object creation but before its
+first CAS discoverable from the unchanged active generation. On open,
+`staging=building` keeps the old active object, deletes staging, and clears the
+field; `retiring` keeps the new active object, finishes idempotent old-object
+deletion, and clears the field. Namespace flushes make each cleanup durable.
+CAS failure leaves the old active reference authoritative and triggers the same
+staging cleanup. In-place rewrite and hole-punch reclamation are forbidden.
 
 ### Versions, migration, and encryption
 
@@ -799,7 +849,7 @@ outside this container absent a future separate specification.
 | logical resident | backing, indexes, tail, write reserve    | evict/prune before admission or return backpressure |
 | projection       | rows/indexes for all generations         | evict eligible entries or fail                      |
 | scratch          | decode/reflow/compress/repair candidates | do not start an over-budget unit                    |
-| durable          | live records plus reclaimable tail       | prune/compact or reject durable append              |
+| durable          | active, staging, retiring, tail, compaction reserve | admit COW compaction or reject durable append        |
 | pin              | bytes protected from eviction/prune      | reject a pin above cap                              |
 
 Active screen, recovery metadata, and a VT-write admission reserve are inside
@@ -853,10 +903,18 @@ prune wait or return `pinned`; an expired pin cannot delay logical prune but its
 in-flight subleases delay physical reuse. New reads return `pruned`. No accepted
 active pin is revoked silently.
 
-Disk accounting includes live bytes and headroom for one maximum segment,
-checkpoint, quarantine record, manifest, and superblock. Compaction has separate
-headroom. If pins or minimum retention leave no victim, append returns
-`durable_budget_exhausted`; the terminal remains usable in memory.
+Disk accounting charges active, staging, and retiring object allocated lengths,
+unreachable tail, and all metadata against one hard physical-byte limit.
+`compaction_reserve_bytes` is inside that limit and unavailable to normal append;
+its default is the larger of 64 MiB and 50% of the hard limit, capped at the hard
+limit. Admission requires
+`active_physical + existing_staging_or_retiring + exact_new_object_estimate +
+maximum_metadata_quantum <= hard_limit`. The engine prunes eligible unpinned
+history before admission if policy permits. Otherwise it returns
+`compaction_headroom_exhausted` with required and available bytes before
+creating staging; no segment or manifest is published. Dual-copy bytes remain
+charged until old-object deletion and namespace flush complete. Orphan staging
+cleanup is also charged and blocks new durable append until complete.
 
 ## Corruption, quarantine, repair, and full resync
 
@@ -1024,7 +1082,7 @@ Computation and host storage are pull-based. The exact v1 request operations are
 | `truncate_compare_size`      | object, generation, expected length, new shorter length; change only if both match                 |
 | `flush_data`                 | all prior object data writes are on durable media                                                  |
 | `flush_metadata`             | prior object length and metadata changes are durable                                               |
-| `compare_exchange_reference` | reference key, expected generation/digest, new object/digest; atomic switch or `reference_changed` |
+| `compare_exchange_reference` | reference key, expected complete v1 body, replacement complete v1 body; atomic CAS or `reference_changed` |
 | `flush_namespace`            | the preceding reference create/replace/delete is durable across crash                              |
 | `delete_unreferenced`        | best-effort garbage removal; never a commit prerequisite                                           |
 
@@ -1158,10 +1216,11 @@ Collection does not allocate on VT write or active resize.
 Targets use optimized builds on at least four 2024-era laptop performance cores,
 NVMe-class storage, a 200x60 viewport, and 10 million history rows. The fixed
 gate corpus is 60% ASCII logs, 20% Unicode prose/emoji, 10% style-dense shell
-prompts, 5% tabbed hard lines at the 4096-atom reflow-span cap, and 5% valid
-Kitty textual placeholders. Each corpus runs 20 unmeasured warmups followed by
-200 measured resizes at both default overscan (120 rows for this viewport,
-subject to the 2 MiB cap) and hard maximum overscan (512 rows/16 MiB). Report
+prompts, 5% hard lines containing parser-materialized tab-fill blanks at the
+4096-atom reflow-span cap, and 5% valid Kitty textual placeholders. Each corpus
+runs 20 unmeasured warmups followed by 200 measured resizes at both default
+overscan (120 rows for this viewport, subject to the 2 MiB cap) and hard maximum
+overscan (512 rows/16 MiB). Report
 p50/p95/p99, codec, cache state, charged bytes, and host I/O separately. Every
 corpus must pass; an aggregate cannot hide a failure.
 
@@ -1175,7 +1234,7 @@ corpus must pass; an aggregate cannot hide a failure.
 | 240 cold rows, resident backing         | p95 engine CPU <= 8 ms                                                  |
 | 240 cold rows, durable backing          | p95 engine CPU <= 12 ms plus host I/O                                   |
 | warm anchor map                         | p95 <= 50 microseconds, no allocation                                   |
-| open clean 10-million-row store         | p95 <= 50 ms CPU, at most 64 delta records/8 MiB delta bytes            |
+| open clean 10-million-row store         | p95 <= 50 ms CPU; <=2 MiB/16,384 refs plus <=8 MiB/64 deltas             |
 | recover 1 GiB torn-tail container       | p95 <= 100 ms CPU plus reclaim I/O                                      |
 | index rebuild                           | >= 1 GiB segment headers/s, no payload decompression                    |
 
@@ -1200,9 +1259,9 @@ resize waiting for compression. A miss blocks default enablement.
 | cancellation  | cancel at every block boundary; <=64 KiB consumed/produced; no late publish             | cancellation latency        |
 | cache/pins    | eviction caps; pin expiration/status/renewal/sublease reclaim schedules                 | hit rate at fixed bytes     |
 | concurrency   | deterministic owner/handle use-cancel-close-completion and mutation schedules           | VT throughput during work   |
-| container     | independent TLV/golden parser; manifest delta refs; exact offsets/digests/LZ4 mutations | encode/decode/ratio         |
-| crashes       | fail/tear/reorder every host op; CAS/reference and each flush old-or-new only           | recovery/tail size          |
-| recovery      | no-manifest failed-closed; demand quarantine races/failure/reopen/cap/removal           | open/header scan            |
+| container     | TLV/golden parser; manifest/delta/ref hard caps; exact offsets/digests/LZ4 mutations    | encode/decode/ratio         |
+| crashes       | COW compaction create/CAS/flush/delete at every cut; host ops remain old-or-new         | recovery/tail size          |
+| recovery      | no-manifest failed-closed; staging/retiring cleanup; quarantine races/reopen/cap        | open/header scan            |
 | repair        | exact authenticated replacement only; slice gaps/overlap/replay/wrong stream rejected   | repair/headroom             |
 | ABI           | handle tombstone reuse/limits/exhaustion and thread races; fuzz wasm/native pointers    | boundary copy overhead      |
 | compatibility | v1/v2 and `GHUNIT2` goldens unchanged; mixed units reject                               | snapshot regression         |
