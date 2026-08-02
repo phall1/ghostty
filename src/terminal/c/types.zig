@@ -78,6 +78,8 @@ pub const structs: std.StaticStringMap(StructInfo) = structs: {
         .{ "GhosttyTerminalSnapshotCapabilities", StructInfo.init(snapshot.Capabilities) },
         .{ "GhosttyTerminalSnapshotIncrementalCapabilities", StructInfo.init(snapshot_incremental.Capabilities) },
         .{ "GhosttyTerminalSnapshotCaptureOptions", StructInfo.init(snapshot_incremental.CaptureOptions) },
+        .{ "GhosttyTerminalSnapshotDetachOptions", StructInfo.init(snapshot_incremental.DetachOptions) },
+        .{ "GhosttyTerminalSnapshotContinuationOptions", StructInfo.init(snapshot_incremental.ContinuationOptions) },
         .{ "GhosttyTerminalSnapshotCaptureEvent", StructInfo.init(snapshot_incremental.CaptureEvent) },
         .{ "GhosttyTerminalSnapshotDecoderOptions", StructInfo.init(snapshot_incremental.DecoderOptions) },
         .{ "GhosttyTerminalSnapshotDecodeEvent", StructInfo.init(snapshot_incremental.DecodeEvent) },

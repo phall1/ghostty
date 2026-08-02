@@ -1012,6 +1012,211 @@ pub fn encode(
     var encoder = try Encoder.init(terminal_screen, key);
     while (!encoder.finished()) try encoder.next(destination);
 }
+/// Fully owned HISTORY/PAGE records captured at a READY boundary.
+///
+/// Records are encoded eagerly while the source terminal is still borrowed.
+/// Once construction succeeds, no terminal or PageList pointer remains, so the
+/// owner may resume mutation or destroy the source before these records are
+/// emitted. PAGE records are split newest-first at `max_rows`.
+pub const DetachedHistories = struct {
+    const OwnedRecord = struct {
+        bytes: []u8,
+        rows: usize,
+    };
+
+    pub const InitError = Allocator.Error ||
+        PageSliceEncodeError ||
+        record.Writer.FinishError ||
+        error{
+            InvalidLimit,
+            PageLimitExceeded,
+            RecordLimitExceeded,
+            TotalBytesLimitExceeded,
+        };
+
+    alloc: Allocator,
+    records: []OwnedRecord,
+    index: usize = 0,
+
+    pub fn init(
+        alloc: Allocator,
+        terminal_: *const Terminal,
+        max_pages: usize,
+        max_total_bytes: usize,
+        max_record_bytes: usize,
+        max_rows: usize,
+    ) InitError!DetachedHistories {
+        if (max_pages == 0 or
+            max_total_bytes == 0 or
+            max_record_bytes < record.Header.len or
+            max_rows == 0)
+        {
+            return error.InvalidLimit;
+        }
+
+        const keys = [_]TerminalScreenKey{ .primary, .alternate };
+        var page_counts = [_]u32{0} ** keys.len;
+        var screen_count: usize = 0;
+        var total_pages: usize = 0;
+        for (keys, 0..) |key, key_index| {
+            const terminal_screen = terminal_.screens.get(key) orelse continue;
+            screen_count += 1;
+            var node = terminal_screen.pages.getTopLeft(.active).node.prev;
+            while (node) |current| : (node = current.prev) {
+                const chunks = std.math.divCeil(
+                    usize,
+                    current.rows(),
+                    max_rows,
+                ) catch return error.PageLimitExceeded;
+                total_pages = std.math.add(
+                    usize,
+                    total_pages,
+                    chunks,
+                ) catch return error.PageLimitExceeded;
+                if (total_pages > max_pages) return error.PageLimitExceeded;
+                page_counts[key_index] = std.math.cast(
+                    u32,
+                    std.math.add(
+                        usize,
+                        page_counts[key_index],
+                        chunks,
+                    ) catch return error.PageLimitExceeded,
+                ) orelse return error.PageLimitExceeded;
+            }
+        }
+
+        const record_count = std.math.add(
+            usize,
+            screen_count,
+            total_pages,
+        ) catch return error.TotalBytesLimitExceeded;
+        const metadata_bytes = std.math.mul(
+            usize,
+            record_count,
+            @sizeOf(OwnedRecord),
+        ) catch return error.TotalBytesLimitExceeded;
+        if (metadata_bytes > max_total_bytes)
+            return error.TotalBytesLimitExceeded;
+
+        var records: std.ArrayList(OwnedRecord) = .empty;
+        errdefer {
+            for (records.items) |owned| alloc.free(owned.bytes);
+            records.deinit(alloc);
+        }
+        try records.ensureTotalCapacityPrecise(alloc, record_count);
+        var retained_bytes = metadata_bytes;
+
+        for (keys, 0..) |key, key_index| {
+            const terminal_screen = terminal_.screens.get(key) orelse continue;
+            {
+                const header_bytes = try encodeDetachedHeader(
+                    alloc,
+                    key,
+                    page_counts[key_index],
+                );
+                errdefer alloc.free(header_bytes);
+                retained_bytes = std.math.add(
+                    usize,
+                    retained_bytes,
+                    header_bytes.len,
+                ) catch return error.TotalBytesLimitExceeded;
+                if (header_bytes.len > max_record_bytes)
+                    return error.RecordLimitExceeded;
+                if (retained_bytes > max_total_bytes)
+                    return error.TotalBytesLimitExceeded;
+                records.appendAssumeCapacity(.{
+                    .bytes = header_bytes,
+                    .rows = 0,
+                });
+            }
+
+            var node = terminal_screen.pages.getTopLeft(.active).node.prev;
+            while (node) |current| : (node = current.prev) {
+                var preserved = try current.pagePreservingState(terminal_screen.alloc);
+                defer preserved.deinit();
+                const source = preserved.page();
+                var row_end: usize = source.size.rows;
+                while (row_end > 0) {
+                    const rows = @min(row_end, max_rows);
+                    const row_start = row_end - rows;
+                    var output = try encodePageSlice(
+                        alloc,
+                        source,
+                        row_start,
+                        row_end,
+                    );
+                    errdefer output.deinit();
+                    const encoded = output.written();
+                    if (encoded.len > max_record_bytes)
+                        return error.RecordLimitExceeded;
+                    retained_bytes = std.math.add(
+                        usize,
+                        retained_bytes,
+                        encoded.len,
+                    ) catch return error.TotalBytesLimitExceeded;
+                    if (retained_bytes > max_total_bytes)
+                        return error.TotalBytesLimitExceeded;
+                    const owned = try output.toOwnedSlice();
+                    records.appendAssumeCapacity(.{
+                        .bytes = owned,
+                        .rows = rows,
+                    });
+                    row_end = row_start;
+                }
+            }
+        }
+
+        std.debug.assert(records.items.len == record_count);
+        return .{
+            .alloc = alloc,
+            .records = try records.toOwnedSlice(alloc),
+        };
+    }
+
+    pub fn deinit(self: *DetachedHistories) void {
+        for (self.records) |owned| self.alloc.free(owned.bytes);
+        self.alloc.free(self.records);
+        self.* = undefined;
+    }
+
+    pub fn finished(self: *const DetachedHistories) bool {
+        return self.index == self.records.len;
+    }
+
+    pub fn nextRows(self: *const DetachedHistories) usize {
+        std.debug.assert(!self.finished());
+        return self.records[self.index].rows;
+    }
+
+    pub fn next(
+        self: *DetachedHistories,
+        destination: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        std.debug.assert(!self.finished());
+        try destination.writeAll(self.records[self.index].bytes);
+        self.index += 1;
+    }
+};
+
+fn encodeDetachedHeader(
+    alloc: Allocator,
+    key: TerminalScreenKey,
+    page_count: u32,
+) (Allocator.Error || record.Writer.FinishError)![]u8 {
+    var output: std.Io.Writer.Allocating = .init(alloc);
+    errdefer output.deinit();
+    var stream: record.Writer = .init(alloc, &output.writer);
+    defer stream.deinit();
+    const payload = stream.begin(.history);
+    errdefer stream.cancel();
+    try (Header{
+        .key = key,
+        .page_count = page_count,
+    }).encode(payload);
+    try stream.finish();
+    return output.toOwnedSlice();
+}
+
 
 /// Errors possible while restoring one HISTORY and its PAGE sequence.
 pub const DecodeError = Decoder.InitError ||

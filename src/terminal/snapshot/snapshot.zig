@@ -179,6 +179,7 @@ pub const Encoder = struct {
     key_index: usize = 0,
     screen_encoder: ?screen.Encoder = null,
     history_encoder: ?history.Encoder = null,
+    detached_histories: ?history.DetachedHistories = null,
 
     pub fn init(
         alloc: Allocator,
@@ -253,12 +254,37 @@ pub const Encoder = struct {
     }
 
     pub fn deinit(self: *Encoder) void {
+        if (self.detached_histories) |*detached| detached.deinit();
         self.stream.deinit();
         self.* = undefined;
     }
 
     pub fn finished(self: *const Encoder) bool {
         return self.state == .done;
+    }
+
+    /// Replace the borrowed post-READY history traversal with owned records.
+    ///
+    /// Construction of `detached` must have completed while `terminal_` was
+    /// still valid. After this call, `next` never dereferences the terminal.
+    pub fn attachDetachedHistories(
+        self: *Encoder,
+        detached: history.DetachedHistories,
+    ) error{InvalidState}!void {
+        if (self.state != .histories or
+            self.history_encoder != null or
+            self.detached_histories != null)
+        {
+            return error.InvalidState;
+        }
+        self.detached_histories = detached;
+    }
+
+    pub fn detachedNextRows(self: *const Encoder) ?usize {
+        if (self.state != .histories) return null;
+        const detached = self.detached_histories orelse return null;
+        if (detached.finished()) return null;
+        return detached.nextRows();
     }
 
     /// Emit at most one unit of caller-controlled work.
@@ -315,6 +341,15 @@ pub const Encoder = struct {
                 return .ready;
             },
             .histories => {
+                if (self.detached_histories) |*detached| {
+                    if (detached.finished()) {
+                        self.state = .finish;
+                        continue;
+                    }
+                    try detached.next(self.stream.writer());
+                    return .progress;
+                }
+
                 if (self.history_encoder == null) {
                     while (self.key_index < keys.len) {
                         const key = keys[self.key_index];

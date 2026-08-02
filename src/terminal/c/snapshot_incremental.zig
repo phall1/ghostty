@@ -62,6 +62,20 @@ pub const CaptureOptions = extern struct {
     max_pages: usize,
 };
 
+pub const DetachOptions = extern struct {
+    size: usize,
+    version: u32,
+    max_pages: usize,
+    max_total_bytes: usize,
+    max_rows: usize,
+};
+
+pub const ContinuationOptions = extern struct {
+    size: usize,
+    version: u32,
+    max_rows: usize,
+};
+
 pub const CaptureEventKind = enum(c_int) {
     record = 0,
     ready = 1,
@@ -81,6 +95,8 @@ pub const CaptureEvent = extern struct {
     written: usize,
     required_bytes: usize,
     checkpoint: Token,
+    rows: usize,
+    required_rows: usize,
 };
 
 pub const DecoderOptions = extern struct {
@@ -198,10 +214,7 @@ pub fn capabilities(out_: ?*Capabilities) callconv(lib.calling_conv) Status {
         std.math.maxInt(u32)
     else
         0;
-    out.max_rows = if (authenticated_history)
-        std.math.maxInt(u32)
-    else
-        0;
+    out.max_rows = std.math.maxInt(u32);
     out.codec_identity = .{ .ptr = codec_identity.ptr, .len = codec_identity.len };
     out.build_identity = .{
         .ptr = build_options.version_string.ptr,
@@ -216,6 +229,16 @@ fn validSized(ptr: anytype, comptime T: type) bool {
 
 fn validVersioned(ptr: anytype, comptime T: type) bool {
     return validSized(ptr, T) and ptr.version == abi_version;
+}
+
+const capture_event_v1_size = @offsetOf(CaptureEvent, "rows");
+
+fn validCaptureEvent(ptr: *const CaptureEvent) bool {
+    return ptr.size >= capture_event_v1_size and ptr.version == abi_version;
+}
+
+fn captureEventHasRows(ptr: *const CaptureEvent) bool {
+    return ptr.size >= @sizeOf(CaptureEvent);
 }
 
 fn validBound(value: usize) bool {
@@ -235,6 +258,8 @@ fn mapError(err: anyerror) Status {
         error.ChunkLimitExceeded,
         error.LeaseLimitExceeded,
         error.LeaseGenerationExhausted,
+        error.InvalidLimit,
+        error.TotalBytesLimitExceeded,
         => .limit_exceeded,
         error.Stale => .stale,
         error.Pruned => .pruned,
@@ -281,12 +306,14 @@ const CaptureState = struct {
     pending_index: u32 = 0,
     pending_count: u32 = 0,
     pending_checkpoint: [token_len]u8 = [_]u8{0} ** token_len,
+    pending_rows: usize = 0,
     history_key: u16 = 0,
     history_index: u32 = 0,
     history_count: u32 = 0,
     page_records: usize = 0,
     envelope_emitted: bool = false,
     terminal_state: bool = false,
+    detached: bool = false,
 };
 
 pub const Capture = ?*CaptureState;
@@ -351,12 +378,14 @@ pub fn captureNew(
     state.pending_index = 0;
     state.pending_count = 0;
     state.pending_checkpoint = [_]u8{0} ** token_len;
+    state.pending_rows = 0;
     state.history_key = 0;
     state.history_index = 0;
     state.history_count = 0;
     state.envelope_emitted = false;
     state.page_records = 0;
     state.terminal_state = false;
+    state.detached = false;
     const continuation_value: snapshot.Continuation = if (continuation.len == 0)
         .ground
     else
@@ -383,6 +412,7 @@ fn classifyCapture(state: *CaptureState, event: snapshot.EncodeEvent, bytes: []c
     state.pending_index = 0;
     state.pending_count = 0;
     state.pending_checkpoint = [_]u8{0} ** token_len;
+    state.pending_rows = 0;
 
     if (!state.envelope_emitted) {
         state.envelope_emitted = true;
@@ -410,6 +440,13 @@ fn classifyCapture(state: *CaptureState, event: snapshot.EncodeEvent, bytes: []c
             state.page_records += 1;
             if (state.page_records > state.max_pages) return .limit_exceeded;
             if (state.history_count > 0) {
+                if (bytes.len < snapshot.record.Header.len + 4)
+                    return .corruption;
+                state.pending_rows = std.mem.readInt(
+                    u16,
+                    bytes[snapshot.record.Header.len + 2 ..][0..2],
+                    .little,
+                );
                 state.pending_kind = .history_page;
                 state.pending_key = state.history_key;
                 state.pending_index = state.history_index;
@@ -424,22 +461,26 @@ fn classifyCapture(state: *CaptureState, event: snapshot.EncodeEvent, bytes: []c
     return .success;
 }
 
-pub fn captureNext(
-    capture: Capture,
+fn captureNextBounded(
+    state: *CaptureState,
+    max_rows: ?usize,
     buffer_: ?[*]u8,
     buffer_len: usize,
-    out_: ?*CaptureEvent,
-) callconv(lib.calling_conv) Status {
-    const state = capture orelse return .invalid_handle;
-    const out = out_ orelse return .invalid_handle;
-    if (!validVersioned(out, CaptureEvent)) return .invalid_state;
+    out: *CaptureEvent,
+) Status {
+    if (!validCaptureEvent(out)) return .invalid_state;
     out.written = 0;
     out.required_bytes = 0;
     out.checkpoint = emptyToken();
+    if (captureEventHasRows(out)) {
+        out.rows = 0;
+        out.required_rows = 0;
+    }
     if (state.terminal_state) return .invalid_state;
     if (buffer_ == null and buffer_len != 0) return .invalid_state;
 
     if (!state.pending) {
+        const detached_rows = state.encoder.detachedNextRows();
         state.output.end = 0;
         const encode_event = state.encoder.next() catch |err| {
             state.terminal_state = true;
@@ -454,6 +495,7 @@ pub fn captureNext(
             state.terminal_state = true;
             return status;
         }
+        if (detached_rows) |rows| state.pending_rows = rows;
         state.pending = true;
         state.pending_len = bytes.len;
     }
@@ -466,6 +508,14 @@ pub fn captureNext(
     out.count = state.pending_count;
     out.required_bytes = pending.len;
     out.checkpoint.bytes = state.pending_checkpoint;
+    if (captureEventHasRows(out)) out.rows = state.pending_rows;
+    if (max_rows) |limit| {
+        if (state.pending_rows > limit) {
+            if (captureEventHasRows(out))
+                out.required_rows = state.pending_rows;
+            return .out_of_space;
+        }
+    }
     if (pending.len > buffer_len) return .out_of_space;
     if (pending.len > 0) @memcpy(buffer_.?[0..pending.len], pending);
     out.written = pending.len;
@@ -473,6 +523,104 @@ pub fn captureNext(
     state.pending_len = 0;
     if (state.pending_kind == .finish) state.terminal_state = true;
     return .success;
+}
+
+pub fn captureNext(
+    capture: Capture,
+    buffer_: ?[*]u8,
+    buffer_len: usize,
+    out_: ?*CaptureEvent,
+) callconv(lib.calling_conv) Status {
+    const state = capture orelse return .invalid_handle;
+    if (state.detached) return .invalid_handle;
+    const out = out_ orelse return .invalid_handle;
+    return captureNextBounded(state, null, buffer_, buffer_len, out);
+}
+
+pub const Continuation = ?*CaptureState;
+
+pub fn captureDetachReady(
+    capture_: ?*Capture,
+    options_: ?*const DetachOptions,
+    out_: ?*Continuation,
+) callconv(lib.calling_conv) Status {
+    const capture = capture_ orelse return .invalid_handle;
+    const out = out_ orelse return .invalid_handle;
+    out.* = null;
+    const state = capture.* orelse return .invalid_handle;
+    const options = options_ orelse return .invalid_state;
+    if (!validVersioned(options, DetachOptions) or
+        !validBound(options.max_pages) or
+        !validBound(options.max_total_bytes) or
+        !validBound(options.max_rows))
+    {
+        return .invalid_state;
+    }
+    if (state.detached or
+        state.terminal_state or
+        state.pending or
+        state.pending_kind != .ready)
+    {
+        return .invalid_state;
+    }
+    const terminal = terminal_c.zigTerminal(state.terminal) orelse
+        return .wrong_terminal;
+    var detached = snapshot.history.DetachedHistories.init(
+        state.alloc,
+        terminal,
+        options.max_pages,
+        options.max_total_bytes,
+        state.output_buffer.len,
+        options.max_rows,
+    ) catch |err| return mapError(err);
+    state.encoder.attachDetachedHistories(detached) catch {
+        detached.deinit();
+        return .invalid_state;
+    };
+    state.detached = true;
+    capture.* = null;
+    out.* = state;
+    return .success;
+}
+
+pub fn continuationNext(
+    continuation: Continuation,
+    options_: ?*const ContinuationOptions,
+    buffer_: ?[*]u8,
+    buffer_len: usize,
+    out_: ?*CaptureEvent,
+) callconv(lib.calling_conv) Status {
+    const state = continuation orelse return .invalid_handle;
+    if (!state.detached) return .invalid_handle;
+    const options = options_ orelse return .invalid_state;
+    if (!validVersioned(options, ContinuationOptions) or
+        !validBound(options.max_rows))
+    {
+        return .invalid_state;
+    }
+    const out = out_ orelse return .invalid_handle;
+    return captureNextBounded(
+        state,
+        options.max_rows,
+        buffer_,
+        buffer_len,
+        out,
+    );
+}
+
+pub fn continuationAbort(
+    continuation: Continuation,
+) callconv(lib.calling_conv) Status {
+    const state = continuation orelse return .invalid_handle;
+    if (!state.detached) return .invalid_handle;
+    state.terminal_state = true;
+    return .success;
+}
+
+pub fn continuationFree(
+    continuation: Continuation,
+) callconv(lib.calling_conv) void {
+    captureFree(continuation);
 }
 
 pub fn captureAbort(capture: Capture) callconv(lib.calling_conv) Status {

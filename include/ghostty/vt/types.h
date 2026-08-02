@@ -99,6 +99,10 @@ typedef struct GhosttyTerminalImpl* GhosttyTerminal;
 /** Opaque incremental snapshot capture state. */
 typedef struct GhosttyTerminalSnapshotCaptureImpl* GhosttyTerminalSnapshotCapture;
 
+/** Opaque terminal-independent continuation of capture after READY. */
+typedef struct GhosttyTerminalSnapshotContinuationImpl*
+    GhosttyTerminalSnapshotContinuation;
+
 /** Opaque incremental snapshot decoder state. */
 typedef struct GhosttyTerminalSnapshotDecoderImpl* GhosttyTerminalSnapshotDecoder;
 

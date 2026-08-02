@@ -219,6 +219,27 @@ typedef struct {
     size_t max_pages;
 } GhosttyTerminalSnapshotCaptureOptions;
 
+/** Strict retained-memory and row-splitting limits for READY detachment. */
+typedef struct {
+    size_t size;
+    uint32_t version;
+    /** Inclusive count of owned PAGE records after row splitting. */
+    size_t max_pages;
+    /** Inclusive bytes retained by owned records and their metadata. */
+    size_t max_total_bytes;
+    /** Inclusive rows represented by any owned PAGE record. */
+    size_t max_rows;
+} GhosttyTerminalSnapshotDetachOptions;
+
+/** Per-call delivery limits for a terminal-independent continuation. */
+typedef struct {
+    size_t size;
+    uint32_t version;
+    /** Inclusive rows accepted for this event. Must be nonzero. */
+    size_t max_rows;
+} GhosttyTerminalSnapshotContinuationOptions;
+
+
 typedef enum GHOSTTY_ENUM_TYPED {
     GHOSTTY_TERMINAL_SNAPSHOT_CAPTURE_RECORD = 0,
     GHOSTTY_TERMINAL_SNAPSHOT_CAPTURE_READY = 1,
@@ -246,6 +267,13 @@ typedef struct {
     size_t written;
     size_t required_bytes;
     GhosttyTerminalHistoryToken checkpoint;
+    /**
+     * Exact rows represented by a HISTORY_PAGE, zero for every other event.
+     * These tail fields are written only when `size` includes them.
+     */
+    size_t rows;
+    /** Exact row requirement on a row-budget OUT_OF_SPACE, otherwise zero. */
+    size_t required_rows;
 } GhosttyTerminalSnapshotCaptureEvent;
 
 typedef struct {
@@ -375,6 +403,42 @@ ghostty_terminal_snapshot_capture_next(
     uint8_t* buffer,
     size_t buffer_len,
     GhosttyTerminalSnapshotCaptureEvent* out_event);
+
+/**
+ * Atomically replace a capture which has delivered READY with a fully owned,
+ * terminal-independent continuation.
+ *
+ * All remaining HISTORY/PAGE records are encoded under the supplied strict
+ * limits before ownership changes. On failure, `*capture` is unchanged and
+ * `*out_continuation` is NULL. On success, `*capture` becomes NULL; the source
+ * terminal may immediately be mutated or freed.
+ */
+GHOSTTY_API GhosttyTerminalSnapshotStatus
+ghostty_terminal_snapshot_capture_detach_ready(
+    GhosttyTerminalSnapshotCapture* capture,
+    const GhosttyTerminalSnapshotDetachOptions* options,
+    GhosttyTerminalSnapshotContinuation* out_continuation);
+
+/**
+ * Emit one complete owned post-READY record.
+ *
+ * Byte or row shortage returns OUT_OF_SPACE without advancing. The exact byte
+ * and row requirements are reported in `out_event`.
+ */
+GHOSTTY_API GhosttyTerminalSnapshotStatus
+ghostty_terminal_snapshot_continuation_next(
+    GhosttyTerminalSnapshotContinuation continuation,
+    const GhosttyTerminalSnapshotContinuationOptions* options,
+    uint8_t* buffer,
+    size_t buffer_len,
+    GhosttyTerminalSnapshotCaptureEvent* out_event);
+
+GHOSTTY_API GhosttyTerminalSnapshotStatus
+ghostty_terminal_snapshot_continuation_abort(
+    GhosttyTerminalSnapshotContinuation continuation);
+
+GHOSTTY_API void ghostty_terminal_snapshot_continuation_free(
+    GhosttyTerminalSnapshotContinuation continuation);
 
 GHOSTTY_API GhosttyTerminalSnapshotStatus
 ghostty_terminal_snapshot_capture_abort(

@@ -296,6 +296,10 @@ comptime {
         @export(&c.terminal_snapshot_incremental_capabilities, .{ .name = "ghostty_terminal_snapshot_incremental_capabilities" });
         @export(&c.terminal_snapshot_capture_new, .{ .name = "ghostty_terminal_snapshot_capture_new" });
         @export(&c.terminal_snapshot_capture_next, .{ .name = "ghostty_terminal_snapshot_capture_next" });
+        @export(&c.terminal_snapshot_capture_detach_ready, .{ .name = "ghostty_terminal_snapshot_capture_detach_ready" });
+        @export(&c.terminal_snapshot_continuation_next, .{ .name = "ghostty_terminal_snapshot_continuation_next" });
+        @export(&c.terminal_snapshot_continuation_abort, .{ .name = "ghostty_terminal_snapshot_continuation_abort" });
+        @export(&c.terminal_snapshot_continuation_free, .{ .name = "ghostty_terminal_snapshot_continuation_free" });
         @export(&c.terminal_snapshot_capture_abort, .{ .name = "ghostty_terminal_snapshot_capture_abort" });
         @export(&c.terminal_snapshot_capture_free, .{ .name = "ghostty_terminal_snapshot_capture_free" });
         @export(&c.terminal_snapshot_decoder_new, .{ .name = "ghostty_terminal_snapshot_decoder_new" });
