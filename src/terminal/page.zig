@@ -31,7 +31,9 @@ const log = std.log.scoped(.page);
 /// require page-aligned, zeroed memory obtained directly from the OS
 /// (not the Zig allocator) because the allocation fast-path is
 /// performance-critical and the OS guarantees zeroed pages.
-const PageAlloc = switch (builtin.os.tag) {
+const PageAlloc = if (builtin.target.cpu.arch.isWasm())
+    AllocWasm
+else switch (builtin.os.tag) {
     .windows => AllocWindows,
     else => AllocPosix,
 };
@@ -52,6 +54,23 @@ const AllocPosix = struct {
 
     pub fn free(mem: []align(std.heap.page_size_min) u8) void {
         posix.munmap(mem);
+    }
+};
+
+/// Allocate page-aligned backing memory from wasm linear memory.
+const AllocWasm = struct {
+    const allocator = std.heap.wasm_allocator;
+    const alignment: std.mem.Alignment =
+        .fromByteUnits(std.heap.page_size_min);
+
+    pub fn alloc(n: usize) Allocator.Error![]align(std.heap.page_size_min) u8 {
+        const mem = try allocator.alignedAlloc(u8, alignment, n);
+        @memset(mem, 0);
+        return mem;
+    }
+
+    pub fn free(mem: []align(std.heap.page_size_min) u8) void {
+        allocator.free(mem);
     }
 };
 

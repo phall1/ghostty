@@ -108,6 +108,7 @@
 //! nonzero base codepoint.
 
 const std = @import("std");
+const build_options = @import("terminal_options");
 const test_fixture = @import("fixture.zig");
 const io = @import("io.zig");
 const kitty = @import("../kitty.zig");
@@ -321,8 +322,10 @@ pub fn decode(
                             // valid Unicode scalar. Preserve it and derive the
                             // native row hint so later row operations remain
                             // correct.
-                            if (cp == kitty.graphics.unicode.placeholder) {
-                                row.kitty_virtual_placeholder = true;
+                            if (comptime build_options.kitty_graphics) {
+                                if (cp == kitty.graphics.unicode.placeholder) {
+                                    row.kitty_virtual_placeholder = true;
+                                }
                             }
                         },
                         .bg_color_palette => {

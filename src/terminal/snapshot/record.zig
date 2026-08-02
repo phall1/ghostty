@@ -192,6 +192,13 @@ const Scratch = union(enum) {
         };
     }
 
+    fn end(self: *const Scratch) usize {
+        return switch (self.*) {
+            .allocating => |value| value.writer.end,
+            .fixed => |value| value.writer.end,
+        };
+    }
+
     fn reset(self: *Scratch) void {
         switch (self.*) {
             .allocating => |*value| value.shrinkRetainingCapacity(0),
@@ -310,7 +317,7 @@ pub const Writer = struct {
         // Checkpoints require an exact byte boundary. Writer owns this
         // adapter and always constructs it without a buffer.
         assert(self.active_tag == null);
-        assert(self.scratch.writer().end == 0);
+        assert(self.scratch.end() == 0);
         assert(self.hashing.writer.buffer.len == 0);
         assert(self.hashing.writer.buffered().len == 0);
 
