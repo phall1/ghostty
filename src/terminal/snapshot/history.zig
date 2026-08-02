@@ -341,12 +341,12 @@ const UnitHeader = struct {
         try io.writeInt(writer, u32, self.payload_len);
     }
 
-    const DecodeError = std.Io.Reader.Error || error{
+    const UnitDecodeError = std.Io.Reader.Error || error{
         InvalidHistoryUnit,
         WrongGeneration,
     };
 
-    fn decode(reader: *std.Io.Reader) DecodeError!UnitHeader {
+    fn decode(reader: *std.Io.Reader) UnitDecodeError!UnitHeader {
         if (try io.readInt(reader, u64) != magic) {
             return error.InvalidHistoryUnit;
         }
@@ -531,7 +531,7 @@ pub const ImportResult = union(enum) {
 };
 
 pub const ImportError = Allocator.Error ||
-    UnitHeader.DecodeError ||
+    UnitHeader.UnitDecodeError ||
     page.DecodeError ||
     TerminalPageList.PageAllocation.FinalizeError ||
     error{
