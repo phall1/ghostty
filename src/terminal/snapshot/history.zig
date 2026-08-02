@@ -125,6 +125,9 @@ pub const HistoryCheckpoint = struct {
 ///
 /// The current page and oldest checkpoint boundary are tracked independently.
 /// This is constant-sized state: it never retains or clones the full history.
+/// Tracked pins are observational anchors: PageList may still evict their
+/// pages under configured limits, at which point the cursor reports Pruned.
+/// They never retain Page mappings beyond PageList's own limits.
 /// A lease must be deinitialized before its Terminal unless that screen
 /// generation has already been removed.
 pub const HistoryLease = struct {
@@ -1508,26 +1511,65 @@ test "history cursor invalidation and transactional abort outcomes" {
             ),
         );
     }
-    {
-        var lease = try HistoryLease.init(&source, .primary);
-        defer lease.deinit();
-        var cursor_value = try lease.cursor();
-        // The fixture has six history rows in three complete pages. A
-        // three-row limit deterministically evicts the oldest checkpoint page
-        // (whole-page enforcement retains at most one two-row page).
-        source.screens.get(.primary).?.pages.setMaxLines(3);
-        try testing.expect(lease.boundary.?.garbage);
-        var output: std.Io.Writer.Allocating = .init(testing.allocator);
-        defer output.deinit();
-        try testing.expectError(
-            error.Pruned,
-            cursor_value.next(
-                &source,
-                .{ .bytes = 4096, .rows = 2 },
-                &output.writer,
-            ),
-        );
+    var prune_source = try Terminal.init(testing.io, testing.allocator, .{
+        .cols = 80,
+        .rows = 1,
+        .max_scrollback_bytes = null,
+        .max_scrollback_lines = null,
+    });
+    defer prune_source.deinit(testing.allocator);
+    const prune_screen = prune_source.screens.get(.primary).?;
+    const page_rows: usize =
+        prune_screen.pages.getTopLeft(.screen).node.capacity().rows;
+    prune_screen.cursorAbsolute(0, 0);
+    while (prune_screen.pages.totalPages() < 5) {
+        try prune_screen.testWriteString("\n");
     }
+
+    var prune_lease = try HistoryLease.init(&prune_source, .primary);
+    defer prune_lease.deinit();
+    var prune_cursor = try prune_lease.cursor();
+    const captured_boundary = prune_lease.boundary.?.node;
+
+    // Prepend an older page after capture. Pruning that page applies real
+    // pressure but leaves the checkpoint boundary intact, so the cursor must
+    // continue rather than silently including or skipping captured history.
+    var older = try prune_screen.pages.allocatePage(
+        captured_boundary.capacity(),
+    );
+    defer older.deinit();
+    older.page().size.rows = @intCast(page_rows);
+    try older.finalize(.prepend);
+    prune_screen.pages.setMaxLines(4 * page_rows);
+    try testing.expect(!prune_lease.boundary.?.garbage);
+    try testing.expectEqual(
+        captured_boundary,
+        prune_screen.pages.getTopLeft(.screen).node,
+    );
+
+    var prune_output: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer prune_output.deinit();
+    try testing.expectEqual(
+        @as(std.meta.Tag(NextResult), .chunk),
+        std.meta.activeTag(try prune_cursor.next(
+            &prune_source,
+            .{ .bytes = std.math.maxInt(usize), .rows = page_rows },
+            &prune_output.writer,
+        )),
+    );
+
+    // Lowering below the remaining checkpoint prefix now recycles the oldest
+    // captured boundary and must produce the explicit Pruned outcome.
+    prune_screen.pages.setMaxLines(page_rows + page_rows / 2);
+    try testing.expect(prune_lease.boundary.?.garbage);
+    try testing.expectError(
+        error.Pruned,
+        prune_cursor.next(
+            &prune_source,
+            .{ .bytes = std.math.maxInt(usize), .rows = page_rows },
+            &prune_output.writer,
+        ),
+    );
 
     var reset_source = try testCursorTerminal(testing.allocator, 1, 'A');
     defer reset_source.deinit(testing.allocator);
