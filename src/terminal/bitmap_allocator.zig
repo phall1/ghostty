@@ -282,6 +282,10 @@ fn findFreeChunks(bitmaps: []u64, n: usize) ?usize {
                 rem -= 64;
             }
 
+            // The final full bitmap may have been consumed by the loop's
+            // increment. A remaining suffix still requires another bitmap.
+            if (i >= bitmaps.len) return null;
+
             // If the number of available chunks at the start of this bitmap
             // is less than the remaining required, we have to try again.
             if (@ctz(~bitmaps[i]) < rem) continue;
@@ -529,6 +533,24 @@ test "BitmapAllocator layout small capacity cannot alloc out of bounds" {
         try testing.expectEqual(error.OutOfMemory, err);
     }
     try testing.expectEqual(Alloc.bitmap_bit_size, count);
+}
+
+test "findFreeChunks handles multi-bitmap boundary exactly" {
+    const testing = std.testing;
+
+    var exact = [_]u64{
+        std.math.maxInt(u64),
+        std.math.maxInt(u64),
+    };
+    try testing.expectEqual(@as(?usize, 0), findFreeChunks(&exact, 128));
+    try testing.expectEqualSlices(u64, &.{ 0, 0 }, &exact);
+
+    // One trailing bit plus one full bitmap is still insufficient for 129
+    // chunks. This used to advance to bitmaps[len] before checking the suffix.
+    var insufficient = [_]u64{ @as(u64, 1) << 63, std.math.maxInt(u64) };
+    const before = insufficient;
+    try testing.expectEqual(@as(?usize, null), findFreeChunks(&insufficient, 129));
+    try testing.expectEqualSlices(u64, &before, &insufficient);
 }
 
 test "BitmapAllocator alloc sequentially" {

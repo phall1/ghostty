@@ -115,14 +115,14 @@ test "snapshot property rejects reordered duplicated and forged records" {
     try reordered.writer.writeAll(bytes[spans[1].start..spans[1].end]);
     try reordered.writer.writeAll(bytes[spans[0].start..spans[0].end]);
     try reordered.writer.writeAll(bytes[spans[1].end..]);
-    try expectDecodeError(reordered.written(), error.UnexpectedRecord);
+    try expectDecodeError(reordered.written(), error.UnexpectedRecordTag);
 
     var duplicated: std.Io.Writer.Allocating = .init(testing.allocator);
     defer duplicated.deinit();
     try duplicated.writer.writeAll(bytes[0..spans[0].end]);
     try duplicated.writer.writeAll(bytes[spans[0].start..spans[0].end]);
     try duplicated.writer.writeAll(bytes[spans[0].end..]);
-    try expectDecodeError(duplicated.written(), error.UnexpectedRecord);
+    try expectDecodeError(duplicated.written(), error.UnexpectedRecordTag);
 
     var forged = try testing.allocator.dupe(u8, bytes);
     defer testing.allocator.free(forged);
@@ -137,10 +137,11 @@ test "snapshot property rejects reordered duplicated and forged records" {
     try expectDecodeError(forged, error.UnsupportedVersion);
 }
 
-test "snapshot property arbitrary bytes never panic" {
+test "snapshot property malformed arbitrary bytes return typed errors without panic" {
     var prng = std.Random.DefaultPrng.init(seed);
     const random = prng.random();
     var bytes: [257]u8 = undefined;
+    var rejected: usize = 0;
     for (0..256) |_| {
         const len = random.uintLessThan(usize, bytes.len);
         random.bytes(bytes[0..len]);
@@ -153,12 +154,16 @@ test "snapshot property arbitrary bytes never panic" {
         var offset: usize = 0;
         while (offset < len) {
             const width = @min(len - offset, 1 + random.uintLessThan(usize, 17));
-            const pushed = decoder.push(bytes[offset..][0..width]) catch break;
+            const pushed = decoder.push(bytes[offset..][0..width]) catch {
+                rejected += 1;
+                break;
+            };
             offset += pushed.consumed;
             if (std.meta.activeTag(pushed.event) == .finish or
                 pushed.consumed == 0) break;
         }
     }
+    try testing.expect(rejected > 0);
 }
 
 test "snapshot property enforces record bound before payload allocation" {
