@@ -1531,7 +1531,6 @@ test "history cursor captures rows sharing the active page" {
     );
 }
 
-
 test "history cursor pages newest first within strict budgets" {
     const testing = std.testing;
     var source = try testCursorTerminal(testing.allocator, 3, 'A');
