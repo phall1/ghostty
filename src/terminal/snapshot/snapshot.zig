@@ -946,7 +946,8 @@ pub fn decode(
 
         switch (pushed.event) {
             .ready => {
-                ready = try decoder.takeReady(&restored);
+                ready = decoder.takeReady(&restored) catch
+                    return error.DecoderTerminal;
                 restored_initialized = true;
             },
             .finish => {
@@ -2407,7 +2408,6 @@ test "incremental decoder enforces caller bounds and one-record work" {
         ),
     );
 }
-
 
 test "incremental complete decode allocation failures are transactional" {
     const testing = std.testing;

@@ -4441,12 +4441,12 @@ pub const HistoryImport = struct {
         }
 
         const pin_keys = destination.tracked_pins.keys();
-        for (pin_keys) |pin| {
-            if (pin.node != node) continue;
-            pin.node = replacement;
-            pin.x = 0;
-            pin.y = 0;
-            pin.garbage = true;
+        for (pin_keys) |tracked_pin| {
+            if (tracked_pin.node != node) continue;
+            tracked_pin.node = replacement;
+            tracked_pin.x = 0;
+            tracked_pin.y = 0;
+            tracked_pin.garbage = true;
         }
         destination.viewport_pin.garbage = false;
 
