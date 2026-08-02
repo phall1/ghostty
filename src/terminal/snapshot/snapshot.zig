@@ -2442,7 +2442,7 @@ test "malformed and truncated post-READY history are isolated" {
                         try testing.expect(event.retained);
                         try restored.resize(
                             testing.allocator,
-                            .{ .cols = 4, .rows = 2 },
+                            .{ .rows = 5 },
                         );
                         resized_page_count =
                             restored.screens.get(.primary).?.pages.totalPages();
@@ -2454,10 +2454,18 @@ test "malformed and truncated post-READY history are isolated" {
         }
         try testing.expect(saw_error);
         try testing.expect(resized);
-        try testing.expectEqual(@as(@TypeOf(restored.cols), 4), restored.cols);
+        try testing.expectEqual(@as(@TypeOf(restored.rows), 5), restored.rows);
+        const resized_primary = restored.screens.get(.primary).?;
+        try testing.expect(resized_primary.pages.total_rows >= restored.rows);
+        try testing.expectEqual(
+            resized_primary.cursor.page_pin.rowAndCell().cell,
+            resized_primary.cursor.page_cell,
+        );
+        resized_primary.pages.assertIntegrity();
+        resized_primary.assertIntegrity();
         try testing.expectEqual(
             resized_page_count,
-            restored.screens.get(.primary).?.pages.totalPages(),
+            resized_primary.pages.totalPages(),
         );
     }
 

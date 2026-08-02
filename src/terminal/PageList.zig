@@ -1260,15 +1260,15 @@ pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
         if (opts.rows) |v| assert(v > 0);
     }
 
-    // A column resize can split, merge, or rebuild every page. Remove any
-    // uncommitted snapshot prefix while its page identity is still intact,
-    // then invalidate the remainder so its decoder authenticates and discards
-    // it instead of publishing history across the live resize.
-    if (opts.cols) |cols| {
-        if (cols != self.cols) {
-            self.discardSnapshotHistoryImport();
-            self.history_generation +%= 1;
-        }
+    // A column resize can split, merge, or rebuild every page, while row
+    // growth can pull history into the active area. Remove any uncommitted
+    // snapshot prefix before either mutation while page identity is intact,
+    // then invalidate the remainder so it authenticates and discards.
+    const cols_changed = if (opts.cols) |cols| cols != self.cols else false;
+    const rows_changed = if (opts.rows) |rows| rows != self.rows else false;
+    if (cols_changed or rows_changed) {
+        self.discardSnapshotHistoryImport();
+        self.history_generation +%= 1;
     }
 
     // Resizing (especially with reflow) can cause our row offset to
@@ -8048,15 +8048,16 @@ test "PageList HistoryImport rejects older pages after live eviction" {
     newest.page().size.rows = 2;
     try testing.expect(try import.prepend(&newest));
 
-    // Preserve exactly the current allocation. Live row growth eventually
-    // needs another page and recycles the imported oldest page to satisfy it.
+    // Pre-fill the receiver's live tail to its real capacity so one serialized
+    // live row growth must acquire another page. With exactly the current two
+    // allocations allowed, grow recycles the imported oldest page.
+    const live = result.pages.last.?;
+    const added_rows = live.capacity().rows - live.rows();
+    live.page().size.rows = live.capacity().rows;
+    result.total_rows += added_rows;
     result.setMaxBytes(result.page_size);
-    var growth: usize = 0;
-    while (result.pages.first.?.snapshot_history_import) {
-        if (growth == 10_000) return error.TestUnexpectedResult;
-        _ = try result.grow();
-        growth += 1;
-    }
+    _ = try result.grow();
+    try testing.expect(!result.pages.first.?.snapshot_history_import);
 
     // A smaller older page would fit once the byte policy is relaxed, but the
     // lost newer import makes publishing it a forbidden history gap.
@@ -8069,7 +8070,7 @@ test "PageList HistoryImport rejects older pages after live eviction" {
     try testing.expect(older.node != null);
 }
 
-test "PageList column resize invalidates every HistoryImport mode" {
+test "PageList resize invalidates every HistoryImport mode" {
     const testing = std.testing;
     const S = struct {
         fn exercise(cols: size.CellCountInt, reflow: bool) !void {
@@ -8093,12 +8094,37 @@ test "PageList column resize invalidates every HistoryImport mode" {
             try testing.expectEqual(generation +% 1, result.historyGeneration());
             try testing.expect(!result.pages.first.?.snapshot_history_import);
         }
+
+        fn exerciseRows(rows: size.CellCountInt) !void {
+            var result = try init(testing.allocator, .{
+                .cols = 2,
+                .rows = 2,
+                .max_size = null,
+                .max_lines = null,
+            });
+            defer result.deinit();
+            var import = try HistoryImport.init(&result, testing.allocator, 1);
+            defer import.deinit();
+
+            var page = try result.allocatePage(.{ .cols = 2, .rows = 1 });
+            defer page.deinit();
+            page.page().size.rows = 1;
+            try testing.expect(try import.prepend(&page));
+            const generation = result.historyGeneration();
+
+            try result.resize(.{ .rows = rows });
+            try testing.expectEqual(generation +% 1, result.historyGeneration());
+            try testing.expect(!result.pages.first.?.snapshot_history_import);
+            try testing.expect(result.total_rows >= result.rows);
+        }
     };
 
     try S.exercise(1, false);
     try S.exercise(3, false);
     try S.exercise(1, true);
     try S.exercise(3, true);
+    try S.exerciseRows(1);
+    try S.exerciseRows(3);
 }
 
 test "PageList PageAllocation allocation failure leaves list unchanged" {
