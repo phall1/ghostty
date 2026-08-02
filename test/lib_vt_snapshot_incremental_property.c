@@ -330,14 +330,14 @@ static void property_history_tokens(GhosttyTerminal source) {
     assert(ghostty_terminal_history_importer_push(
         importer.importer, destination, units[1], unit_lens[1],
         &options, &imported) ==
-        GHOSTTY_TERMINAL_SNAPSHOT_STATUS_CORRUPTION);
+        GHOSTTY_TERMINAL_SNAPSHOT_STATUS_INVALID_STATE);
     assert(ghostty_terminal_history_importer_push(
         importer.importer, destination, units[0], unit_lens[0],
         &options, &imported) == SUCCESS);
     assert(ghostty_terminal_history_importer_push(
         importer.importer, destination, units[0], unit_lens[0],
         &options, &imported) ==
-        GHOSTTY_TERMINAL_SNAPSHOT_STATUS_CORRUPTION);
+        GHOSTTY_TERMINAL_SNAPSHOT_STATUS_INVALID_STATE);
     assert(ghostty_terminal_history_importer_push(
         importer.importer, destination, units[1], unit_lens[1],
         &options, &imported) == SUCCESS);
