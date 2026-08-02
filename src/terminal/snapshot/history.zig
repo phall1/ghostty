@@ -242,11 +242,12 @@ pub const HistoryLease = struct {
     };
 
     pub fn init(
+        io_: std.Io,
         terminal_: *Terminal,
         key: TerminalScreenKey,
     ) InitError!HistoryLease {
         var entropy: [32]u8 = undefined;
-        terminal_.io.random(&entropy);
+        io_.random(&entropy);
         return initWithEntropy(terminal_, key, entropy);
     }
 
@@ -696,6 +697,7 @@ pub const HistoryImporter = struct {
     };
 
     pub fn init(
+        io_: std.Io,
         terminal_: *Terminal,
         key: TerminalScreenKey,
         max_chunks: usize,
@@ -709,7 +711,7 @@ pub const HistoryImporter = struct {
         const terminal_screen = terminal_.screens.get(key) orelse
             return error.ScreenUnavailable;
         var entropy: [32]u8 = undefined;
-        terminal_.io.random(&entropy);
+        io_.random(&entropy);
         terminal_screen.pages.initializeHistoryLeaseKey(entropy);
 
         const state = try terminal_screen.alloc.create(HistoryImporterState);
@@ -1653,7 +1655,7 @@ test "history cursor captures rows sharing the active page" {
         terminal_screen.pages.getBottomRight(.history).?.node,
     );
 
-    const first_lease = try HistoryLease.init(&terminal_value, .primary);
+    const first_lease = try HistoryLease.init(testing.io, &terminal_value, .primary);
     defer first_lease.deinit(&terminal_value);
     const first_cut = testLeaseState(&terminal_value, first_lease).checkpoint;
     const first_cursor = try first_lease.cursor(&terminal_value);
@@ -1661,7 +1663,7 @@ test "history cursor captures rows sharing the active page" {
     terminal_screen.cursorAbsolute(0, 1);
     try terminal_screen.testWriteString("\n");
     try testing.expectEqual(@as(usize, 1), terminal_screen.pages.totalPages());
-    const second_lease = try HistoryLease.init(&terminal_value, .primary);
+    const second_lease = try HistoryLease.init(testing.io, &terminal_value, .primary);
     defer second_lease.deinit(&terminal_value);
     const second_cut = testLeaseState(&terminal_value, second_lease).checkpoint;
     try testing.expectEqual(first_cut.newest_serial, second_cut.newest_serial);
@@ -1712,7 +1714,7 @@ test "history cursor pages newest first within strict budgets" {
     };
 
     const pins_before = source_screen.pages.countTrackedPins();
-    const lease = try HistoryLease.init(&source, .primary);
+    const lease = try HistoryLease.init(testing.io, &source, .primary);
     defer lease.deinit(&source);
     const checkpoint_value = lease.checkpoint();
     try testing.expect(checkpoint_value.eql(lease.checkpoint()));
@@ -1790,7 +1792,7 @@ test "history cursor pages newest first within strict budgets" {
     try testing.expectEqual(storage[1], middle.storage());
     try testing.expectEqual(storage[2], oldest.storage());
 
-    const cross_lease = try HistoryLease.init(&source, .primary);
+    const cross_lease = try HistoryLease.init(testing.io, &source, .primary);
     defer cross_lease.deinit(&source);
     const cross_cursor = try cross_lease.cursor(&source);
     var cross_unit: std.Io.Writer.Allocating = .init(testing.allocator);
@@ -1819,6 +1821,7 @@ test "history cursor pages newest first within strict budgets" {
     try testing.expectError(
         error.InvalidCheckpoint,
         HistoryImporter.init(
+            testing.io,
             &destination,
             .primary,
             units.len,
@@ -1832,6 +1835,7 @@ test "history cursor pages newest first within strict budgets" {
     );
 
     var importer = try HistoryImporter.init(
+        testing.io,
         &destination,
         .primary,
         units.len,
@@ -2028,7 +2032,7 @@ test "history cursor invalidation and transactional abort outcomes" {
     defer other.deinit(testing.allocator);
 
     {
-        const lease = try HistoryLease.init(&source, .primary);
+        const lease = try HistoryLease.init(testing.io, &source, .primary);
         defer lease.deinit(&source);
         const cursor_value = try lease.cursor(&source);
         var output: std.Io.Writer.Allocating = .init(testing.allocator);
@@ -2085,7 +2089,7 @@ test "history cursor invalidation and transactional abort outcomes" {
         try prune_screen.testWriteString("\n");
     }
 
-    const prune_lease = try HistoryLease.init(&prune_source, .primary);
+    const prune_lease = try HistoryLease.init(testing.io, &prune_source, .primary);
     defer prune_lease.deinit(&prune_source);
     const prune_cursor = try prune_lease.cursor(&prune_source);
     const prune_state = testLeaseState(&prune_source, prune_lease);
@@ -2134,7 +2138,7 @@ test "history cursor invalidation and transactional abort outcomes" {
     var reset_source = try testCursorTerminal(testing.allocator, 1, 'A');
     defer reset_source.deinit(testing.allocator);
     {
-        const lease = try HistoryLease.init(&reset_source, .primary);
+        const lease = try HistoryLease.init(testing.io, &reset_source, .primary);
         defer lease.deinit(&reset_source);
         const cursor_value = try lease.cursor(&reset_source);
         reset_source.screens.get(.primary).?.pages.reset();
@@ -2153,7 +2157,7 @@ test "history cursor invalidation and transactional abort outcomes" {
     var resize_source = try testCursorTerminal(testing.allocator, 1, 'A');
     defer resize_source.deinit(testing.allocator);
     {
-        const lease = try HistoryLease.init(&resize_source, .primary);
+        const lease = try HistoryLease.init(testing.io, &resize_source, .primary);
         defer lease.deinit(&resize_source);
         const cursor_value = try lease.cursor(&resize_source);
         try resize_source.screens.get(.primary).?.pages.resize(.{ .cols = 3 });
@@ -2172,7 +2176,7 @@ test "history cursor invalidation and transactional abort outcomes" {
     var stale_source = try testCursorTerminal(testing.allocator, 1, 'A');
     defer stale_source.deinit(testing.allocator);
     {
-        const lease = try HistoryLease.init(&stale_source, .primary);
+        const lease = try HistoryLease.init(testing.io, &stale_source, .primary);
         defer lease.deinit(&stale_source);
         const cursor_value = try lease.cursor(&stale_source);
         stale_source.screens.get(.primary).?.pages.eraseHistory(null);
@@ -2191,7 +2195,11 @@ test "history cursor invalidation and transactional abort outcomes" {
     var generation_source = try testCursorTerminal(testing.allocator, 1, 'A');
     defer generation_source.deinit(testing.allocator);
     _ = try generation_source.switchScreen(.alternate);
-    const generation_lease = try HistoryLease.init(&generation_source, .alternate);
+    const generation_lease = try HistoryLease.init(
+        testing.io,
+        &generation_source,
+        .alternate,
+    );
     defer generation_lease.deinit(&generation_source);
     const generation_cursor = try generation_lease.cursor(&generation_source);
     _ = try generation_source.switchScreen(.primary);
@@ -2210,7 +2218,7 @@ test "history cursor invalidation and transactional abort outcomes" {
 
     var abort_source = try testCursorTerminal(testing.allocator, 1, 'A');
     defer abort_source.deinit(testing.allocator);
-    const abort_lease = try HistoryLease.init(&abort_source, .primary);
+    const abort_lease = try HistoryLease.init(testing.io, &abort_source, .primary);
     defer abort_lease.deinit(&abort_source);
     const abort_cursor = try abort_lease.cursor(&abort_source);
     var unit: std.Io.Writer.Allocating = .init(testing.allocator);
@@ -2230,6 +2238,7 @@ test "history cursor invalidation and transactional abort outcomes" {
     const abort_viewport_codepoint = abort_screen.pages
         .getTopLeft(.viewport).rowAndCell().cell.codepoint();
     var abort_import = try HistoryImporter.init(
+        testing.io,
         &abort_destination,
         .primary,
         1,
@@ -2257,7 +2266,11 @@ test "history cursor invalidation and transactional abort outcomes" {
     defer ownership_source.deinit(testing.allocator);
     const ownership_screen = ownership_source.screens.get(.primary).?;
     const ownership_pins = ownership_screen.pages.countTrackedPins();
-    const ownership_lease = try HistoryLease.init(&ownership_source, .primary);
+    const ownership_lease = try HistoryLease.init(
+        testing.io,
+        &ownership_source,
+        .primary,
+    );
     const ownership_alias = ownership_lease;
     const ownership_cursor = try ownership_alias.cursor(&ownership_source);
     const moved_cursor = ownership_cursor;
@@ -2294,12 +2307,12 @@ test "history lease and cursor OOM release bounded state without advancing" {
     tw.errorAlways(.boundary_pin, error.OutOfMemory);
     try testing.expectError(
         error.OutOfMemory,
-        HistoryLease.init(&source, .primary),
+        HistoryLease.init(testing.io, &source, .primary),
     );
     try testing.expectEqual(initial_pins, source_screen.pages.countTrackedPins());
     try tw.end(.reset);
 
-    const lease = try HistoryLease.init(&source, .primary);
+    const lease = try HistoryLease.init(testing.io, &source, .primary);
     defer lease.deinit(&source);
     const cursor_value = try lease.cursor(&source);
     const lease_state = testLeaseState(&source, lease);
@@ -2360,7 +2373,7 @@ test "history lease slots recycle while stale aliases remain invalid" {
 
     var stale: ?HistoryLease = null;
     for (0..1024) |index| {
-        const lease = try HistoryLease.init(&terminal_value, .primary);
+        const lease = try HistoryLease.init(testing.io, &terminal_value, .primary);
         if (index == 0) stale = lease;
         lease.deinit(&terminal_value);
     }
@@ -2375,11 +2388,11 @@ test "history lease slots recycle while stale aliases remain invalid" {
 
     var active: [TerminalPageList.max_history_leases]HistoryLease = undefined;
     for (&active) |*lease| {
-        lease.* = try HistoryLease.init(&terminal_value, .primary);
+        lease.* = try HistoryLease.init(testing.io, &terminal_value, .primary);
     }
     try testing.expectError(
         error.LeaseLimitExceeded,
-        HistoryLease.init(&terminal_value, .primary),
+        HistoryLease.init(testing.io, &terminal_value, .primary),
     );
     for (&active) |*lease| lease.deinit(&terminal_value);
     try testing.expectEqual(
