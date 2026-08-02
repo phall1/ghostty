@@ -842,8 +842,7 @@ pub fn historyImporterPush(
     out.retained = false;
     const zig_terminal = terminal_c.zigTerminal(terminal) orelse
         return .wrong_terminal;
-    const unit = if (unit_) |ptr| ptr[0..unit_len] else if (unit_len == 0) &.{} else
-        return .invalid_state;
+    const unit = if (unit_) |ptr| ptr[0..unit_len] else if (unit_len == 0) &.{} else return .invalid_state;
     const result = state.importer.prepend(zig_terminal, unit, .{
         .bytes = options.max_unit_bytes,
         .rows = options.max_rows,
