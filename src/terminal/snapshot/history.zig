@@ -92,7 +92,7 @@ pub const NextResult = union(enum) {
     too_small: struct {
         minimum_bytes: usize,
     },
-    /// One complete PAGE record was emitted.
+    /// One complete engine-owned history unit was emitted.
     chunk: struct {
         bytes: usize,
         rows: usize,
@@ -111,6 +111,7 @@ pub const CursorError = Allocator.Error ||
         WrongGeneration,
         Reset,
         Resize,
+        CursorAlreadyTaken,
     };
 
 /// Stable identity for one captured history cut.
@@ -118,9 +119,11 @@ pub const CursorError = Allocator.Error ||
 /// Fields intentionally remain private. Callers can compare checkpoints but
 /// cannot infer native page layout or addresses from them.
 pub const HistoryCheckpoint = struct {
+    session_id: u64,
     screen_generation: usize,
     history_generation: u64,
     newest_serial: u64,
+    newest_y: u16,
     oldest_serial: u64,
 
     pub fn eql(a: HistoryCheckpoint, b: HistoryCheckpoint) bool {
@@ -128,26 +131,81 @@ pub const HistoryCheckpoint = struct {
     }
 };
 
-/// Engine-owned lease over one screen's complete historical prefix.
-///
-/// The current page and oldest checkpoint boundary are tracked independently.
-/// This is constant-sized state: it never retains or clones the full history.
-/// Tracked pins are observational anchors: PageList may still evict their
-/// pages under configured limits, at which point the cursor reports Pruned.
-/// They never retain Page mappings beyond PageList's own limits.
-/// A lease must be deinitialized before its Terminal unless that screen
-/// generation has already been removed.
-pub const HistoryLease = struct {
+const LeaseToken = struct {
     terminal: *Terminal,
     key: TerminalScreenKey,
-    checkpoint_: HistoryCheckpoint,
+    screen_generation: usize,
+    id: u64,
+};
+
+const LeaseState = struct {
+    alloc: Allocator,
+    checkpoint: HistoryCheckpoint,
     current: ?*TerminalPageList.Pin,
     boundary: ?*TerminalPageList.Pin,
     current_serial: u64,
     boundary_serial: u64,
     pages_inspected: usize = 0,
+    inspected_serial: ?u64 = null,
     cursor_taken: bool = false,
-    active: bool = true,
+    sequence: u64 = 0,
+};
+
+var next_history_session: std.atomic.Value(u64) = .init(1);
+
+fn releaseLeaseState(raw: *anyopaque, pages: *TerminalPageList) void {
+    const state: *LeaseState = @ptrCast(@alignCast(raw));
+    if (state.current) |pin_| pages.untrackPin(pin_);
+    if (state.boundary) |pin_| pages.untrackPin(pin_);
+    const alloc = state.alloc;
+    alloc.destroy(state);
+}
+
+fn resolveLease(
+    token: LeaseToken,
+    terminal_: *Terminal,
+) CursorError!struct {
+    screen: *TerminalScreen,
+    state: *LeaseState,
+} {
+    if (terminal_ != token.terminal) return error.WrongTerminal;
+    if (terminal_.screens.generation(token.key) != token.screen_generation) {
+        return error.WrongGeneration;
+    }
+    const terminal_screen = terminal_.screens.get(token.key) orelse
+        return error.WrongGeneration;
+    const raw = terminal_screen.pages.historyLease(token.id) orelse
+        return error.Stale;
+    const state: *LeaseState = @ptrCast(@alignCast(raw));
+    if (terminal_screen.pages.historyGeneration() !=
+        state.checkpoint.history_generation)
+    {
+        return switch (terminal_screen.pages.historyInvalidation()) {
+            .reset => error.Reset,
+            .resize => error.Resize,
+            .none, .stale => error.Stale,
+        };
+    }
+    if (state.boundary) |pin_| {
+        if (pin_.garbage or pin_.node.serial != state.boundary_serial) {
+            return error.Pruned;
+        }
+    }
+    if (state.current) |pin_| {
+        if (pin_.garbage) return error.Pruned;
+        if (pin_.node.serial != state.current_serial) return error.Stale;
+    }
+    return .{ .screen = terminal_screen, .state = state };
+}
+
+/// Engine-owned lease over one screen's complete historical prefix.
+///
+/// The public value is a copy-safe token. Pin ownership lives in PageList's
+/// stable private registry, so moved or aliased handles share one lifetime and
+/// observe Stale after the first deinit.
+pub const HistoryLease = struct {
+    token: LeaseToken,
+    checkpoint_: HistoryCheckpoint,
 
     pub const InitError = Allocator.Error || error{ScreenUnavailable};
 
@@ -157,8 +215,10 @@ pub const HistoryLease = struct {
     ) InitError!HistoryLease {
         const terminal_screen = terminal_.screens.get(key) orelse
             return error.ScreenUnavailable;
-        const current_node = terminal_screen.pages.getTopLeft(.active).node.prev;
+        const newest = terminal_screen.pages.getBottomRight(.history);
+        const current_node = if (newest) |pin_| pin_.node else null;
         const current_serial = if (current_node) |node| node.serial else 0;
+        const newest_y: u16 = if (newest) |pin_| pin_.y else 0;
         const oldest_node = if (current_node != null)
             terminal_screen.pages.getTopLeft(.screen).node
         else
@@ -167,15 +227,13 @@ pub const HistoryLease = struct {
 
         var current: ?*TerminalPageList.Pin = null;
         errdefer if (current) |pin_| terminal_screen.pages.untrackPin(pin_);
-        if (current_node) |node| {
+        if (newest) |pin_| {
             try history_tw.check(.current_pin);
-            current = try terminal_screen.pages.trackPin(.{
-                .node = node,
-                .y = node.rows() - 1,
-            });
+            current = try terminal_screen.pages.trackPin(pin_);
         }
 
         var boundary: ?*TerminalPageList.Pin = null;
+        errdefer if (boundary) |pin_| terminal_screen.pages.untrackPin(pin_);
         if (oldest_node) |node| {
             if (node != current_node.?) {
                 try history_tw.check(.boundary_pin);
@@ -183,20 +241,40 @@ pub const HistoryLease = struct {
             }
         }
 
+        const id = next_history_session.fetchAdd(1, .monotonic);
         const screen_generation = terminal_.screens.generation(key);
-        return .{
-            .terminal = terminal_,
-            .key = key,
-            .checkpoint_ = .{
-                .screen_generation = screen_generation,
-                .history_generation = terminal_screen.pages.historyGeneration(),
-                .newest_serial = current_serial,
-                .oldest_serial = oldest_serial,
-            },
+        const checkpoint_: HistoryCheckpoint = .{
+            .session_id = id,
+            .screen_generation = screen_generation,
+            .history_generation = terminal_screen.pages.historyGeneration(),
+            .newest_serial = current_serial,
+            .newest_y = newest_y,
+            .oldest_serial = oldest_serial,
+        };
+        const state = try terminal_screen.alloc.create(LeaseState);
+        errdefer terminal_screen.alloc.destroy(state);
+        state.* = .{
+            .alloc = terminal_screen.alloc,
+            .checkpoint = checkpoint_,
             .current = current,
             .boundary = boundary,
             .current_serial = current_serial,
             .boundary_serial = oldest_serial,
+        };
+        try terminal_screen.pages.registerHistoryLease(id, .{
+            .ptr = state,
+            .release = releaseLeaseState,
+        });
+        current = null;
+        boundary = null;
+        return .{
+            .token = .{
+                .terminal = terminal_,
+                .key = key,
+                .screen_generation = screen_generation,
+                .id = id,
+            },
+            .checkpoint_ = checkpoint_,
         };
     }
 
@@ -204,82 +282,112 @@ pub const HistoryLease = struct {
         return self.checkpoint_;
     }
 
-    /// Create the lease's single opaque cursor.
-    pub fn cursor(self: *HistoryLease) error{CursorAlreadyTaken}!HistoryCursor {
-        if (self.cursor_taken) return error.CursorAlreadyTaken;
-        self.cursor_taken = true;
-        return .{ .lease = self };
+    pub fn cursor(self: *const HistoryLease) CursorError!HistoryCursor {
+        const resolved = try resolveLease(self.token, self.token.terminal);
+        if (resolved.state.cursor_taken) return error.CursorAlreadyTaken;
+        resolved.state.cursor_taken = true;
+        return .{
+            .token = self.token,
+        };
     }
 
-    /// Diagnostic work counter used to verify continuation remains O(1) in
-    /// history depth. It counts source pages, not rows or encoding retries.
     pub fn inspectedPages(self: *const HistoryLease) usize {
-        return self.pages_inspected;
+        const terminal_screen = self.token.terminal.screens.get(
+            self.token.key,
+        ) orelse return 0;
+        const raw = terminal_screen.pages.historyLease(self.token.id) orelse
+            return 0;
+        const state: *LeaseState = @ptrCast(@alignCast(raw));
+        return state.pages_inspected;
     }
 
-    pub fn abort(self: *HistoryLease) void {
+    pub fn abort(self: *const HistoryLease) void {
         self.deinit();
     }
 
-    pub fn deinit(self: *HistoryLease) void {
-        if (!self.active) return;
-        self.active = false;
+    pub fn deinit(self: *const HistoryLease) void {
+        if (self.token.terminal.screens.generation(self.token.key) !=
+            self.token.screen_generation) return;
+        const terminal_screen = self.token.terminal.screens.get(
+            self.token.key,
+        ) orelse return;
+        terminal_screen.pages.releaseHistoryLease(self.token.id);
+    }
+};
 
-        if (self.terminal.screens.generation(self.key) !=
-            self.checkpoint_.screen_generation) return;
-        const terminal_screen = self.terminal.screens.get(self.key) orelse return;
-        if (self.current) |pin_| terminal_screen.pages.untrackPin(pin_);
-        if (self.boundary) |pin_| terminal_screen.pages.untrackPin(pin_);
-        self.current = null;
-        self.boundary = null;
+const UnitHeader = struct {
+    const magic: u64 = 0x3154494E554847; // "GHUNIT1"
+    const len = 66;
+
+    checkpoint: HistoryCheckpoint,
+    sequence: u64,
+    rows: u32,
+    payload_len: u32,
+
+    fn encode(self: UnitHeader, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try io.writeInt(writer, u64, magic);
+        try io.writeInt(writer, u64, self.checkpoint.session_id);
+        try io.writeInt(
+            writer,
+            u64,
+            @intCast(self.checkpoint.screen_generation),
+        );
+        try io.writeInt(writer, u64, self.checkpoint.history_generation);
+        try io.writeInt(writer, u64, self.checkpoint.newest_serial);
+        try io.writeInt(writer, u16, self.checkpoint.newest_y);
+        try io.writeInt(writer, u64, self.checkpoint.oldest_serial);
+        try io.writeInt(writer, u64, self.sequence);
+        try io.writeInt(writer, u32, self.rows);
+        try io.writeInt(writer, u32, self.payload_len);
     }
 
-    fn validate(
-        self: *HistoryLease,
-        terminal_: *Terminal,
-    ) CursorError!*TerminalScreen {
-        if (!self.active) return error.Stale;
-        if (terminal_ != self.terminal) return error.WrongTerminal;
-        if (terminal_.screens.generation(self.key) !=
-            self.checkpoint_.screen_generation) return error.WrongGeneration;
-        const terminal_screen = terminal_.screens.get(self.key) orelse
-            return error.WrongGeneration;
-        if (terminal_screen.pages.historyGeneration() !=
-            self.checkpoint_.history_generation)
-        {
-            return switch (terminal_screen.pages.historyInvalidation()) {
-                .reset => error.Reset,
-                .resize => error.Resize,
-                .none, .stale => error.Stale,
-            };
+    const DecodeError = std.Io.Reader.Error || error{
+        InvalidHistoryUnit,
+        WrongGeneration,
+    };
+
+    fn decode(reader: *std.Io.Reader) DecodeError!UnitHeader {
+        if (try io.readInt(reader, u64) != magic) {
+            return error.InvalidHistoryUnit;
         }
-        if (self.boundary) |pin_| {
-            if (pin_.garbage or pin_.node.serial != self.boundary_serial) {
-                return error.Pruned;
-            }
-        }
-        if (self.current) |pin_| {
-            if (pin_.garbage) return error.Pruned;
-            if (pin_.node.serial != self.current_serial) return error.Stale;
-        }
-        return terminal_screen;
+        const session_id = try io.readInt(reader, u64);
+        const screen_generation_u64 = try io.readInt(reader, u64);
+        const screen_generation = std.math.cast(
+            usize,
+            screen_generation_u64,
+        ) orelse return error.WrongGeneration;
+        return .{
+            .checkpoint = .{
+                .session_id = session_id,
+                .screen_generation = screen_generation,
+                .history_generation = try io.readInt(reader, u64),
+                .newest_serial = try io.readInt(reader, u64),
+                .newest_y = try io.readInt(reader, u16),
+                .oldest_serial = try io.readInt(reader, u64),
+            },
+            .sequence = try io.readInt(reader, u64),
+            .rows = try io.readInt(reader, u32),
+            .payload_len = try io.readInt(reader, u32),
+        };
     }
 };
 
 /// Opaque newest-to-oldest continuation over a HistoryLease.
 pub const HistoryCursor = struct {
-    lease: *HistoryLease,
+    token: LeaseToken,
 
-    /// Emit one complete PAGE codec unit without advancing on a budget outcome
-    /// or allocation/encoding failure.
+    /// Emit one authenticated history unit without advancing on a budget
+    /// outcome or allocation/encoding failure.
     pub fn next(
-        self: *HistoryCursor,
+        self: *const HistoryCursor,
         terminal_: *Terminal,
         budget: Budget,
         destination: *std.Io.Writer,
     ) CursorError!NextResult {
-        const terminal_screen = try self.lease.validate(terminal_);
-        const pin_ = self.lease.current orelse return .end;
+        const resolved = try resolveLease(self.token, terminal_);
+        const terminal_screen = resolved.screen;
+        const state = resolved.state;
+        const pin_ = state.current orelse return .end;
         if (budget.bytes == 0 or budget.rows == 0) return .zero_budget;
 
         const source_node = pin_.node;
@@ -297,8 +405,9 @@ pub const HistoryCursor = struct {
             row_end,
         );
         defer one.deinit();
-        if (one.written().len > budget.bytes) {
-            return .{ .too_small = .{ .minimum_bytes = one.written().len } };
+        const one_len = UnitHeader.len + one.written().len;
+        if (one_len > budget.bytes) {
+            return .{ .too_small = .{ .minimum_bytes = one_len } };
         }
 
         var low: usize = 1;
@@ -313,7 +422,8 @@ pub const HistoryCursor = struct {
                     row_end,
                 );
                 defer candidate_bytes.deinit();
-                break :fits candidate_bytes.written().len <= budget.bytes;
+                break :fits UnitHeader.len + candidate_bytes.written().len <=
+                    budget.bytes;
             };
             if (fits) {
                 low = candidate;
@@ -330,26 +440,37 @@ pub const HistoryCursor = struct {
             row_end,
         );
         defer encoded.deinit();
-        const encoded_len = encoded.written().len;
+        const encoded_len = UnitHeader.len + encoded.written().len;
         std.debug.assert(encoded_len <= budget.bytes);
+        const unit_header: UnitHeader = .{
+            .checkpoint = state.checkpoint,
+            .sequence = state.sequence,
+            .rows = @intCast(rows),
+            .payload_len = @intCast(encoded.written().len),
+        };
+        try unit_header.encode(destination);
         try destination.writeAll(encoded.written());
 
-        self.lease.pages_inspected += @intFromBool(row_end == source_node.rows());
+        if (state.inspected_serial != source_node.serial) {
+            state.inspected_serial = source_node.serial;
+            state.pages_inspected += 1;
+        }
+        state.sequence += 1;
         const row_start = row_end - rows;
         const page_complete = row_start == 0;
         if (page_complete) {
-            if (source_node.serial == self.lease.boundary_serial) {
+            if (source_node.serial == state.boundary_serial) {
                 terminal_screen.pages.untrackPin(pin_);
-                if (self.lease.boundary) |boundary| {
+                if (state.boundary) |boundary| {
                     terminal_screen.pages.untrackPin(boundary);
-                    self.lease.boundary = null;
+                    state.boundary = null;
                 }
-                self.lease.current = null;
+                state.current = null;
             } else if (source_node.prev) |previous| {
                 pin_.node = previous;
                 pin_.y = previous.rows() - 1;
                 pin_.x = 0;
-                self.lease.current_serial = previous.serial;
+                state.current_serial = previous.serial;
             } else {
                 return error.Pruned;
             }
@@ -410,12 +531,13 @@ pub const ImportResult = union(enum) {
 };
 
 pub const ImportError = Allocator.Error ||
-    record.Header.DecodeError ||
+    UnitHeader.DecodeError ||
     page.DecodeError ||
     TerminalPageList.PageAllocation.FinalizeError ||
     error{
         ChunkLimitExceeded,
-        InvalidChunk,
+        InvalidHistoryUnit,
+        UnexpectedHistoryUnit,
         Stale,
         WrongTerminal,
         WrongGeneration,
@@ -423,15 +545,18 @@ pub const ImportError = Allocator.Error ||
         Resize,
     };
 
-/// Transactional, independently bounded importer for engine-produced PAGE
-/// units. Imported pages are prepended while live writes continue at the
-/// active end of the destination.
+/// Transactional, independently bounded importer for authenticated
+/// engine-owned history units. The private unit envelope is not part of the
+/// immutable v1/v2 snapshot grammar; its payload is one unchanged PAGE record.
+/// Imported pages are prepended while live writes continue at the active end.
 pub const HistoryImporter = struct {
     terminal: *Terminal,
     key: TerminalScreenKey,
     screen_generation: usize,
     history_generation: u64,
     import: TerminalPageList.HistoryImport,
+    expected_checkpoint: HistoryCheckpoint,
+    expected_sequence: u64 = 0,
     deinitialized: bool = false,
     chunks: usize = 0,
     max_chunks: usize,
@@ -444,6 +569,7 @@ pub const HistoryImporter = struct {
         terminal_: *Terminal,
         key: TerminalScreenKey,
         max_chunks: usize,
+        expected_checkpoint: HistoryCheckpoint,
     ) InitError!HistoryImporter {
         const terminal_screen = terminal_.screens.get(key) orelse
             return error.ScreenUnavailable;
@@ -452,6 +578,7 @@ pub const HistoryImporter = struct {
             .key = key,
             .screen_generation = terminal_.screens.generation(key),
             .history_generation = terminal_screen.pages.historyGeneration(),
+            .expected_checkpoint = expected_checkpoint,
             .import = try .init(
                 &terminal_screen.pages,
                 terminal_screen.alloc,
@@ -475,27 +602,31 @@ pub const HistoryImporter = struct {
         if (budget.bytes == 0 or budget.rows == 0) return .zero_budget;
         if (self.chunks == self.max_chunks) return error.ChunkLimitExceeded;
 
-        if (unit.len < record.Header.len) return error.InvalidChunk;
-        var header_source: std.Io.Reader = .fixed(unit);
-        const record_header = try record.Header.decode(&header_source);
-        const expected_len = std.math.add(
-            usize,
-            record.Header.len,
-            @as(usize, record_header.payload_len),
-        ) catch return error.InvalidChunk;
-        if (expected_len != unit.len or record_header.tag != .page) {
-            return error.InvalidChunk;
+        if (unit.len < UnitHeader.len) return error.InvalidHistoryUnit;
+        var header_source: std.Io.Reader = .fixed(unit[0..UnitHeader.len]);
+        const unit_header = try UnitHeader.decode(&header_source);
+        if (!unit_header.checkpoint.eql(self.expected_checkpoint) or
+            unit_header.sequence != self.expected_sequence)
+        {
+            return error.UnexpectedHistoryUnit;
         }
-
-        var source: std.Io.Reader = .fixed(unit);
-        var decoder: page.Decoder = undefined;
-        try decoder.init(&source);
-        const rows: usize = decoder.header.rows;
+        const payload_len: usize = @intCast(unit_header.payload_len);
+        if (UnitHeader.len + payload_len != unit.len) {
+            return error.InvalidHistoryUnit;
+        }
+        const rows: usize = @intCast(unit_header.rows);
         if (unit.len > budget.bytes or rows > budget.rows) {
             return .{ .too_small = .{
                 .required_bytes = unit.len,
                 .required_rows = rows,
             } };
+        }
+
+        var source: std.Io.Reader = .fixed(unit[UnitHeader.len..]);
+        var decoder: page.Decoder = undefined;
+        try decoder.init(&source);
+        if (decoder.header.rows != unit_header.rows) {
+            return error.InvalidHistoryUnit;
         }
 
         var allocation = try terminal_screen.pages.allocatePage(
@@ -508,10 +639,15 @@ pub const HistoryImporter = struct {
         self.imported_prompt = self.imported_prompt or
             (retained and contains_prompt);
         self.chunks += 1;
+        self.expected_sequence += 1;
         return .{ .imported = .{
             .rows = rows,
             .retained = retained,
         } };
+    }
+
+    pub fn inspectedPrefixNodes(self: *const HistoryImporter) usize {
+        return self.import.inspectedPrefixNodes();
     }
 
     pub fn commit(
@@ -1317,12 +1453,84 @@ fn testCursorTerminal(
 }
 
 fn testDecodedFirstCodepoint(unit: []const u8) !u21 {
-    var source: std.Io.Reader = .fixed(unit);
+    var header_source: std.Io.Reader = .fixed(unit[0..UnitHeader.len]);
+    const unit_header = try UnitHeader.decode(&header_source);
+    var source: std.Io.Reader = .fixed(unit[UnitHeader.len..]);
     var decoded = try page.decode(&source, std.testing.allocator);
     defer decoded.deinit();
+    try std.testing.expectEqual(
+        unit_header.rows,
+        @as(u32, decoded.size.rows),
+    );
     try std.testing.expectError(error.EndOfStream, source.takeByte());
     return decoded.getRowAndCell(0, 0).cell.codepoint();
 }
+
+fn testLeaseState(lease: *const HistoryLease) *LeaseState {
+    const terminal_screen = lease.token.terminal.screens.get(lease.token.key).?;
+    const raw = terminal_screen.pages.historyLease(lease.token.id).?;
+    return @ptrCast(@alignCast(raw));
+}
+test "history cursor captures rows sharing the active page" {
+    const testing = std.testing;
+    var terminal_value = try Terminal.init(testing.io, testing.allocator, .{
+        .cols = 2,
+        .rows = 2,
+        .max_scrollback_bytes = null,
+    });
+    defer terminal_value.deinit(testing.allocator);
+    const terminal_screen = terminal_value.screens.get(.primary).?;
+    try terminal_screen.testWriteString("A");
+    terminal_screen.cursorAbsolute(0, 1);
+    try terminal_screen.testWriteString("\n");
+    try testing.expectEqual(@as(usize, 1), terminal_screen.pages.totalPages());
+    try testing.expectEqual(
+        terminal_screen.pages.getTopLeft(.active).node,
+        terminal_screen.pages.getBottomRight(.history).?.node,
+    );
+
+    const first_lease = try HistoryLease.init(&terminal_value, .primary);
+    defer first_lease.deinit();
+    const first_cut = first_lease.checkpoint();
+    const first_cursor = try first_lease.cursor();
+
+    terminal_screen.cursorAbsolute(0, 1);
+    try terminal_screen.testWriteString("\n");
+    try testing.expectEqual(@as(usize, 1), terminal_screen.pages.totalPages());
+    const second_lease = try HistoryLease.init(&terminal_value, .primary);
+    defer second_lease.deinit();
+    const second_cut = second_lease.checkpoint();
+    try testing.expectEqual(first_cut.newest_serial, second_cut.newest_serial);
+    try testing.expect(first_cut.newest_y != second_cut.newest_y);
+
+    var output: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer output.deinit();
+    const result = try first_cursor.next(
+        &terminal_value,
+        .{ .bytes = 4096, .rows = 8 },
+        &output.writer,
+    );
+    const chunk = switch (result) {
+        .chunk => |value| value,
+        else => return error.TestExpectedChunk,
+    };
+    try testing.expectEqual(@as(usize, 1), chunk.rows);
+    try testing.expectEqual(
+        @as(u21, 'A'),
+        try testDecodedFirstCodepoint(output.written()),
+    );
+    var end_output: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer end_output.deinit();
+    try testing.expectEqual(
+        @as(std.meta.Tag(NextResult), .end),
+        std.meta.activeTag(try first_cursor.next(
+            &terminal_value,
+            .{ .bytes = 4096, .rows = 1 },
+            &end_output.writer,
+        )),
+    );
+}
+
 
 test "history cursor pages newest first within strict budgets" {
     const testing = std.testing;
@@ -1341,12 +1549,12 @@ test "history cursor pages newest first within strict budgets" {
     };
 
     const pins_before = source_screen.pages.countTrackedPins();
-    var lease = try HistoryLease.init(&source, .primary);
+    const lease = try HistoryLease.init(&source, .primary);
     defer lease.deinit();
     try testing.expectEqual(pins_before + 2, source_screen.pages.countTrackedPins());
     const checkpoint_value = lease.checkpoint();
     try testing.expect(checkpoint_value.eql(lease.checkpoint()));
-    var cursor_value = try lease.cursor();
+    const cursor_value = try lease.cursor();
     try testing.expectError(error.CursorAlreadyTaken, lease.cursor());
 
     var no_output: [1]u8 = undefined;
@@ -1420,6 +1628,17 @@ test "history cursor pages newest first within strict budgets" {
     try testing.expectEqual(storage[1], middle.storage());
     try testing.expectEqual(storage[2], oldest.storage());
 
+    const cross_lease = try HistoryLease.init(&source, .primary);
+    defer cross_lease.deinit();
+    const cross_cursor = try cross_lease.cursor();
+    var cross_unit: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer cross_unit.deinit();
+    _ = try cross_cursor.next(
+        &source,
+        .{ .bytes = 4096, .rows = 1 },
+        &cross_unit.writer,
+    );
+
     var destination = try testCursorTerminal(testing.allocator, 1, 'm');
     defer destination.deinit(testing.allocator);
     const destination_screen = destination.screens.get(.primary).?;
@@ -1429,11 +1648,16 @@ test "history cursor pages newest first within strict budgets" {
     const active_node = destination_screen.pages.getTopLeft(.active).node;
     const active_first = active_node.page().getRowAndCell(0, 0).cell.codepoint();
     const pages_before_import = destination_screen.pages.totalPages();
+    destination_screen.pages.scroll(.top);
+    const viewport_node = destination_screen.pages.getTopLeft(.viewport).node;
+    const viewport_codepoint =
+        viewport_node.page().getRowAndCell(0, 0).cell.codepoint();
 
     var importer = try HistoryImporter.init(
         &destination,
         .primary,
         units.len,
+        checkpoint_value,
     );
     defer importer.deinit();
     try testing.expectEqual(
@@ -1454,7 +1678,52 @@ test "history cursor pages newest first within strict budgets" {
         std.meta.activeTag(import_too_small),
     );
 
-    for (units) |unit| {
+    const rejected_pages = destination_screen.pages.totalPages();
+    try testing.expectError(
+        error.UnexpectedHistoryUnit,
+        importer.prepend(
+            &destination,
+            units[1],
+            .{ .bytes = units[1].len, .rows = 1 },
+        ),
+    );
+    try testing.expectError(
+        error.UnexpectedHistoryUnit,
+        importer.prepend(
+            &destination,
+            cross_unit.written(),
+            .{ .bytes = cross_unit.written().len, .rows = 1 },
+        ),
+    );
+    var corrupt = try testing.allocator.dupe(u8, units[0]);
+    defer testing.allocator.free(corrupt);
+    corrupt[50] ^= 1;
+    try testing.expectError(
+        error.UnexpectedHistoryUnit,
+        importer.prepend(
+            &destination,
+            corrupt,
+            .{ .bytes = corrupt.len, .rows = 1 },
+        ),
+    );
+    try testing.expectEqual(rejected_pages, destination_screen.pages.totalPages());
+
+    const first_import = try importer.prepend(
+        &destination,
+        units[0],
+        .{ .bytes = units[0].len, .rows = 1 },
+    );
+    try testing.expect(std.meta.activeTag(first_import) == .imported);
+    try testing.expectError(
+        error.UnexpectedHistoryUnit,
+        importer.prepend(
+            &destination,
+            units[0],
+            .{ .bytes = units[0].len, .rows = 1 },
+        ),
+    );
+
+    for (units[1..]) |unit| {
         const result = try importer.prepend(
             &destination,
             unit,
@@ -1467,6 +1736,7 @@ test "history cursor pages newest first within strict budgets" {
         try testing.expect(imported.retained);
         try testing.expectEqual(@as(usize, 1), imported.rows);
     }
+    try testing.expectEqual(units.len - 1, importer.inspectedPrefixNodes());
     try importer.commit(&destination);
 
     try testing.expectEqualStrings("live destination", destination.getTitle().?);
@@ -1478,6 +1748,14 @@ test "history cursor pages newest first within strict budgets" {
     try testing.expectEqual(
         active_first,
         active_node.page().getRowAndCell(0, 0).cell.codepoint(),
+    );
+    try testing.expectEqual(
+        viewport_node,
+        destination_screen.pages.getTopLeft(.viewport).node,
+    );
+    try testing.expectEqual(
+        viewport_codepoint,
+        destination_screen.pages.getTopLeft(.viewport).rowAndCell().cell.codepoint(),
     );
     try testing.expectEqual(
         pages_before_import + units.len,
@@ -1507,9 +1785,9 @@ test "history cursor invalidation and transactional abort outcomes" {
     defer other.deinit(testing.allocator);
 
     {
-        var lease = try HistoryLease.init(&source, .primary);
+        const lease = try HistoryLease.init(&source, .primary);
         defer lease.deinit();
-        var cursor_value = try lease.cursor();
+        const cursor_value = try lease.cursor();
         var output: std.Io.Writer.Allocating = .init(testing.allocator);
         defer output.deinit();
         try testing.expectError(
@@ -1536,10 +1814,11 @@ test "history cursor invalidation and transactional abort outcomes" {
         try prune_screen.testWriteString("\n");
     }
 
-    var prune_lease = try HistoryLease.init(&prune_source, .primary);
+    const prune_lease = try HistoryLease.init(&prune_source, .primary);
     defer prune_lease.deinit();
-    var prune_cursor = try prune_lease.cursor();
-    const captured_boundary = prune_lease.boundary.?.node;
+    const prune_cursor = try prune_lease.cursor();
+    const prune_state = testLeaseState(&prune_lease);
+    const captured_boundary = prune_state.boundary.?.node;
 
     // Prepend an older page after capture. Pruning that page applies real
     // pressure but leaves the checkpoint boundary intact, so the cursor must
@@ -1551,7 +1830,7 @@ test "history cursor invalidation and transactional abort outcomes" {
     older.page().size.rows = @intCast(page_rows);
     try older.finalize(.prepend);
     prune_screen.pages.setMaxLines(4 * page_rows);
-    try testing.expect(!prune_lease.boundary.?.garbage);
+    try testing.expect(!prune_state.boundary.?.garbage);
     try testing.expectEqual(
         captured_boundary,
         prune_screen.pages.getTopLeft(.screen).node,
@@ -1571,7 +1850,7 @@ test "history cursor invalidation and transactional abort outcomes" {
     // Lowering below the remaining checkpoint prefix now recycles the oldest
     // captured boundary and must produce the explicit Pruned outcome.
     prune_screen.pages.setMaxLines(page_rows + page_rows / 2);
-    try testing.expect(prune_lease.boundary.?.garbage);
+    try testing.expect(prune_state.boundary.?.garbage);
     try testing.expectError(
         error.Pruned,
         prune_cursor.next(
@@ -1584,9 +1863,9 @@ test "history cursor invalidation and transactional abort outcomes" {
     var reset_source = try testCursorTerminal(testing.allocator, 1, 'A');
     defer reset_source.deinit(testing.allocator);
     {
-        var lease = try HistoryLease.init(&reset_source, .primary);
+        const lease = try HistoryLease.init(&reset_source, .primary);
         defer lease.deinit();
-        var cursor_value = try lease.cursor();
+        const cursor_value = try lease.cursor();
         reset_source.screens.get(.primary).?.pages.reset();
         var output: std.Io.Writer.Allocating = .init(testing.allocator);
         defer output.deinit();
@@ -1603,9 +1882,9 @@ test "history cursor invalidation and transactional abort outcomes" {
     var resize_source = try testCursorTerminal(testing.allocator, 1, 'A');
     defer resize_source.deinit(testing.allocator);
     {
-        var lease = try HistoryLease.init(&resize_source, .primary);
+        const lease = try HistoryLease.init(&resize_source, .primary);
         defer lease.deinit();
-        var cursor_value = try lease.cursor();
+        const cursor_value = try lease.cursor();
         try resize_source.screens.get(.primary).?.pages.resize(.{ .cols = 3 });
         var output: std.Io.Writer.Allocating = .init(testing.allocator);
         defer output.deinit();
@@ -1622,9 +1901,9 @@ test "history cursor invalidation and transactional abort outcomes" {
     var stale_source = try testCursorTerminal(testing.allocator, 1, 'A');
     defer stale_source.deinit(testing.allocator);
     {
-        var lease = try HistoryLease.init(&stale_source, .primary);
+        const lease = try HistoryLease.init(&stale_source, .primary);
         defer lease.deinit();
-        var cursor_value = try lease.cursor();
+        const cursor_value = try lease.cursor();
         stale_source.screens.get(.primary).?.pages.eraseHistory(null);
         var output: std.Io.Writer.Allocating = .init(testing.allocator);
         defer output.deinit();
@@ -1641,9 +1920,9 @@ test "history cursor invalidation and transactional abort outcomes" {
     var generation_source = try testCursorTerminal(testing.allocator, 1, 'A');
     defer generation_source.deinit(testing.allocator);
     _ = try generation_source.switchScreen(.alternate);
-    var generation_lease = try HistoryLease.init(&generation_source, .alternate);
+    const generation_lease = try HistoryLease.init(&generation_source, .alternate);
     defer generation_lease.deinit();
-    var generation_cursor = try generation_lease.cursor();
+    const generation_cursor = try generation_lease.cursor();
     _ = try generation_source.switchScreen(.primary);
     generation_source.screens.remove(testing.allocator, .alternate);
     _ = try generation_source.switchScreen(.alternate);
@@ -1660,9 +1939,9 @@ test "history cursor invalidation and transactional abort outcomes" {
 
     var abort_source = try testCursorTerminal(testing.allocator, 1, 'A');
     defer abort_source.deinit(testing.allocator);
-    var abort_lease = try HistoryLease.init(&abort_source, .primary);
+    const abort_lease = try HistoryLease.init(&abort_source, .primary);
     defer abort_lease.deinit();
-    var abort_cursor = try abort_lease.cursor();
+    const abort_cursor = try abort_lease.cursor();
     var unit: std.Io.Writer.Allocating = .init(testing.allocator);
     defer unit.deinit();
     _ = try abort_cursor.next(
@@ -1676,10 +1955,13 @@ test "history cursor invalidation and transactional abort outcomes" {
     const abort_screen = abort_destination.screens.get(.primary).?;
     const abort_pages = abort_screen.pages.totalPages();
     const abort_active = abort_screen.pages.getTopLeft(.active).node;
+    abort_screen.pages.scroll(.top);
+    const abort_viewport = abort_screen.pages.getTopLeft(.viewport).node;
     var abort_import = try HistoryImporter.init(
         &abort_destination,
         .primary,
         1,
+        abort_lease.checkpoint(),
     );
     defer abort_import.deinit();
     _ = try abort_import.prepend(
@@ -1693,6 +1975,35 @@ test "history cursor invalidation and transactional abort outcomes" {
         abort_active,
         abort_screen.pages.getTopLeft(.active).node,
     );
+    try testing.expectEqual(
+        abort_viewport,
+        abort_screen.pages.getTopLeft(.viewport).node,
+    );
+
+    var ownership_source = try testCursorTerminal(testing.allocator, 1, 'R');
+    defer ownership_source.deinit(testing.allocator);
+    const ownership_screen = ownership_source.screens.get(.primary).?;
+    const ownership_pins = ownership_screen.pages.countTrackedPins();
+    const ownership_lease = try HistoryLease.init(&ownership_source, .primary);
+    const ownership_alias = ownership_lease;
+    const ownership_cursor = try ownership_alias.cursor();
+    const moved_cursor = ownership_cursor;
+    ownership_lease.abort();
+    try testing.expectEqual(
+        ownership_pins,
+        ownership_screen.pages.countTrackedPins(),
+    );
+    var stale_output: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer stale_output.deinit();
+    try testing.expectError(
+        error.Stale,
+        moved_cursor.next(
+            &ownership_source,
+            .{ .bytes = 4096, .rows = 1 },
+            &stale_output.writer,
+        ),
+    );
+    ownership_alias.deinit();
 }
 
 test "history lease and cursor OOM release bounded state without advancing" {
@@ -1715,14 +2026,15 @@ test "history lease and cursor OOM release bounded state without advancing" {
     try testing.expectEqual(initial_pins, source_screen.pages.countTrackedPins());
     try tw.end(.reset);
 
-    var lease = try HistoryLease.init(&source, .primary);
+    const lease = try HistoryLease.init(&source, .primary);
     defer lease.deinit();
-    var cursor_value = try lease.cursor();
-    const y_before = lease.current.?.y;
-    const serial_before = lease.current_serial;
-    const codepoint_before =
-        lease.current.?.node.page().getRowAndCell(0, y_before).cell.codepoint();
-    const storage_before = lease.current.?.node.storage();
+    const cursor_value = try lease.cursor();
+    const lease_state = testLeaseState(&lease);
+    const y_before = lease_state.current.?.y;
+    const serial_before = lease_state.current_serial;
+    const codepoint_before = lease_state.current.?.node.page()
+        .getRowAndCell(0, y_before).cell.codepoint();
+    const storage_before = lease_state.current.?.node.storage();
     const pins_with_lease = source_screen.pages.countTrackedPins();
 
     // Fail before any PAGE scratch encoding. No bytes, page state, pin, or
@@ -1738,12 +2050,13 @@ test "history lease and cursor OOM release bounded state without advancing" {
             &output.writer,
         ),
     );
-    try testing.expectEqual(y_before, lease.current.?.y);
-    try testing.expectEqual(serial_before, lease.current_serial);
-    try testing.expectEqual(storage_before, lease.current.?.node.storage());
+    try testing.expectEqual(y_before, lease_state.current.?.y);
+    try testing.expectEqual(serial_before, lease_state.current_serial);
+    try testing.expectEqual(storage_before, lease_state.current.?.node.storage());
     try testing.expectEqual(
         codepoint_before,
-        lease.current.?.node.page().getRowAndCell(0, y_before).cell.codepoint(),
+        lease_state.current.?.node.page()
+            .getRowAndCell(0, y_before).cell.codepoint(),
     );
     try testing.expectEqual(pins_with_lease, source_screen.pages.countTrackedPins());
     try testing.expectEqual(@as(usize, 0), output.written().len);

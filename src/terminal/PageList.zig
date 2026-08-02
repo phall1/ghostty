@@ -373,6 +373,11 @@ pub const HistoryInvalidation = enum {
     resize,
     stale,
 };
+
+pub const HistoryLeaseEntry = struct {
+    ptr: *anyopaque,
+    release: *const fn (*anyopaque, *PageList) void,
+};
 /// The memory pool we get page nodes, pages from.
 pool: MemoryPool,
 
@@ -410,6 +415,8 @@ page_serial_epoch: u64,
 history_generation: u64 = 0,
 
 history_invalidation: HistoryInvalidation = .none,
+
+history_leases: std.AutoHashMapUnmanaged(u64, HistoryLeaseEntry) = .empty,
 
 /// Byte size of the raw backing mappings owned by active page nodes. This is
 /// logical scrollback accounting and does not change while a mapping is
@@ -899,6 +906,10 @@ pub fn deinit(self: *PageList) void {
     // Verify integrity before cleanup
     self.assertIntegrity();
 
+    var lease_it = self.history_leases.valueIterator();
+    while (lease_it.next()) |entry| entry.release(entry.ptr, self);
+    self.history_leases.deinit(self.pool.alloc);
+
     // Always deallocate our hashmap.
     self.tracked_pins.deinit(self.pool.alloc);
 
@@ -925,6 +936,24 @@ pub fn historyGeneration(self: *const PageList) u64 {
 
 pub fn historyInvalidation(self: *const PageList) HistoryInvalidation {
     return self.history_invalidation;
+}
+
+pub fn registerHistoryLease(
+    self: *PageList,
+    id: u64,
+    entry: HistoryLeaseEntry,
+) Allocator.Error!void {
+    try self.history_leases.putNoClobber(self.pool.alloc, id, entry);
+}
+
+pub fn historyLease(self: *PageList, id: u64) ?*anyopaque {
+    const entry = self.history_leases.getPtr(id) orelse return null;
+    return entry.ptr;
+}
+
+pub fn releaseHistoryLease(self: *PageList, id: u64) void {
+    const entry = self.history_leases.fetchRemove(id) orelse return;
+    entry.value.release(entry.value.ptr, self);
 }
 
 /// Reset the PageList back to an empty state. This is similar to
@@ -4429,6 +4458,10 @@ pub const HistoryImport = struct {
     discarding: bool = false,
     count: usize = 0,
     active: bool = true,
+    newest_serial: ?u64 = null,
+    prefix_nodes_inspected: usize = 0,
+    viewport_was_top: bool = false,
+    viewport_converted: bool = false,
 
     pub fn init(
         destination: *PageList,
@@ -4460,9 +4493,23 @@ pub const HistoryImport = struct {
         assert(self.count < self.serials.len);
         const node = allocation.node.?;
         const serial = node.serial;
+        const convert_viewport = !self.viewport_converted and
+            self.destination.viewport == .top;
+        if (convert_viewport) {
+            self.destination.scroll(.{ .pin = .{
+                .node = self.destination.pages.first.?,
+            } });
+            self.viewport_was_top = true;
+            self.viewport_converted = true;
+        }
         node.snapshot_history_import = true;
         allocation.finalize(.prepend) catch |err| {
             node.snapshot_history_import = false;
+            if (convert_viewport) {
+                self.destination.scroll(.top);
+                self.viewport_was_top = false;
+                self.viewport_converted = false;
+            }
             switch (err) {
                 error.MaxSizeExceeded,
                 error.MaxLinesExceeded,
@@ -4475,6 +4522,7 @@ pub const HistoryImport = struct {
         };
         self.serials[self.count] = serial;
         self.count += 1;
+        self.newest_serial = serial;
         return true;
     }
 
@@ -4500,6 +4548,10 @@ pub const HistoryImport = struct {
         return self.active;
     }
 
+    pub fn inspectedPrefixNodes(self: *const HistoryImport) usize {
+        return self.prefix_nodes_inspected;
+    }
+
     /// Remove surviving imported history without disturbing later live writes.
     pub fn rollback(self: *HistoryImport) void {
         if (!self.active) return;
@@ -4510,6 +4562,7 @@ pub const HistoryImport = struct {
                 !self.contains(node.serial)) break;
             self.destination.removeSnapshotHistoryNode(node);
         }
+        if (self.viewport_was_top) self.destination.scroll(.top);
         self.destination.assertIntegrity();
     }
 
@@ -4519,18 +4572,16 @@ pub const HistoryImport = struct {
         self.* = undefined;
     }
 
-    /// Every retained import must still form the complete oldest prefix.
-    /// Live limit enforcement may evict one between incremental PAGE records;
-    /// once that happens accepting any older page would create a gap.
-    fn retainedPrefixIntact(self: *const HistoryImport) bool {
-        var retained: usize = 0;
-        var node = self.destination.pages.first;
-        while (node) |current| : (node = current.next) {
-            if (!current.snapshot_history_import) break;
-            if (!self.contains(current.serial)) return false;
-            retained += 1;
-        }
-        return retained == self.count;
+    /// Every retained import must still be the current oldest prefix.
+    ///
+    /// The most recently prepended imported node is always `pages.first`.
+    /// Comparing that one node and serial is sufficient to detect any eviction
+    /// or intervening prepend without rescanning prior imported pages.
+    fn retainedPrefixIntact(self: *HistoryImport) bool {
+        const expected = self.newest_serial orelse return self.count == 0;
+        self.prefix_nodes_inspected += 1;
+        const first = self.destination.pages.first orelse return false;
+        return first.snapshot_history_import and first.serial == expected;
     }
 
     fn contains(self: *const HistoryImport, serial: u64) bool {
