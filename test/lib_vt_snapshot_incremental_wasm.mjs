@@ -1605,10 +1605,10 @@ rt.unlimitedScrollback(historyDestination);
 const sourceHistoryRows = rt.terminalUsize(source, 15);
 assert.ok(sourceHistoryRows > 1000);
 assert.equal(rt.gridText(source, 3, 0, 8), "row-0000");
-// Completing the split SGR writes the parser line and CRLF advances two
-// primary rows into history; both source and READY terminal must preserve it.
+// Column-zero normalization keeps the completed SGR text on one row, so its
+// CRLF advances exactly row-1993 into history on both READY/source terminals.
 assert.equal(rt.gridText(
-  source, 3, sourceHistoryRows - 1, 8), "row-1994");
+  source, 3, sourceHistoryRows - 1, 8), "row-1993");
 const checkpointOwner = { value: null };
 historyTransfer(rt, source, historyDestination, checkpointOwner);
 assert.ok(checkpointOwner.value.some((byte) => byte !== 0));
