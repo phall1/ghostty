@@ -49,6 +49,12 @@ pub fn deinit(self: *Glossary, alloc: Allocator) void {
     self.* = undefined;
 }
 
+/// True when this glossary has no registered glyphs. This does not expose the
+/// insertion-ordered representation because its FIFO order remains semantic.
+pub fn isEmpty(self: *const Glossary) bool {
+    return self.entries.count() == 0;
+}
+
 /// Register the given glyph entry.
 ///
 /// This will act according to the glyph specification

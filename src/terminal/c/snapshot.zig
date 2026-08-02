@@ -42,6 +42,9 @@ pub const Capabilities = extern struct {
 fn mapError(err: anyerror) Result {
     return switch (err) {
         error.OutOfMemory, error.WriteFailed => .out_of_memory,
+        error.UnsupportedKittyGraphics,
+        error.UnsupportedGlyphGlossary,
+        => .unsupported_feature,
         else => .invalid_value,
     };
 }
@@ -81,6 +84,7 @@ pub fn encode(
     out.len = 0;
 
     const t = terminal_c.zigTerminal(terminal) orelse return .invalid_value;
+    snapshot_codec.validateSupportedState(t) catch |err| return mapError(err);
     const alloc = lib.alloc.default(alloc_);
 
     var continuation_writer: std.Io.Writer.Allocating = .init(alloc);
@@ -241,6 +245,35 @@ test "snapshot C API exposes immutable codec capabilities" {
     result.size -= 1;
     try testing.expectEqual(Result.invalid_value, capabilities(&result));
     try testing.expectEqual(Result.invalid_value, capabilities(null));
+}
+
+test "snapshot C API reports unsupported native fidelity explicitly" {
+    try testing.expectEqual(
+        Result.unsupported_feature,
+        mapError(error.UnsupportedKittyGraphics),
+    );
+    try testing.expectEqual(
+        Result.unsupported_feature,
+        mapError(error.UnsupportedGlyphGlossary),
+    );
+
+    const source = try testTerminal();
+    defer terminal_c.free(source);
+    const register =
+        "\x1b_25a1;r;cp=e0a0;AAAAAAAAAAAAAA==\x1b\\";
+    terminal_c.vt_write(source, register, register.len);
+
+    var result: Encoded = .{
+        .size = @sizeOf(Encoded),
+        .data = @ptrFromInt(@alignOf(usize)),
+        .len = std.math.maxInt(usize),
+    };
+    try testing.expectEqual(
+        Result.unsupported_feature,
+        encode(&lib.alloc.test_allocator, source, &result),
+    );
+    try testing.expectEqual(@as(?[*]u8, null), result.data);
+    try testing.expectEqual(@as(usize, 0), result.len);
 }
 
 test "snapshot C API ground-state round trip restores usable terminal" {

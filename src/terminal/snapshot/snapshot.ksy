@@ -983,7 +983,7 @@ types:
         valid:
           expr: |
             content_kind == 0 ?
-              (_ <= 0x10ffff and not (_ >= 0xd800 and _ <= 0xdfff) and _ != 0x10eeee) :
+              (_ <= 0x10ffff and not (_ >= 0xd800 and _ <= 0xdfff)) :
             content_kind == 1 ?
               _ <= 0xff :
               _ <= 0xffffff
@@ -999,7 +999,7 @@ types:
         repeat: expr
         repeat-expr: num_graphemes
         valid:
-          expr: _ <= 0x10ffff and not (_ >= 0xd800 and _ <= 0xdfff) and _ != 0x10eeee
+          expr: _ <= 0x10ffff and not (_ >= 0xd800 and _ <= 0xdfff)
 
   grid_cell_flags:
     seq:

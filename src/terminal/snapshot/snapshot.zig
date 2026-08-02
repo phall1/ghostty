@@ -16,6 +16,7 @@ const TerminalStream = @import("../stream_terminal.zig").Stream;
 const terminal_kitty = @import("../kitty.zig");
 const TerminalPageList = @import("../PageList.zig");
 const TerminalScreen = @import("../Screen.zig");
+const TerminalSelection = @import("../Selection.zig");
 const TerminalScreenKey = @import("../ScreenSet.zig").Key;
 const Blake3 = std.crypto.hash.Blake3;
 
@@ -24,6 +25,9 @@ const test_complete_v1_fixture = test_fixture.parse(
 );
 const test_complete_v2_fixture = test_fixture.parse(
     @embedFile("testdata/complete-v2.hex"),
+);
+const test_complete_kitty_placeholder_v2_fixture = test_fixture.parse(
+    @embedFile("testdata/complete-kitty-placeholder-v2.hex"),
 );
 
 const test_encode_options: EncodeOptions = .{ .continuation = .ground };
@@ -98,8 +102,34 @@ pub const capabilities: Capabilities = .{
     .history = true,
 };
 
+/// Exact native state that the immutable v1/v2 grammar cannot represent.
+pub const UnsupportedStateError = error{
+    UnsupportedKittyGraphics,
+    UnsupportedGlyphGlossary,
+};
+
+/// Reject terminal-owned semantics that v1/v2 would otherwise silently omit.
+///
+/// This scan performs no allocation and must run while the terminal is held
+/// immutable, before constructing a record writer or emitting the envelope.
+pub fn validateSupportedState(t: *const Terminal) UnsupportedStateError!void {
+    if (comptime build_options.kitty_graphics) {
+        for ([_]TerminalScreenKey{ .primary, .alternate }) |key| {
+            const value = t.screens.get(key) orelse continue;
+            if (!value.kitty_images.isSemanticallyEmpty()) {
+                return error.UnsupportedKittyGraphics;
+            }
+        }
+    }
+
+    if (!t.glyph_glossary.isEmpty()) {
+        return error.UnsupportedGlyphGlossary;
+    }
+}
+
 /// Errors possible while encoding one complete terminal snapshot.
-pub const EncodeError = terminal.EncodeError ||
+pub const EncodeError = UnsupportedStateError ||
+    terminal.EncodeError ||
     screen.EncodeError ||
     history.EncodeError ||
     checkpoint.EncodeError ||
@@ -177,6 +207,8 @@ pub const Encoder = struct {
             },
             .v2 => try continuation.validate(options.continuation),
         }
+
+        try validateSupportedState(t);
 
         return .{
             .alloc = alloc,
@@ -1695,78 +1727,268 @@ test "complete snapshot preserves every supported continuation cut" {
     };
 }
 
-test "complete snapshot preserves Kitty virtual placeholders" {
+fn testExpectUnsupportedCapture(
+    t: *const Terminal,
+    expected: UnsupportedStateError,
+) !void {
+    var destination: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer destination.deinit();
+    try destination.writer.writeAll("prefix");
+    try std.testing.expectError(
+        expected,
+        encode(
+            std.testing.allocator,
+            &destination.writer,
+            t,
+            test_encode_options,
+        ),
+    );
+    try std.testing.expectEqualStrings("prefix", destination.written());
+}
+
+test "complete snapshot rejects every primary and alternate Kitty storage state" {
     if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
 
+    const testing = std.testing;
+    const Case = enum {
+        completed_image,
+        placement,
+        loading,
+        implicit_image_counter,
+        implicit_placement_counter,
+    };
+    const cases = [_]Case{
+        .completed_image,
+        .placement,
+        .loading,
+        .implicit_image_counter,
+        .implicit_placement_counter,
+    };
+
+    for ([_]TerminalScreenKey{ .primary, .alternate }) |key| {
+        for (cases) |case| {
+            var t = try Terminal.init(testing.io, testing.allocator, .{
+                .cols = 2,
+                .rows = 1,
+            });
+            defer t.deinit(testing.allocator);
+            if (key == .alternate) _ = try t.switchScreen(.alternate);
+            const storage = &t.screens.active.kitty_images;
+
+            switch (case) {
+                .completed_image => try storage.addImage(
+                    testing.io,
+                    testing.allocator,
+                    .{ .id = 1 },
+                ),
+                .placement => {
+                    try storage.addImage(
+                        testing.io,
+                        testing.allocator,
+                        .{ .id = 1 },
+                    );
+                    try storage.addPlacement(
+                        testing.io,
+                        testing.allocator,
+                        1,
+                        1,
+                        .{ .location = .{ .virtual = {} } },
+                    );
+                },
+                .loading => {
+                    const cmd = try terminal_kitty.graphics.CommandParser.parseString(
+                        testing.allocator,
+                        "a=t,f=24,t=d,s=1,v=2,m=1,i=1;////",
+                    );
+                    defer cmd.deinit(testing.allocator);
+                    _ = terminal_kitty.graphics.execute(
+                        testing.io,
+                        testing.allocator,
+                        &t,
+                        &cmd,
+                    );
+                },
+                .implicit_image_counter => {
+                    const cmd = try terminal_kitty.graphics.CommandParser.parseString(
+                        testing.allocator,
+                        "a=t,f=24,t=d,s=1,v=2,i=0,I=0;////////",
+                    );
+                    defer cmd.deinit(testing.allocator);
+                    _ = terminal_kitty.graphics.execute(
+                        testing.io,
+                        testing.allocator,
+                        &t,
+                        &cmd,
+                    );
+                    storage.delete(
+                        testing.io,
+                        testing.allocator,
+                        &t,
+                        .{ .all = true },
+                    );
+                },
+                .implicit_placement_counter => {
+                    try storage.addImage(
+                        testing.io,
+                        testing.allocator,
+                        .{ .id = 1 },
+                    );
+                    try storage.addPlacement(
+                        testing.io,
+                        testing.allocator,
+                        1,
+                        0,
+                        .{ .location = .{ .virtual = {} } },
+                    );
+                    storage.delete(
+                        testing.io,
+                        testing.allocator,
+                        &t,
+                        .{ .id = .{
+                            .delete = true,
+                            .image_id = 1,
+                            .placement_id = 0,
+                        } },
+                    );
+                },
+            }
+
+            try testing.expect(!storage.isSemanticallyEmpty());
+            try testExpectUnsupportedCapture(
+                &t,
+                error.UnsupportedKittyGraphics,
+            );
+        }
+    }
+}
+
+test "complete snapshot rejects a nonempty glyph glossary before envelope" {
     const testing = std.testing;
     var t = try Terminal.init(testing.io, testing.allocator, .{
         .cols = 2,
         .rows = 1,
     });
     defer t.deinit(testing.allocator);
+    var stream = TerminalStream.init(.{
+        .allocator = testing.allocator,
+        .handler = .init(&t),
+    });
+    defer stream.deinit();
 
-    // Register a real virtual placement, then write its grid representation:
-    // U+10EEEE followed by row and column diacritics. The image and placement
-    // registry is intentionally omitted, but the grid content must remain
-    // decodable.
-    try t.screens.active.kitty_images.addImage(
-        testing.io,
-        testing.allocator,
-        .{ .id = 1 },
+    stream.nextSlice(
+        "\x1b_25a1;r;cp=e0a0;AAAAAAAAAAAAAA==\x1b\\",
     );
-    try t.screens.active.kitty_images.addPlacement(
-        testing.io,
-        testing.allocator,
-        1,
-        0,
-        .{
-            .location = .{ .virtual = {} },
-            .columns = 1,
-            .rows = 1,
-        },
+    try testing.expect(!t.glyph_glossary.isEmpty());
+    try testExpectUnsupportedCapture(
+        &t,
+        error.UnsupportedGlyphGlossary,
     );
-    try t.setAttribute(.{ .@"256_fg" = 1 });
-    try t.printString("\u{10EEEE}\u{0305}\u{0305}");
-    const source_cell = t.screens.active.pages.getCell(.{
-        .screen = .{},
-    }).?;
-    try testing.expectEqual(
-        terminal_kitty.graphics.unicode.placeholder,
-        source_cell.cell.codepoint(),
-    );
-    try testing.expect(source_cell.row.kitty_virtual_placeholder);
+}
 
-    var encoded: std.Io.Writer.Allocating = .init(testing.allocator);
-    defer encoded.deinit();
-    try encode(testing.allocator, &encoded.writer, &t, test_encode_options);
-
-    var encoded_source: std.Io.Reader = .fixed(encoded.written());
-    var restored = try decode(
+test "asset-free Kitty placeholder fixture round trips U+10EEEE" {
+    const testing = std.testing;
+    var source: std.Io.Reader = .fixed(
+        &test_complete_kitty_placeholder_v2_fixture,
+    );
+    var decoded = try decode(
         testing.allocator,
         testing.io,
-        &encoded_source,
+        &source,
         test_decode_options,
     );
-    defer restored.deinit(testing.allocator);
-    const restored_terminal = &restored.terminal.?;
-
-    const restored_cell = restored_terminal.screens.active.pages.getCell(.{
+    defer decoded.deinit(testing.allocator);
+    const restored = &decoded.terminal.?;
+    const restored_screen = restored.screens.get(.alternate).?;
+    const restored_cell = restored_screen.pages.getCell(.{
         .screen = .{},
     }).?;
+
     try testing.expectEqual(
         terminal_kitty.graphics.unicode.placeholder,
         restored_cell.cell.codepoint(),
     );
-    try testing.expect(restored_cell.cell.hasGrapheme());
+    try testing.expectEqualSlices(
+        u21,
+        &.{ terminal_kitty.graphics.unicode.placeholder, 0x0305 },
+        restored_cell.node.page().lookupGrapheme(restored_cell.cell).?,
+    );
     try testing.expect(restored_cell.row.kitty_virtual_placeholder);
-    try testing.expectEqual(
-        @as(usize, 0),
-        restored_terminal.screens.active.kitty_images.images.count(),
+    if (comptime build_options.kitty_graphics) {
+        try testing.expect(restored_screen.kitty_images.isSemanticallyEmpty());
+    }
+
+    var reencoded: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer reencoded.deinit();
+    try encode(
+        testing.allocator,
+        &reencoded.writer,
+        restored,
+        test_encode_options,
     );
-    try testing.expectEqual(
-        @as(usize, 0),
-        restored_terminal.screens.active.kitty_images.placements.count(),
+    try testing.expectEqualStrings(
+        &test_complete_kitty_placeholder_v2_fixture,
+        reencoded.written(),
     );
+}
+
+test "complete snapshot omits and resets view-local state" {
+    const testing = std.testing;
+    var source: std.Io.Reader = .fixed(&test_complete_v2_fixture);
+    var decoded = try decode(
+        testing.allocator,
+        testing.io,
+        &source,
+        test_decode_options,
+    );
+    defer decoded.deinit(testing.allocator);
+    const t = &decoded.terminal.?;
+    const primary = t.screens.get(.primary).?;
+
+    try primary.select(TerminalSelection.init(
+        primary.pages.pin(.{ .active = .{} }).?,
+        primary.pages.pin(.{ .active = .{ .x = 1 } }).?,
+        false,
+    ));
+    primary.scroll(.top);
+    t.flags.focused = false;
+    t.flags.visible = false;
+    t.flags.selection_scroll = true;
+    t.flags.search_viewport_dirty = true;
+    primary.dirty.selection = true;
+    primary.dirty.hyperlink_hover = true;
+
+    var encoded: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer encoded.deinit();
+    try encode(
+        testing.allocator,
+        &encoded.writer,
+        t,
+        test_encode_options,
+    );
+    try testing.expectEqualStrings(
+        &test_complete_v2_fixture,
+        encoded.written(),
+    );
+
+    var restored_source: std.Io.Reader = .fixed(encoded.written());
+    var restored = try decode(
+        testing.allocator,
+        testing.io,
+        &restored_source,
+        test_decode_options,
+    );
+    defer restored.deinit(testing.allocator);
+    const restored_terminal = &restored.terminal.?;
+    const restored_primary = restored_terminal.screens.get(.primary).?;
+    const scrollbar = restored_primary.pages.scrollbar();
+    try testing.expect(restored_terminal.flags.focused);
+    try testing.expect(restored_terminal.flags.visible);
+    try testing.expect(!restored_terminal.flags.selection_scroll);
+    try testing.expect(!restored_terminal.flags.search_viewport_dirty);
+    try testing.expect(restored_primary.selection == null);
+    try testing.expect(!restored_primary.dirty.selection);
+    try testing.expect(!restored_primary.dirty.hyperlink_hover);
+    try testing.expectEqual(scrollbar.total - scrollbar.len, scrollbar.offset);
 }
 
 test "complete snapshot encoding streams from the current writer position" {
