@@ -565,7 +565,7 @@ pub fn decoderPush(
     const data = data_.?[0..len];
     const result = state.decoder.push(data) catch |err| {
         out.consumed = state.decoder.consumedOnError();
-        state.terminal_state = true;
+        if (err != error.ReadyNotTaken) state.terminal_state = true;
         return mapError(err);
     };
     out.consumed = result.consumed;
