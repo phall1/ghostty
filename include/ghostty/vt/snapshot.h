@@ -171,6 +171,7 @@ typedef enum GHOSTTY_ENUM_TYPED {
     GHOSTTY_TERMINAL_SNAPSHOT_STATUS_CONTINUATION_UNAVAILABLE = -15,
     GHOSTTY_TERMINAL_SNAPSHOT_STATUS_RESET = -16,
     GHOSTTY_TERMINAL_SNAPSHOT_STATUS_RESIZE = -17,
+    GHOSTTY_TERMINAL_SNAPSHOT_STATUS_ENTROPY_UNAVAILABLE = -18,
     GHOSTTY_TERMINAL_SNAPSHOT_STATUS_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalSnapshotStatus;
 
@@ -184,10 +185,12 @@ typedef struct {
  * Incremental ABI feature and identity metadata.
  *
  * `codec_identity` and `build_identity` are immutable library-owned strings.
- * Standalone freestanding/wasm builds do not have a secure entropy source:
- * `authenticated_tokens` and `bounded_units` are false there, and the
- * history lease/importer constructors return UNSUPPORTED_FEATURE. Snapshot
- * capture and READY/history stream decoding remain available.
+ * Standalone `wasm32-freestanding` builds require the wasm function import
+ * `ghostty.host_entropy_fill(i32 buffer, i32 len) -> i32`. The host must fill
+ * all `len` bytes in module linear memory with cryptographically secure random
+ * data and return zero. Any nonzero return produces ENTROPY_UNAVAILABLE; there
+ * is no deterministic fallback. Other freestanding targets continue to report
+ * authenticated history as unsupported.
  */
 typedef struct {
     size_t size;
@@ -423,7 +426,8 @@ GHOSTTY_API void ghostty_terminal_snapshot_decoder_free(
     GhosttyTerminalSnapshotDecoder decoder);
 
 /** Acquire one engine-owned, generation-bound history cut.
- * Returns UNSUPPORTED_FEATURE when secure token entropy is unavailable.
+ * Returns UNSUPPORTED_FEATURE when authenticated history is not compiled for
+ * the target, or ENTROPY_UNAVAILABLE when its secure entropy provider fails.
  */
 GHOSTTY_API GhosttyTerminalSnapshotStatus
 ghostty_terminal_history_lease_new(
@@ -462,7 +466,8 @@ GHOSTTY_API void ghostty_terminal_history_cursor_free(
  * Create a transactional importer for units authenticated by `checkpoint`.
  * The source terminal and its lease must still be live; the destination owns
  * imported pages and may receive serialized live VT writes between pushes.
- * Returns UNSUPPORTED_FEATURE when secure token entropy is unavailable.
+ * Returns UNSUPPORTED_FEATURE when authenticated history is not compiled for
+ * the target, or ENTROPY_UNAVAILABLE when its secure entropy provider fails.
  */
 GHOSTTY_API GhosttyTerminalSnapshotStatus
 ghostty_terminal_history_importer_new(

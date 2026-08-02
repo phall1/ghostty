@@ -39,6 +39,8 @@ pub const Codepoints = extern struct {
 pub const structs: std.StaticStringMap(StructInfo) = structs: {
     @setEvalBranchQuota(10_000);
     break :structs .initComptime(.{
+        .{ "GhosttyAllocator", StructInfo.init(lib.alloc.Allocator) },
+        .{ "GhosttyAllocatorVtable", StructInfo.init(lib.alloc.VTable) },
         .{ "GhosttyBuffer", StructInfo.init(lib.Buffer) },
         .{ "GhosttyClipboardContent", StructInfo.init(terminal.ClipboardContent) },
         .{ "GhosttyClipboardWrite", StructInfo.init(terminal.ClipboardWrite) },

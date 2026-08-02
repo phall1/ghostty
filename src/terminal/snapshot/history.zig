@@ -706,16 +706,33 @@ pub const HistoryImporter = struct {
         source_terminal: *Terminal,
         expected_checkpoint: HistoryCheckpoint,
     ) InitError!HistoryImporter {
+        var entropy: [32]u8 = undefined;
+        io_.random(&entropy);
+        return initWithEntropy(
+            terminal_,
+            key,
+            max_chunks,
+            source_terminal,
+            expected_checkpoint,
+            entropy,
+        );
+    }
+
+    pub fn initWithEntropy(
+        terminal_: *Terminal,
+        key: TerminalScreenKey,
+        max_chunks: usize,
+        source_terminal: *Terminal,
+        expected_checkpoint: HistoryCheckpoint,
+        entropy: [32]u8,
+    ) InitError!HistoryImporter {
         const source_state = try resolveCheckpoint(
             source_terminal,
             expected_checkpoint,
         );
         const terminal_screen = terminal_.screens.get(key) orelse
             return error.ScreenUnavailable;
-        var entropy: [32]u8 = undefined;
-        io_.random(&entropy);
         terminal_screen.pages.initializeHistoryLeaseKey(entropy);
-
         var import = try TerminalPageList.HistoryImport.init(
             &terminal_screen.pages,
             terminal_screen.alloc,

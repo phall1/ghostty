@@ -1,210 +1,766 @@
 #!/usr/bin/env node
 
-// Direct standalone ghostty-vt.wasm ABI smoke. No wasm-bindgen, Cargo, WASI,
-// callbacks, or host file descriptors are involved.
+// Direct standalone ghostty-vt.wasm ABI smoke. Browser consumers, including
+// phux-web, should instantiate this artifact through JS (or wasm-bindgen JS
+// glue) and provide the import below. Cargo wasm must not try to link the
+// native libghostty-rs archive into its wasm module.
 import { readFile } from "node:fs/promises";
+import { webcrypto } from "node:crypto";
 import assert from "node:assert/strict";
 
 const wasmPath = process.argv[2] ?? "zig-out/bin/ghostty-vt.wasm";
 const wasmBytes = await readFile(wasmPath);
 const module = await WebAssembly.compile(wasmBytes);
-const imports = {};
-for (const entry of WebAssembly.Module.imports(module)) {
-  imports[entry.module] ??= {};
-  if (entry.kind === "function") imports[entry.module][entry.name] = () => 0;
-  else if (entry.kind === "memory") {
-    imports[entry.module][entry.name] = new WebAssembly.Memory({ initial: 32 });
-  } else if (entry.kind === "table") {
-    imports[entry.module][entry.name] = new WebAssembly.Table({
-      initial: 0,
-      element: "anyfunc",
-    });
-  } else if (entry.kind === "global") {
-    imports[entry.module][entry.name] = new WebAssembly.Global({
-      value: "i32",
-      mutable: true,
-    }, 0);
+const moduleImports = WebAssembly.Module.imports(module);
+const entropyImport = {
+  module: "ghostty",
+  name: "host_entropy_fill",
+  kind: "function",
+};
+assert.deepEqual(
+  moduleImports.filter((entry) => entry.module === entropyImport.module),
+  [entropyImport],
+  "standalone wasm must require exactly ghostty.host_entropy_fill",
+);
+for (const entry of moduleImports) {
+  assert.ok(
+    entry.module === "ghostty" ||
+      (entry.module === "env" && entry.name === "log" && entry.kind === "function"),
+    `unexpected standalone wasm import ${entry.module}.${entry.name}:${entry.kind}`,
+  );
+}
+
+// `getRandomValues` is shared by Node's Web Crypto and browsers. Reacquire a
+// view for every chunk so a prior wasm memory growth can never leave this host
+// writing into a detached ArrayBuffer. Exceptions become a nonzero import
+// result; there is deliberately no zero-filled or predictable fallback.
+function secureEntropy(getMemory, ptr, len) {
+  try {
+    const memory = getMemory();
+    if (!(memory instanceof WebAssembly.Memory)) return -1;
+    const end = ptr + len;
+    if (!Number.isSafeInteger(end) || end > memory.buffer.byteLength) return -1;
+    for (let offset = 0; offset < len; offset += 65536) {
+      const count = Math.min(65536, len - offset);
+      webcrypto.getRandomValues(
+        new Uint8Array(memory.buffer, ptr + offset, count),
+      );
+    }
+    return 0;
+  } catch {
+    return -1;
   }
 }
-const { exports: e } = await WebAssembly.instantiate(module, imports);
-assert.ok(e.memory instanceof WebAssembly.Memory);
 
-const u8 = () => new Uint8Array(e.memory.buffer);
-const view = () => new DataView(e.memory.buffer);
-const alloc = (len) => {
-  const ptr = e.ghostty_alloc(0, len);
-  assert.notEqual(ptr, 0, `allocation failed (${len} bytes)`);
-  return ptr;
-};
-const free = (ptr, len) => e.ghostty_free(0, ptr, len);
-const cString = (ptr) => {
-  const memory = u8();
-  let end = ptr;
-  while (memory[end] !== 0) ++end;
-  return new TextDecoder().decode(memory.subarray(ptr, end));
-};
-const layouts = JSON.parse(cString(e.ghostty_type_json()));
-const layout = (name) => {
-  const value = layouts[name];
-  assert.ok(value, `missing ${name} from ghostty_type_json`);
-  return value;
-};
-const field = (name, member) => layout(name).fields[member].offset;
-const struct = (name) => {
-  const size = layout(name).size;
-  const ptr = alloc(size);
-  u8().fill(0, ptr, ptr + size);
-  view().setUint32(ptr + field(name, "size"), size, true);
-  if (layout(name).fields.version)
-    view().setUint32(ptr + field(name, "version"), 1, true);
-  return { ptr, size, name };
-};
-const dispose = (s) => free(s.ptr, s.size);
-const getUsize = (s, member) => view().getUint32(
-  s.ptr + field(s.name, member), true);
-const setUsize = (s, member, value) => view().setUint32(
-  s.ptr + field(s.name, member), value, true);
-const getI32 = (s, member) => view().getInt32(
-  s.ptr + field(s.name, member), true);
+async function instantiateRuntime(entropyProvider = secureEntropy) {
+  let memory = null;
+  const imports = {};
+  for (const entry of moduleImports) {
+    imports[entry.module] ??= {};
+    if (entry.module === entropyImport.module && entry.name === entropyImport.name) {
+      imports[entry.module][entry.name] = (ptr, len) => {
+        try {
+          return entropyProvider(() => memory, ptr >>> 0, len >>> 0) | 0;
+        } catch {
+          return -1;
+        }
+      };
+    } else if (entry.module === "env" && entry.name === "log") {
+      imports.env.log = () => {};
+    }
+  }
+  const instance = await WebAssembly.instantiate(module, imports);
+  memory = instance.exports.memory;
+  assert.ok(memory instanceof WebAssembly.Memory);
+  return new Runtime(instance.exports);
+}
 
 const SUCCESS = 0;
 const UNSUPPORTED_FEATURE = -1;
 const UNKNOWN_VERSION = -2;
+const CORRUPTION = -3;
+const LIMIT_EXCEEDED = -5;
+const WRONG_GENERATION = -8;
+const WRONG_TERMINAL = -9;
+const INVALID_HANDLE = -10;
+const IMPORT_BUSY = -11;
+const OUT_OF_MEMORY = -12;
 const OUT_OF_SPACE = -13;
+const INVALID_STATE = -14;
+const ENTROPY_UNAVAILABLE = -18;
+const CAPTURE_RECORD = 0;
 const CAPTURE_READY = 1;
+const CAPTURE_HISTORY_BEGIN = 2;
+const CAPTURE_HISTORY_PAGE = 3;
 const CAPTURE_FINISH = 4;
 const DECODE_READY = 2;
 const DECODE_FINISH = 5;
+const HISTORY_UNIT = 0;
+const HISTORY_END = 1;
 
-const terminalSlot = alloc(4);
-view().setUint32(terminalSlot, 0, true);
-assert.equal(e.ghostty_terminal_new(0, terminalSlot, 40, 8), 0);
-const source = view().getUint32(terminalSlot, true);
-assert.notEqual(source, 0);
-const text = new TextEncoder().encode("wasm-ready\r\n".repeat(40));
-const textPtr = alloc(text.length);
-u8().set(text, textPtr);
-e.ghostty_terminal_vt_write(source, textPtr, text.length);
-free(textPtr, text.length);
-
-const capabilities = struct("GhosttyTerminalSnapshotIncrementalCapabilities");
-assert.equal(e.ghostty_terminal_snapshot_incremental_capabilities(
-  capabilities.ptr), SUCCESS);
-assert.equal(view().getUint8(
-  capabilities.ptr + field(capabilities.name, "incremental")), 1);
-assert.equal(view().getUint8(
-  capabilities.ptr + field(capabilities.name, "authenticated_tokens")), 0);
-assert.equal(view().getUint8(
-  capabilities.ptr + field(capabilities.name, "bounded_units")), 0);
-const unavailableLease = struct("GhosttyTerminalHistoryLeaseResult");
-assert.equal(e.ghostty_terminal_history_lease_new(
-  0, source, 0, unavailableLease.ptr), UNSUPPORTED_FEATURE);
-assert.equal(view().getUint32(
-  unavailableLease.ptr + field(unavailableLease.name, "lease"), true), 0);
-dispose(unavailableLease);
-dispose(capabilities);
-
-const captureOptions = struct("GhosttyTerminalSnapshotCaptureOptions");
-setUsize(captureOptions, "max_record_bytes", 4 * 1024 * 1024);
-setUsize(captureOptions, "max_pages", 4096);
-const captureSlot = alloc(4);
-view().setUint32(captureSlot, 0, true);
-assert.equal(e.ghostty_terminal_snapshot_capture_new(
-  0, source, captureOptions.ptr, captureSlot), SUCCESS);
-const capture = view().getUint32(captureSlot, true);
-assert.notEqual(capture, 0);
-
-const records = [];
-let sawReady = false;
-for (;;) {
-  const event = struct("GhosttyTerminalSnapshotCaptureEvent");
-  assert.equal(e.ghostty_terminal_snapshot_capture_next(
-    capture, 0, 0, event.ptr), OUT_OF_SPACE);
-  const required = getUsize(event, "required_bytes");
-  assert.ok(required > 0);
-  const record = alloc(required);
-  assert.equal(e.ghostty_terminal_snapshot_capture_next(
-    capture, record, required, event.ptr), SUCCESS);
-  const written = getUsize(event, "written");
-  assert.equal(written, required);
-  records.push(Uint8Array.from(u8().subarray(record, record + written)));
-  const kind = getI32(event, "kind");
-  if (kind === CAPTURE_READY) sawReady = true;
-  free(record, required);
-  dispose(event);
-  if (kind === CAPTURE_FINISH) break;
-}
-assert.ok(sawReady);
-e.ghostty_terminal_snapshot_capture_free(capture);
-free(captureSlot, 4);
-dispose(captureOptions);
-
-const encodedLength = records.reduce((n, record) => n + record.length, 0);
-const encoded = new Uint8Array(encodedLength);
-let writeOffset = 0;
-for (const record of records) {
-  encoded.set(record, writeOffset);
-  writeOffset += record.length;
-}
-const encodedPtr = alloc(encoded.length);
-u8().set(encoded, encodedPtr);
-
-const decoderOptions = struct("GhosttyTerminalSnapshotDecoderOptions");
-setUsize(decoderOptions, "max_continuation_bytes", 1024 * 1024);
-setUsize(decoderOptions, "max_record_bytes", 4 * 1024 * 1024);
-setUsize(decoderOptions, "max_pages", 4096);
-const decoderSlot = alloc(4);
-view().setUint32(decoderSlot, 0, true);
-assert.equal(e.ghostty_terminal_snapshot_decoder_new(
-  0, decoderOptions.ptr, decoderSlot), SUCCESS);
-const decoder = view().getUint32(decoderSlot, true);
-let decodedTerminal = 0;
-let offset = 0;
-while (offset < encoded.length) {
-  const event = struct("GhosttyTerminalSnapshotDecodeEvent");
-  assert.equal(e.ghostty_terminal_snapshot_decoder_push(
-    decoder, encodedPtr + offset, 1, event.ptr), SUCCESS);
-  const consumed = getUsize(event, "consumed");
-  assert.equal(consumed, 1);
-  offset += consumed;
-  const kind = getI32(event, "kind");
-  if (kind === DECODE_READY) {
-    const take = struct("GhosttyTerminalSnapshotTakeTerminalResult");
-    assert.equal(e.ghostty_terminal_snapshot_decoder_take_terminal(
-      decoder, take.ptr), SUCCESS);
-    decodedTerminal = view().getUint32(
-      take.ptr + field(take.name, "terminal"), true);
-    assert.notEqual(decodedTerminal, 0);
-    assert.equal(e.ghostty_terminal_snapshot_decoder_replay_continuation(
-      decoder, decodedTerminal), SUCCESS);
-    dispose(take);
+class Runtime {
+  constructor(exports) {
+    this.e = exports;
+    this.layouts = JSON.parse(this.cString(exports.ghostty_type_json()));
   }
-  dispose(event);
-  if (kind === DECODE_FINISH) break;
+
+  u8() { return new Uint8Array(this.e.memory.buffer); }
+  view() { return new DataView(this.e.memory.buffer); }
+
+  alloc(len) {
+    const ptr = this.e.ghostty_alloc(0, len);
+    assert.notEqual(ptr, 0, `allocation failed (${len} bytes)`);
+    return ptr;
+  }
+
+  free(ptr, len) {
+    if (ptr !== 0) this.e.ghostty_free(0, ptr, len);
+  }
+
+  cString(ptr) {
+    const memory = new Uint8Array(this.e.memory.buffer);
+    let end = ptr;
+    while (memory[end] !== 0) ++end;
+    return new TextDecoder().decode(memory.subarray(ptr, end));
+  }
+
+  layout(name) {
+    const value = this.layouts[name];
+    assert.ok(value, `missing ${name} from ghostty_type_json`);
+    return value;
+  }
+
+  field(name, member) {
+    const value = this.layout(name).fields[member];
+    assert.ok(value, `missing ${name}.${member}`);
+    return value.offset;
+  }
+
+  rawStruct(name) {
+    const size = this.layout(name).size;
+    const ptr = this.alloc(size);
+    this.u8().fill(0, ptr, ptr + size);
+    return { ptr, size, name };
+  }
+
+  struct(name) {
+    const result = this.rawStruct(name);
+    const fields = this.layout(name).fields;
+    if (fields.size) this.view().setUint32(
+      result.ptr + fields.size.offset, result.size, true);
+    if (fields.version) this.view().setUint32(
+      result.ptr + fields.version.offset, 1, true);
+    return result;
+  }
+
+  dispose(value) { this.free(value.ptr, value.size); }
+  getUsize(value, member) {
+    return this.view().getUint32(value.ptr + this.field(value.name, member), true);
+  }
+  setUsize(value, member, number) {
+    this.view().setUint32(value.ptr + this.field(value.name, member), number, true);
+  }
+  getI32(value, member) {
+    return this.view().getInt32(value.ptr + this.field(value.name, member), true);
+  }
+  setPtr(value, member, ptr) {
+    this.view().setUint32(value.ptr + this.field(value.name, member), ptr, true);
+  }
+  inlineString(value, member) {
+    const stringPtr = value.ptr + this.field(value.name, member);
+    const ptr = this.view().getUint32(
+      stringPtr + this.field("GhosttyString", "ptr"), true);
+    const len = this.view().getUint32(
+      stringPtr + this.field("GhosttyString", "len"), true);
+    return new TextDecoder().decode(this.u8().subarray(ptr, ptr + len));
+  }
+
+  terminal(columns = 40, rows = 8) {
+    const slot = this.alloc(4);
+    this.view().setUint32(slot, 0, true);
+    assert.equal(this.e.ghostty_terminal_new(0, slot, columns, rows), SUCCESS);
+    const terminal = this.view().getUint32(slot, true);
+    this.free(slot, 4);
+    assert.notEqual(terminal, 0);
+    return terminal;
+  }
+
+  write(terminal, input) {
+    const bytes = typeof input === "string" ? new TextEncoder().encode(input) : input;
+    const ptr = this.alloc(bytes.length);
+    this.u8().set(bytes, ptr);
+    this.e.ghostty_terminal_vt_write(terminal, ptr, bytes.length);
+    this.free(ptr, bytes.length);
+  }
 }
-assert.equal(offset, encoded.length);
-assert.notEqual(decodedTerminal, 0);
-e.ghostty_terminal_snapshot_decoder_free(decoder);
 
-// Unknown version maps to a structured error and never traps.
-const damaged = Uint8Array.from(encoded);
-damaged[8] = 0xff;
-damaged[9] = 0x7f;
-u8().set(damaged, encodedPtr);
-view().setUint32(decoderSlot, 0, true);
-assert.equal(e.ghostty_terminal_snapshot_decoder_new(
-  0, decoderOptions.ptr, decoderSlot), SUCCESS);
-const badDecoder = view().getUint32(decoderSlot, true);
-const badEvent = struct("GhosttyTerminalSnapshotDecodeEvent");
-assert.equal(e.ghostty_terminal_snapshot_decoder_push(
-  badDecoder, encodedPtr, damaged.length, badEvent.ptr), UNKNOWN_VERSION);
-e.ghostty_terminal_snapshot_decoder_free(badDecoder);
-dispose(badEvent);
+function captureOptions(rt, maxRecordBytes = 4 * 1024 * 1024) {
+  const options = rt.struct("GhosttyTerminalSnapshotCaptureOptions");
+  rt.setUsize(options, "max_record_bytes", maxRecordBytes);
+  rt.setUsize(options, "max_pages", 4096);
+  return options;
+}
 
-e.ghostty_terminal_free(decodedTerminal);
-e.ghostty_terminal_free(source);
-free(encodedPtr, encoded.length);
-free(decoderSlot, 4);
-free(terminalSlot, 4);
-dispose(decoderOptions);
+function decoderOptions(rt, maxRecordBytes = 4 * 1024 * 1024) {
+  const options = rt.struct("GhosttyTerminalSnapshotDecoderOptions");
+  rt.setUsize(options, "max_continuation_bytes", 1024 * 1024);
+  rt.setUsize(options, "max_record_bytes", maxRecordBytes);
+  rt.setUsize(options, "max_pages", 4096);
+  return options;
+}
+
+function historyOptions(rt) {
+  const options = rt.struct("GhosttyTerminalHistoryOptions");
+  rt.setUsize(options, "max_unit_bytes", 256 * 1024);
+  rt.setUsize(options, "max_rows", 32);
+  rt.setUsize(options, "max_units", 4096);
+  return options;
+}
+
+function captureAll(rt, terminal) {
+  const options = captureOptions(rt);
+  const slot = rt.alloc(4);
+  rt.view().setUint32(slot, 0, true);
+  assert.equal(rt.e.ghostty_terminal_snapshot_capture_new(
+    0, terminal, options.ptr, slot), SUCCESS);
+  const capture = rt.view().getUint32(slot, true);
+  assert.notEqual(capture, 0);
+  const records = [];
+  let offset = 0;
+  for (;;) {
+    const probe = rt.struct("GhosttyTerminalSnapshotCaptureEvent");
+    assert.equal(rt.e.ghostty_terminal_snapshot_capture_next(
+      capture, 0, 0, probe.ptr), OUT_OF_SPACE);
+    assert.equal(rt.getUsize(probe, "written"), 0);
+    const required = rt.getUsize(probe, "required_bytes");
+    const kind = rt.getI32(probe, "kind");
+    assert.ok(required > 0);
+    const buffer = rt.alloc(required);
+    if (required > 1) {
+      const short = rt.struct("GhosttyTerminalSnapshotCaptureEvent");
+      assert.equal(rt.e.ghostty_terminal_snapshot_capture_next(
+        capture, buffer, required - 1, short.ptr), OUT_OF_SPACE);
+      assert.equal(rt.getUsize(short, "written"), 0);
+      assert.equal(rt.getUsize(short, "required_bytes"), required);
+      assert.equal(rt.getI32(short, "kind"), kind);
+      rt.dispose(short);
+    }
+    const exact = rt.struct("GhosttyTerminalSnapshotCaptureEvent");
+    assert.equal(rt.e.ghostty_terminal_snapshot_capture_next(
+      capture, buffer, required, exact.ptr), SUCCESS);
+    assert.equal(rt.getUsize(exact, "written"), required);
+    assert.equal(rt.getI32(exact, "kind"), kind);
+    records.push({
+      bytes: Uint8Array.from(rt.u8().subarray(buffer, buffer + required)),
+      kind,
+      offset,
+    });
+    offset += required;
+    rt.free(buffer, required);
+    rt.dispose(exact);
+    rt.dispose(probe);
+    if (kind === CAPTURE_FINISH) break;
+  }
+  assert.equal(rt.e.ghostty_terminal_snapshot_capture_abort(capture), SUCCESS);
+  rt.e.ghostty_terminal_snapshot_capture_free(capture);
+  rt.free(slot, 4);
+  rt.dispose(options);
+  const encoded = new Uint8Array(offset);
+  for (const record of records) encoded.set(record.bytes, record.offset);
+  return { encoded, records };
+}
+
+function exerciseCaptureLimit(rt, terminal) {
+  const options = captureOptions(rt, 10);
+  const slot = rt.alloc(4);
+  rt.view().setUint32(slot, 0, true);
+  assert.equal(rt.e.ghostty_terminal_snapshot_capture_new(
+    0, terminal, options.ptr, slot), SUCCESS);
+  const capture = rt.view().getUint32(slot, true);
+  const event = rt.struct("GhosttyTerminalSnapshotCaptureEvent");
+  const buffer = rt.alloc(10);
+  assert.equal(rt.e.ghostty_terminal_snapshot_capture_next(
+    capture, buffer, 10, event.ptr), SUCCESS);
+  assert.equal(rt.getUsize(event, "written"), 10);
+  assert.equal(rt.e.ghostty_terminal_snapshot_capture_next(
+    capture, buffer, 10, event.ptr), LIMIT_EXCEEDED);
+  rt.e.ghostty_terminal_snapshot_capture_free(capture);
+  rt.free(buffer, 10);
+  rt.dispose(event);
+  rt.free(slot, 4);
+  rt.dispose(options);
+}
+
+function uleb(value) {
+  const bytes = [];
+  do {
+    let byte = value & 0x7f;
+    value >>>= 7;
+    if (value !== 0) byte |= 0x80;
+    bytes.push(byte);
+  } while (value !== 0);
+  return bytes;
+}
+
+function wasmSection(id, payload) {
+  return [id, ...uleb(payload.length), ...payload];
+}
+
+function failAllocatorModuleBytes() {
+  const i32 = 0x7f;
+  const type = (parameters, result) => [
+    0x60, ...uleb(parameters), ...Array(parameters).fill(i32),
+    result ? 1 : 0, ...(result ? [i32] : []),
+  ];
+  const types = [
+    ...uleb(3), ...type(4, true), ...type(6, true), ...type(5, false),
+  ];
+  const functions = [...uleb(4), 0, 1, 1, 2];
+  const exportEntry = (name, index) => {
+    const bytes = new TextEncoder().encode(name);
+    return [...uleb(bytes.length), ...bytes, 0, ...uleb(index)];
+  };
+  const exports = [
+    ...uleb(4),
+    ...exportEntry("alloc", 0),
+    ...exportEntry("resize", 1),
+    ...exportEntry("remap", 2),
+    ...exportEntry("free", 3),
+  ];
+  const body = (instructions) => {
+    const code = [0, ...instructions, 0x0b];
+    return [...uleb(code.length), ...code];
+  };
+  const code = [
+    ...uleb(4),
+    ...body([0x41, 0]),
+    ...body([0x41, 0]),
+    ...body([0x41, 0]),
+    ...body([]),
+  ];
+  return new Uint8Array([
+    0, 0x61, 0x73, 0x6d, 1, 0, 0, 0,
+    ...wasmSection(1, types),
+    ...wasmSection(3, functions),
+    ...wasmSection(7, exports),
+    ...wasmSection(10, code),
+  ]);
+}
+
+async function makeFailAllocator(rt) {
+  const helper = await WebAssembly.instantiate(failAllocatorModuleBytes());
+  const table = Object.values(rt.e).find(
+    (value) => value instanceof WebAssembly.Table,
+  );
+  assert.ok(table, "standalone wasm must export its indirect function table");
+  const base = table.grow(4);
+  const functions = ["alloc", "resize", "remap", "free"];
+  functions.forEach((name, index) => table.set(base + index, helper.instance.exports[name]));
+  const context = rt.alloc(1);
+  const vtable = rt.rawStruct("GhosttyAllocatorVtable");
+  functions.forEach((name, index) => rt.view().setUint32(
+    vtable.ptr + rt.field(vtable.name, name), base + index, true));
+  const allocator = rt.rawStruct("GhosttyAllocator");
+  rt.setPtr(allocator, "ctx", context);
+  rt.setPtr(allocator, "vtable", vtable.ptr);
+  return {
+    ptr: allocator.ptr,
+    dispose() {
+      rt.dispose(allocator);
+      rt.dispose(vtable);
+      rt.free(context, 1);
+    },
+  };
+}
+
+function expectDecodeError(rt, bytes, expected, maxRecordBytes = 4 * 1024 * 1024) {
+  const options = decoderOptions(rt, maxRecordBytes);
+  const slot = rt.alloc(4);
+  rt.view().setUint32(slot, 0, true);
+  assert.equal(rt.e.ghostty_terminal_snapshot_decoder_new(
+    0, options.ptr, slot), SUCCESS);
+  const decoder = rt.view().getUint32(slot, true);
+  const input = rt.alloc(bytes.length);
+  rt.u8().set(bytes, input);
+  let offset = 0;
+  let terminal = 0;
+  let status = SUCCESS;
+  while (offset < bytes.length && status === SUCCESS) {
+    const event = rt.struct("GhosttyTerminalSnapshotDecodeEvent");
+    status = rt.e.ghostty_terminal_snapshot_decoder_push(
+      decoder, input + offset, bytes.length - offset, event.ptr);
+    offset += rt.getUsize(event, "consumed");
+    if (status === SUCCESS && rt.getI32(event, "kind") === DECODE_READY) {
+      const take = rt.struct("GhosttyTerminalSnapshotTakeTerminalResult");
+      assert.equal(rt.e.ghostty_terminal_snapshot_decoder_take_terminal(
+        decoder, take.ptr), SUCCESS);
+      terminal = rt.view().getUint32(
+        take.ptr + rt.field(take.name, "terminal"), true);
+      assert.equal(rt.e.ghostty_terminal_snapshot_decoder_replay_continuation(
+        decoder, terminal), SUCCESS);
+      rt.dispose(take);
+    }
+    rt.dispose(event);
+  }
+  assert.equal(status, expected);
+  assert.equal(rt.e.ghostty_terminal_snapshot_decoder_abort(decoder), SUCCESS);
+  rt.e.ghostty_terminal_snapshot_decoder_free(decoder);
+  if (terminal !== 0) rt.e.ghostty_terminal_free(terminal);
+  rt.free(input, bytes.length);
+  rt.free(slot, 4);
+  rt.dispose(options);
+}
+
+function historyTransfer(rt, source, destination, checkpointOwner) {
+  const options = historyOptions(rt);
+  const wrongGeneration = rt.struct("GhosttyTerminalHistoryLeaseResult");
+  assert.equal(rt.e.ghostty_terminal_history_lease_new(
+    0, source, 0xffff, wrongGeneration.ptr), WRONG_GENERATION);
+  rt.dispose(wrongGeneration);
+
+  const lease = rt.struct("GhosttyTerminalHistoryLeaseResult");
+  assert.equal(rt.e.ghostty_terminal_history_lease_new(
+    0, source, 0, lease.ptr), SUCCESS);
+  const leaseHandle = rt.view().getUint32(
+    lease.ptr + rt.field(lease.name, "lease"), true);
+  const checkpoint = lease.ptr + rt.field(lease.name, "checkpoint");
+  assert.notEqual(leaseHandle, 0);
+
+  const cursor = rt.struct("GhosttyTerminalHistoryCursorResult");
+  assert.equal(rt.e.ghostty_terminal_history_lease_cursor(
+    leaseHandle, source, cursor.ptr), SUCCESS);
+  const cursorHandle = rt.view().getUint32(
+    cursor.ptr + rt.field(cursor.name, "cursor"), true);
+  assert.notEqual(cursorHandle, 0);
+  const secondCursor = rt.struct("GhosttyTerminalHistoryCursorResult");
+  assert.equal(rt.e.ghostty_terminal_history_lease_cursor(
+    leaseHandle, source, secondCursor.ptr), INVALID_STATE);
+  rt.dispose(secondCursor);
+
+  const wrongCursorEvent = rt.struct("GhosttyTerminalHistoryEvent");
+  assert.equal(rt.e.ghostty_terminal_history_cursor_next(
+    cursorHandle, destination, options.ptr, 0, 0, wrongCursorEvent.ptr),
+  WRONG_TERMINAL);
+  rt.dispose(wrongCursorEvent);
+
+  const token = rt.rawStruct("GhosttyTerminalHistoryToken");
+  rt.u8().set(
+    rt.u8().subarray(checkpoint, checkpoint + token.size), token.ptr);
+  const tokenBytes = token.ptr + rt.field(token.name, "bytes");
+  rt.u8()[tokenBytes + 31] ^= 0x80;
+  const rejected = rt.struct("GhosttyTerminalHistoryImporterResult");
+  assert.equal(rt.e.ghostty_terminal_history_importer_new(
+    0, destination, 0, source, token.ptr, options.ptr, rejected.ptr),
+  INVALID_HANDLE);
+  rt.dispose(rejected);
+  rt.dispose(token);
+
+  const wrongImporter = rt.struct("GhosttyTerminalHistoryImporterResult");
+  assert.equal(rt.e.ghostty_terminal_history_importer_new(
+    0, destination, 0xffff, source, checkpoint, options.ptr,
+    wrongImporter.ptr), WRONG_GENERATION);
+  rt.dispose(wrongImporter);
+
+  const importer = rt.struct("GhosttyTerminalHistoryImporterResult");
+  assert.equal(rt.e.ghostty_terminal_history_importer_new(
+    0, destination, 0, source, checkpoint, options.ptr, importer.ptr),
+  SUCCESS);
+  const importerHandle = rt.view().getUint32(
+    importer.ptr + rt.field(importer.name, "importer"), true);
+  assert.notEqual(importerHandle, 0);
+  const busy = rt.struct("GhosttyTerminalHistoryImporterResult");
+  assert.equal(rt.e.ghostty_terminal_history_importer_new(
+    0, destination, 0, source, checkpoint, options.ptr, busy.ptr),
+  IMPORT_BUSY);
+  rt.dispose(busy);
+
+  let unitCount = 0;
+  let corrupted = false;
+  for (;;) {
+    const probe = rt.struct("GhosttyTerminalHistoryEvent");
+    const probeStatus = rt.e.ghostty_terminal_history_cursor_next(
+      cursorHandle, source, options.ptr, 0, 0, probe.ptr);
+    if (probeStatus === SUCCESS) {
+      assert.equal(rt.getI32(probe, "kind"), HISTORY_END);
+      rt.dispose(probe);
+      break;
+    }
+    assert.equal(probeStatus, OUT_OF_SPACE);
+    const required = rt.getUsize(probe, "required_bytes");
+    assert.ok(required > 0);
+    const unit = rt.alloc(required);
+    if (required > 1) {
+      const short = rt.struct("GhosttyTerminalHistoryEvent");
+      assert.equal(rt.e.ghostty_terminal_history_cursor_next(
+        cursorHandle, source, options.ptr, unit, required - 1, short.ptr),
+      OUT_OF_SPACE);
+      assert.equal(rt.getUsize(short, "written"), 0);
+      assert.equal(rt.getUsize(short, "required_bytes"), required);
+      rt.dispose(short);
+    }
+    const exact = rt.struct("GhosttyTerminalHistoryEvent");
+    assert.equal(rt.e.ghostty_terminal_history_cursor_next(
+      cursorHandle, source, options.ptr, unit, required, exact.ptr), SUCCESS);
+    assert.equal(rt.getI32(exact, "kind"), HISTORY_UNIT);
+    const written = rt.getUsize(exact, "written");
+    assert.equal(written, required);
+
+    const imported = rt.struct("GhosttyTerminalHistoryImportEvent");
+    if (!corrupted) {
+      rt.u8()[unit + written - 1] ^= 0x40;
+      assert.equal(rt.e.ghostty_terminal_history_importer_push(
+        importerHandle, destination, unit, written, options.ptr, imported.ptr),
+      CORRUPTION);
+      assert.equal(rt.getUsize(imported, "consumed"), 0);
+      rt.u8()[unit + written - 1] ^= 0x40;
+      corrupted = true;
+    }
+    assert.equal(rt.e.ghostty_terminal_history_importer_push(
+      importerHandle, source, unit, written, options.ptr, imported.ptr),
+    WRONG_TERMINAL);
+    if (written > 1) {
+      rt.setUsize(options, "max_unit_bytes", written - 1);
+      assert.equal(rt.e.ghostty_terminal_history_importer_push(
+        importerHandle, destination, unit, written, options.ptr, imported.ptr),
+      OUT_OF_SPACE);
+      assert.equal(rt.getUsize(imported, "consumed"), 0);
+      assert.equal(rt.getUsize(imported, "required_bytes"), written);
+      rt.setUsize(options, "max_unit_bytes", 256 * 1024);
+    }
+    assert.equal(rt.e.ghostty_terminal_history_importer_push(
+      importerHandle, destination, unit, written, options.ptr, imported.ptr),
+    SUCCESS);
+    assert.equal(rt.getUsize(imported, "consumed"), written);
+    ++unitCount;
+    rt.write(destination, new TextEncoder().encode(
+      `\x1b[32mlive-pty-${unitCount}\x1b[0m\r\n`));
+
+    rt.dispose(imported);
+    rt.dispose(exact);
+    rt.free(unit, required);
+    rt.dispose(probe);
+  }
+  assert.ok(corrupted);
+  assert.ok(unitCount > 1, "history smoke requires multiple bounded units");
+  assert.equal(rt.e.ghostty_terminal_history_importer_commit(
+    importerHandle, destination), SUCCESS);
+  rt.e.ghostty_terminal_history_importer_free(importerHandle);
+
+  const aborted = rt.struct("GhosttyTerminalHistoryImporterResult");
+  assert.equal(rt.e.ghostty_terminal_history_importer_new(
+    0, destination, 0, source, checkpoint, options.ptr, aborted.ptr), SUCCESS);
+  const abortedHandle = rt.view().getUint32(
+    aborted.ptr + rt.field(aborted.name, "importer"), true);
+  assert.equal(rt.e.ghostty_terminal_history_importer_abort(
+    abortedHandle, source), WRONG_TERMINAL);
+  assert.equal(rt.e.ghostty_terminal_history_importer_abort(
+    abortedHandle, destination), SUCCESS);
+  rt.e.ghostty_terminal_history_importer_free(abortedHandle);
+
+  rt.e.ghostty_terminal_history_cursor_free(cursorHandle);
+  rt.e.ghostty_terminal_history_lease_free(leaseHandle);
+  checkpointOwner.value = Uint8Array.from(
+    rt.u8().subarray(checkpoint, checkpoint + rt.layout("GhosttyTerminalHistoryToken").size));
+  rt.dispose(aborted);
+  rt.dispose(importer);
+  rt.dispose(cursor);
+  rt.dispose(lease);
+  rt.dispose(options);
+}
+
+async function exerciseEntropyFailure() {
+  let failEntropy = false;
+  const rt = await instantiateRuntime((getMemory, ptr, len) =>
+    failEntropy ? -1 : secureEntropy(getMemory, ptr, len));
+  const source = rt.terminal();
+  const destination = rt.terminal();
+  rt.write(source, "entropy-contract\r\n".repeat(20));
+  const lease = rt.struct("GhosttyTerminalHistoryLeaseResult");
+  assert.equal(rt.e.ghostty_terminal_history_lease_new(
+    0, source, 0, lease.ptr), SUCCESS);
+  const leaseHandle = rt.view().getUint32(
+    lease.ptr + rt.field(lease.name, "lease"), true);
+  const checkpoint = lease.ptr + rt.field(lease.name, "checkpoint");
+  failEntropy = true;
+  const unavailableLease = rt.struct("GhosttyTerminalHistoryLeaseResult");
+  assert.equal(rt.e.ghostty_terminal_history_lease_new(
+    0, source, 0, unavailableLease.ptr), ENTROPY_UNAVAILABLE);
+  assert.equal(rt.view().getUint32(
+    unavailableLease.ptr + rt.field(unavailableLease.name, "lease"), true), 0);
+  const options = historyOptions(rt);
+  const unavailableImporter = rt.struct("GhosttyTerminalHistoryImporterResult");
+  assert.equal(rt.e.ghostty_terminal_history_importer_new(
+    0, destination, 0, source, checkpoint, options.ptr,
+    unavailableImporter.ptr), ENTROPY_UNAVAILABLE);
+  assert.equal(rt.view().getUint32(
+    unavailableImporter.ptr + rt.field(unavailableImporter.name, "importer"), true), 0);
+  rt.e.ghostty_terminal_history_lease_free(leaseHandle);
+  rt.e.ghostty_terminal_free(destination);
+  rt.e.ghostty_terminal_free(source);
+  rt.dispose(unavailableImporter);
+  rt.dispose(options);
+  rt.dispose(unavailableLease);
+  rt.dispose(lease);
+}
+
+const rt = await instantiateRuntime();
+const capabilities = rt.struct("GhosttyTerminalSnapshotIncrementalCapabilities");
+assert.equal(rt.e.ghostty_terminal_snapshot_incremental_capabilities(
+  capabilities.ptr), SUCCESS);
+for (const member of [
+  "incremental", "ready", "history", "authenticated_tokens",
+  "bounded_records", "bounded_pages", "bounded_units",
+]) {
+  assert.equal(rt.view().getUint8(
+    capabilities.ptr + rt.field(capabilities.name, member)), 1, member);
+}
+assert.equal(rt.view().getUint16(
+  capabilities.ptr + rt.field(capabilities.name, "default_encode_version"),
+  true), 2);
+const codecIdentity = rt.inlineString(capabilities, "codec_identity");
+const buildIdentity = rt.inlineString(capabilities, "build_identity");
+assert.equal(codecIdentity, "ghostty.snapshot.v1-v2.incremental.v1");
+assert.ok(buildIdentity.length > 0);
+const buildInfo = rt.rawStruct("GhosttyString");
+assert.equal(rt.e.ghostty_build_info(5, buildInfo.ptr), SUCCESS);
+const queriedBuildIdentity = new TextDecoder().decode(rt.u8().subarray(
+  rt.view().getUint32(buildInfo.ptr + rt.field(buildInfo.name, "ptr"), true),
+  rt.view().getUint32(buildInfo.ptr + rt.field(buildInfo.name, "ptr"), true) +
+    rt.view().getUint32(buildInfo.ptr + rt.field(buildInfo.name, "len"), true),
+));
+assert.equal(buildIdentity, queriedBuildIdentity);
+rt.dispose(buildInfo);
+rt.dispose(capabilities);
+
+const source = rt.terminal();
+let sourceText = "";
+for (let index = 0; index < 200; ++index) {
+  sourceText += `row-${String(index).padStart(3, "0")}\r\n`;
+}
+rt.write(source, sourceText);
+rt.write(source, "\x1b[31");
+exerciseCaptureLimit(rt, source);
+
+const failAllocator = await makeFailAllocator(rt);
+const oomOptions = captureOptions(rt);
+const oomSlot = rt.alloc(4);
+rt.view().setUint32(oomSlot, 0, true);
+assert.equal(rt.e.ghostty_terminal_snapshot_capture_new(
+  failAllocator.ptr, source, oomOptions.ptr, oomSlot), OUT_OF_MEMORY);
+assert.equal(rt.view().getUint32(oomSlot, true), 0);
+failAllocator.dispose();
+rt.free(oomSlot, 4);
+rt.dispose(oomOptions);
+
+const captured = captureAll(rt, source);
+assert.ok(captured.records.some((record) => record.kind === CAPTURE_RECORD));
+assert.ok(captured.records.some((record) => record.kind === CAPTURE_READY));
+assert.ok(captured.records.some((record) => record.kind === CAPTURE_HISTORY_BEGIN));
+assert.ok(captured.records.some((record) => record.kind === CAPTURE_HISTORY_PAGE));
+assert.equal(captured.records.at(-1).kind, CAPTURE_FINISH);
+const finishOffset = captured.records.find(
+  (record) => record.kind === CAPTURE_FINISH).offset;
+
+const encodedPtr = rt.alloc(captured.encoded.length);
+rt.u8().set(captured.encoded, encodedPtr);
+const decodeOptions = decoderOptions(rt);
+const decoderSlot = rt.alloc(4);
+rt.view().setUint32(decoderSlot, 0, true);
+assert.equal(rt.e.ghostty_terminal_snapshot_decoder_new(
+  0, decodeOptions.ptr, decoderSlot), SUCCESS);
+const decoder = rt.view().getUint32(decoderSlot, true);
+const fragments = [1, 7, 2, 31, 3, 64, 5, 127, 11, 4];
+let fragmentIndex = 0;
+let offset = 0;
+let decodedTerminal = 0;
+let sawReady = false;
+let sawFinish = false;
+while (!sawReady) {
+  const event = rt.struct("GhosttyTerminalSnapshotDecodeEvent");
+  const offered = Math.min(
+    fragments[fragmentIndex++ % fragments.length], captured.encoded.length - offset);
+  assert.ok(offered > 0);
+  assert.equal(rt.e.ghostty_terminal_snapshot_decoder_push(
+    decoder, encodedPtr + offset, offered, event.ptr), SUCCESS);
+  const consumed = rt.getUsize(event, "consumed");
+  assert.ok(consumed > 0 && consumed <= offered);
+  offset += consumed;
+  if (rt.getI32(event, "kind") === DECODE_READY) {
+    const blocked = rt.struct("GhosttyTerminalSnapshotDecodeEvent");
+    assert.equal(rt.e.ghostty_terminal_snapshot_decoder_push(
+      decoder, encodedPtr + offset, 1, blocked.ptr), INVALID_STATE);
+    assert.equal(rt.getUsize(blocked, "consumed"), 0);
+    rt.dispose(blocked);
+    const take = rt.struct("GhosttyTerminalSnapshotTakeTerminalResult");
+    assert.equal(rt.e.ghostty_terminal_snapshot_decoder_take_terminal(
+      decoder, take.ptr), SUCCESS);
+    decodedTerminal = rt.view().getUint32(
+      take.ptr + rt.field(take.name, "terminal"), true);
+    assert.notEqual(decodedTerminal, 0);
+    const secondTake = rt.struct("GhosttyTerminalSnapshotTakeTerminalResult");
+    assert.equal(rt.e.ghostty_terminal_snapshot_decoder_take_terminal(
+      decoder, secondTake.ptr), INVALID_STATE);
+    rt.dispose(secondTake);
+    const wrong = rt.terminal();
+    assert.equal(rt.e.ghostty_terminal_snapshot_decoder_replay_continuation(
+      decoder, wrong), WRONG_TERMINAL);
+    rt.e.ghostty_terminal_free(wrong);
+    assert.equal(rt.e.ghostty_terminal_snapshot_decoder_replay_continuation(
+      decoder, decodedTerminal), SUCCESS);
+    assert.equal(rt.e.ghostty_terminal_snapshot_decoder_replay_continuation(
+      decoder, decodedTerminal), INVALID_STATE);
+    rt.dispose(take);
+    sawReady = true;
+  }
+  rt.dispose(event);
+}
+
+// Both terminals held the split "ESC [ 31" parser prefix at the cut. Only a
+// successful one-shot continuation replay makes this suffix produce identical
+// terminal snapshots after the remaining history stream reaches FINISH.
+const parserSuffix = "mparser-continuation-replayed\x1b[0m\r\n";
+rt.write(source, parserSuffix);
+rt.write(decodedTerminal, parserSuffix);
+const historyDestination = rt.terminal();
+const checkpointOwner = { value: null };
+historyTransfer(rt, source, historyDestination, checkpointOwner);
+assert.ok(checkpointOwner.value.some((byte) => byte !== 0));
+
+while (!sawFinish) {
+  const event = rt.struct("GhosttyTerminalSnapshotDecodeEvent");
+  const offered = Math.min(
+    fragments[fragmentIndex++ % fragments.length], captured.encoded.length - offset);
+  assert.ok(offered > 0);
+  assert.equal(rt.e.ghostty_terminal_snapshot_decoder_push(
+    decoder, encodedPtr + offset, offered, event.ptr), SUCCESS);
+  const consumed = rt.getUsize(event, "consumed");
+  assert.ok(consumed > 0 && consumed <= offered);
+  offset += consumed;
+  sawFinish = rt.getI32(event, "kind") === DECODE_FINISH;
+  rt.dispose(event);
+}
+assert.equal(offset, captured.encoded.length);
+rt.e.ghostty_terminal_snapshot_decoder_free(decoder);
+
+const sourceAfterReplay = captureAll(rt, source).encoded;
+const decodedAfterReplay = captureAll(rt, decodedTerminal).encoded;
+assert.deepEqual(decodedAfterReplay, sourceAfterReplay);
+
+const unknownVersion = Uint8Array.from(captured.encoded);
+unknownVersion[8] = 0xff;
+unknownVersion[9] = 0x7f;
+expectDecodeError(rt, unknownVersion, UNKNOWN_VERSION);
+const corruptChecksum = Uint8Array.from(captured.encoded);
+corruptChecksum[finishOffset + 10] ^= 0x80;
+expectDecodeError(rt, corruptChecksum, CORRUPTION);
+expectDecodeError(rt, captured.encoded, LIMIT_EXCEEDED, 1);
+
+await exerciseEntropyFailure();
+
+rt.e.ghostty_terminal_free(historyDestination);
+rt.e.ghostty_terminal_free(decodedTerminal);
+rt.e.ghostty_terminal_free(source);
+rt.free(encodedPtr, captured.encoded.length);
+rt.free(decoderSlot, 4);
+rt.dispose(decodeOptions);
 console.log("standalone incremental snapshot wasm smoke: ok");

@@ -27,6 +27,7 @@ pub const Status = enum(c_int) {
     continuation_unavailable = -15,
     reset = -16,
     resize = -17,
+    entropy_unavailable = -18,
 };
 
 pub const Token = extern struct {
@@ -176,7 +177,27 @@ pub const HistoryImportEvent = extern struct {
 
 const codec_identity = "ghostty.snapshot.v1-v2.incremental.v1";
 const build_options = @import("terminal_options");
-const authenticated_history = builtin.os.tag != .freestanding;
+const wasm_host_entropy = builtin.target.cpu.arch.isWasm() and
+    builtin.os.tag == .freestanding;
+const authenticated_history = builtin.os.tag != .freestanding or
+    wasm_host_entropy;
+
+const HostEntropy = struct {
+    /// Standalone wasm host contract. Zero means `buffer` was completely
+    /// filled with cryptographically secure random bytes; any other value is
+    /// a recoverable entropy failure.
+    extern "ghostty" fn host_entropy_fill(
+        buffer: [*]u8,
+        len: usize,
+    ) c_int;
+};
+
+fn hostEntropy() error{EntropyUnavailable}![32]u8 {
+    var entropy: [32]u8 = undefined;
+    if (HostEntropy.host_entropy_fill(entropy[0..].ptr, entropy.len) != 0)
+        return error.EntropyUnavailable;
+    return entropy;
+}
 
 pub fn capabilities(out_: ?*Capabilities) callconv(lib.calling_conv) Status {
     const out = out_ orelse return .invalid_handle;
@@ -225,6 +246,7 @@ fn validBound(value: usize) bool {
 fn mapError(err: anyerror) Status {
     return switch (err) {
         error.OutOfMemory => .out_of_memory,
+        error.EntropyUnavailable => .entropy_unavailable,
         error.UnsupportedKittyGraphics,
         error.UnsupportedGlyphGlossary,
         => .unsupported_feature,
@@ -682,7 +704,14 @@ pub fn historyLeaseNew(
     const io_ = terminal_c.terminalIo(terminal) orelse return .wrong_terminal;
     const key = std.enums.fromInt(@import("../ScreenSet.zig").Key, screen_key) orelse
         return .wrong_generation;
-    const lease = snapshot.HistoryLease.init(io_, zig_terminal, key) catch |err|
+    const lease = if (comptime wasm_host_entropy) host: {
+        const entropy = hostEntropy() catch return .entropy_unavailable;
+        break :host snapshot.HistoryLease.initWithEntropy(
+            zig_terminal,
+            key,
+            entropy,
+        ) catch |err| return mapError(err);
+    } else snapshot.HistoryLease.init(io_, zig_terminal, key) catch |err|
         return mapError(err);
     const alloc = lib.alloc.default(alloc_);
     const state = alloc.create(HistoryLeaseState) catch {
@@ -830,7 +859,17 @@ pub fn historyImporterNew(
     const io_ = terminal_c.terminalIo(terminal) orelse return .wrong_terminal;
     const key = std.enums.fromInt(@import("../ScreenSet.zig").Key, screen_key) orelse
         return .wrong_generation;
-    const importer = snapshot.HistoryImporter.init(
+    const importer = if (comptime wasm_host_entropy) host: {
+        const entropy = hostEntropy() catch return .entropy_unavailable;
+        break :host snapshot.HistoryImporter.initWithEntropy(
+            zig_terminal,
+            key,
+            options.max_units,
+            zig_source,
+            .{ .bytes = checkpoint.bytes },
+            entropy,
+        ) catch |err| return mapError(err);
+    } else snapshot.HistoryImporter.init(
         io_,
         zig_terminal,
         key,

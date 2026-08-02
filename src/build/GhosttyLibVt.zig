@@ -48,6 +48,11 @@ pub fn initWasm(
         .version = zig.version,
     });
 
+    // This standalone artifact deliberately has one security-critical host
+    // contract: `ghostty.host_entropy_fill(i32, i32) -> i32`. Embedders must
+    // provide cryptographic bytes in this module's linear memory. The Node
+    // smoke validates the import descriptor and both success/failure paths.
+
     // Allow exported symbols to actually be exported.
     exe.rdynamic = true;
 
