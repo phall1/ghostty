@@ -378,6 +378,7 @@ pub const HistoryLeaseEntry = struct {
     ptr: *anyopaque,
     release: *const fn (*anyopaque, *PageList) void,
     generation: u64,
+    kind: u8,
 };
 
 pub const HistoryLeaseToken = [32]u8;
@@ -425,7 +426,7 @@ history_generation: u64 = 0,
 history_invalidation: HistoryInvalidation = .none,
 
 history_leases: std.AutoHashMapUnmanaged(u8, HistoryLeaseEntry) = .empty,
-history_lease_key: [32]u8 = undefined,
+history_lease_key: ?[32]u8 = null,
 history_lease_generation: u64 = 0,
 
 /// Byte size of the raw backing mappings owned by active page nodes. This is
@@ -681,7 +682,6 @@ pub fn init(
         .viewport_pin = viewport_pin,
         .viewport_pin_row_offset = null,
     };
-    std.crypto.random.bytes(&result.history_lease_key);
     result.assertIntegrity();
     return result;
 }
@@ -951,26 +951,33 @@ pub fn historyInvalidation(self: *const PageList) HistoryInvalidation {
 
 pub const max_history_leases = 64;
 
+pub fn initializeHistoryLeaseKey(self: *PageList, key: [32]u8) void {
+    if (self.history_lease_key == null) self.history_lease_key = key;
+}
+
 fn historyLeaseTag(
     self: *const PageList,
-    prefix: *const [22]u8,
-) [10]u8 {
-    var hasher = std.crypto.hash.Blake3.init(.{ .key = self.history_lease_key });
+    prefix: *const [23]u8,
+) ?[9]u8 {
+    const key = self.history_lease_key orelse return null;
+    var hasher = std.crypto.hash.Blake3.init(.{ .key = key });
     hasher.update(prefix);
     var digest: [32]u8 = undefined;
     hasher.final(&digest);
-    return digest[0..10].*;
+    return digest[0..9].*;
 }
 
 pub fn registerHistoryLease(
     self: *PageList,
     terminal_address: u64,
     screen_key: u8,
+    kind: u8,
     screen_generation: u32,
     entry: HistoryLeaseEntry,
 ) (Allocator.Error || error{
     LeaseLimitExceeded,
     LeaseGenerationExhausted,
+    EntropyUnavailable,
 })!HistoryLeaseToken {
     if (self.history_leases.count() >= max_history_leases) {
         return error.LeaseLimitExceeded;
@@ -982,15 +989,18 @@ pub fn registerHistoryLease(
         self.history_lease_generation,
         1,
     ) catch return error.LeaseGenerationExhausted;
+    if (self.history_lease_key == null) return error.EntropyUnavailable;
     var token: HistoryLeaseToken = undefined;
     std.mem.writeInt(u64, token[0..8], terminal_address, .little);
     token[8] = screen_key;
-    token[9] = slot;
-    std.mem.writeInt(u64, token[10..18], self.history_lease_generation, .little);
-    std.mem.writeInt(u32, token[18..22], screen_generation, .little);
-    token[22..32].* = self.historyLeaseTag(token[0..22]);
+    token[9] = kind;
+    token[10] = slot;
+    std.mem.writeInt(u64, token[11..19], self.history_lease_generation, .little);
+    std.mem.writeInt(u32, token[19..23], screen_generation, .little);
+    token[23..32].* = self.historyLeaseTag(token[0..23]).?;
     var stored = entry;
     stored.generation = self.history_lease_generation;
+    stored.kind = kind;
     try self.history_leases.putNoClobber(self.pool.alloc, slot, stored);
     return token;
 }
@@ -998,16 +1008,20 @@ pub fn registerHistoryLease(
 pub fn historyLease(
     self: *PageList,
     token: HistoryLeaseToken,
+    expected_kind: u8,
 ) HistoryLeaseLookup {
+    const actual_tag = self.historyLeaseTag(token[0..23]) orelse return .invalid;
     if (!std.crypto.timing_safe.eql(
-        [10]u8,
-        self.historyLeaseTag(token[0..22]),
-        token[22..32].*,
+        [9]u8,
+        actual_tag,
+        token[23..32].*,
     )) return .invalid;
-    const slot = token[9];
-    const generation = std.mem.readInt(u64, token[10..18], .little);
+    if (token[9] != expected_kind) return .invalid;
+    const slot = token[10];
+    const generation = std.mem.readInt(u64, token[11..19], .little);
     const entry = self.history_leases.getPtr(slot) orelse return .stale;
     if (entry.generation != generation) return .stale;
+    if (entry.kind != expected_kind) return .invalid;
     return .{ .active = entry.ptr };
 }
 
@@ -1015,12 +1029,25 @@ pub fn releaseHistoryLease(
     self: *PageList,
     token: HistoryLeaseToken,
 ) void {
-    switch (self.historyLease(token)) {
+    switch (self.historyLease(token, token[9])) {
         .active => {},
         .stale, .invalid => return,
     }
-    const entry = self.history_leases.fetchRemove(token[9]) orelse return;
+    const entry = self.history_leases.fetchRemove(token[10]) orelse return;
     entry.value.release(entry.value.ptr, self);
+}
+
+pub fn deriveHistoryLeaseSecret(
+    self: *const PageList,
+    token: HistoryLeaseToken,
+) ?[32]u8 {
+    const key = self.history_lease_key orelse return null;
+    var hasher = std.crypto.hash.Blake3.init(.{ .key = key });
+    hasher.update("ghostty history unit key");
+    hasher.update(&token);
+    var result: [32]u8 = undefined;
+    hasher.final(&result);
+    return result;
 }
 
 /// Reset the PageList back to an empty state. This is similar to

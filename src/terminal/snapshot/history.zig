@@ -76,6 +76,8 @@ const history_tw = tripwire.module(enum {
     encode_page,
 }, Allocator.Error);
 
+const lease_kind: u8 = 1;
+const importer_kind: u8 = 2;
 /// A caller-provided upper bound for one incremental history operation.
 pub const Budget = struct {
     bytes: usize,
@@ -181,13 +183,13 @@ fn resolveLease(
     const terminal_screen = terminal_.screens.get(key) orelse
         return error.WrongGeneration;
     const token_screen_generation =
-        std.mem.readInt(u32, token[18..22], .little);
+        std.mem.readInt(u32, token[19..23], .little);
     if (token_screen_generation !=
         @as(u32, @truncate(terminal_.screens.generation(key))))
     {
         return error.WrongGeneration;
     }
-    const raw = switch (terminal_screen.pages.historyLease(token)) {
+    const raw = switch (terminal_screen.pages.historyLease(token, lease_kind)) {
         .active => |ptr| ptr,
         .stale => return error.Stale,
         .invalid => return error.InvalidHandle,
@@ -236,14 +238,26 @@ pub const HistoryLease = struct {
         ScreenUnavailable,
         LeaseLimitExceeded,
         LeaseGenerationExhausted,
+        EntropyUnavailable,
     };
 
     pub fn init(
         terminal_: *Terminal,
         key: TerminalScreenKey,
     ) InitError!HistoryLease {
+        var entropy: [32]u8 = undefined;
+        terminal_.io.random(&entropy);
+        return initWithEntropy(terminal_, key, entropy);
+    }
+
+    pub fn initWithEntropy(
+        terminal_: *Terminal,
+        key: TerminalScreenKey,
+        entropy: [32]u8,
+    ) InitError!HistoryLease {
         const terminal_screen = terminal_.screens.get(key) orelse
             return error.ScreenUnavailable;
+        terminal_screen.pages.initializeHistoryLeaseKey(entropy);
         const newest = terminal_screen.pages.getBottomRight(.history);
         const current_node = if (newest) |pin_| pin_.node else null;
         const current_serial = if (current_node) |node| node.serial else 0;
@@ -289,17 +303,20 @@ pub const HistoryLease = struct {
             .current_serial = current_serial,
             .boundary_serial = oldest_serial,
         };
-        std.crypto.random.bytes(&state.secret);
         const token = try terminal_screen.pages.registerHistoryLease(
             @intCast(@intFromPtr(terminal_)),
             @intCast(@intFromEnum(key)),
+            lease_kind,
             @truncate(terminal_.screens.generation(key)),
             .{
                 .ptr = state,
                 .release = releaseLeaseState,
                 .generation = undefined,
+                .kind = undefined,
             },
         );
+        state.secret = terminal_screen.pages
+            .deriveHistoryLeaseSecret(token) orelse unreachable;
         current = null;
         boundary = null;
         return .{ .bytes = token };
@@ -590,6 +607,7 @@ pub const ImportError = Allocator.Error ||
     error{
         ChunkLimitExceeded,
         InvalidHistoryUnit,
+        InvalidHandle,
         UnexpectedHistoryUnit,
         Stale,
         WrongTerminal,
@@ -602,7 +620,8 @@ pub const ImportError = Allocator.Error ||
 /// engine-owned history units. The private unit envelope is not part of the
 /// immutable v1/v2 snapshot grammar; its payload is one unchanged PAGE record.
 /// Imported pages are prepended while live writes continue at the active end.
-pub const HistoryImporter = struct {
+const HistoryImporterState = struct {
+    alloc: Allocator,
     terminal: *Terminal,
     key: TerminalScreenKey,
     screen_generation: usize,
@@ -610,15 +629,70 @@ pub const HistoryImporter = struct {
     import: TerminalPageList.HistoryImport,
     expected_checkpoint: CheckpointData,
     secret: [32]u8,
-    deinitialized: bool = false,
+    expected_sequence: u64 = 0,
     chunks: usize = 0,
     max_chunks: usize,
     imported_prompt: bool = false,
-    active: bool = true,
+    authenticated_bytes: usize = 0,
+};
+
+fn releaseImporterState(raw: *anyopaque, _: *TerminalPageList) void {
+    const state: *HistoryImporterState = @ptrCast(@alignCast(raw));
+    state.import.deinit();
+    state.alloc.destroy(state);
+}
+
+fn resolveImporter(
+    token: TerminalPageList.HistoryLeaseToken,
+    terminal_: *Terminal,
+) ImportError!struct {
+    screen: *TerminalScreen,
+    state: *HistoryImporterState,
+} {
+    const terminal_address = std.mem.readInt(u64, token[0..8], .little);
+    if (terminal_address != @as(u64, @intCast(@intFromPtr(terminal_)))) {
+        return error.WrongTerminal;
+    }
+    const key = tokenScreenKey(token) orelse return error.InvalidHandle;
+    const terminal_screen = terminal_.screens.get(key) orelse
+        return error.WrongGeneration;
+    const token_screen_generation =
+        std.mem.readInt(u32, token[19..23], .little);
+    if (token_screen_generation !=
+        @as(u32, @truncate(terminal_.screens.generation(key))))
+    {
+        return error.WrongGeneration;
+    }
+    const raw = switch (terminal_screen.pages.historyLease(
+        token,
+        importer_kind,
+    )) {
+        .active => |ptr| ptr,
+        .stale => return error.Stale,
+        .invalid => return error.InvalidHandle,
+    };
+    const state: *HistoryImporterState = @ptrCast(@alignCast(raw));
+    if (terminal_screen.pages.historyGeneration() !=
+        state.history_generation)
+    {
+        return switch (terminal_screen.pages.historyInvalidation()) {
+            .reset => error.Reset,
+            .resize => error.Resize,
+            .none, .stale => error.Stale,
+        };
+    }
+    return .{ .screen = terminal_screen, .state = state };
+}
+
+pub const HistoryImporter = struct {
+    bytes: TerminalPageList.HistoryLeaseToken,
 
     pub const InitError = Allocator.Error || error{
         ScreenUnavailable,
         InvalidCheckpoint,
+        LeaseLimitExceeded,
+        LeaseGenerationExhausted,
+        EntropyUnavailable,
     };
 
     pub fn init(
@@ -634,7 +708,14 @@ pub const HistoryImporter = struct {
         );
         const terminal_screen = terminal_.screens.get(key) orelse
             return error.ScreenUnavailable;
-        return .{
+        var entropy: [32]u8 = undefined;
+        terminal_.io.random(&entropy);
+        terminal_screen.pages.initializeHistoryLeaseKey(entropy);
+
+        const state = try terminal_screen.alloc.create(HistoryImporterState);
+        errdefer terminal_screen.alloc.destroy(state);
+        state.* = .{
+            .alloc = terminal_screen.alloc,
             .terminal = terminal_,
             .key = key,
             .screen_generation = terminal_.screens.generation(key),
@@ -648,29 +729,41 @@ pub const HistoryImporter = struct {
             ),
             .max_chunks = max_chunks,
         };
+        errdefer state.import.deinit();
+        const token = try terminal_screen.pages.registerHistoryLease(
+            @intCast(@intFromPtr(terminal_)),
+            @intCast(@intFromEnum(key)),
+            importer_kind,
+            @truncate(terminal_.screens.generation(key)),
+            .{
+                .ptr = state,
+                .release = releaseImporterState,
+                .generation = undefined,
+                .kind = undefined,
+            },
+        );
+        return .{ .bytes = token };
     }
 
-    /// Decode and prepend exactly one PAGE record.
-    ///
-    /// Budget failures and malformed units publish nothing. A retained result
-    /// is visible immediately, but remains rollback-owned until commit.
     pub fn prepend(
-        self: *HistoryImporter,
+        self: *const HistoryImporter,
         terminal_: *Terminal,
         unit: []const u8,
         budget: Budget,
     ) ImportError!ImportResult {
-        const terminal_screen = try self.validate(terminal_);
+        const resolved = try resolveImporter(self.bytes, terminal_);
+        const terminal_screen = resolved.screen;
+        const state = resolved.state;
         if (budget.bytes == 0 or budget.rows == 0) return .zero_budget;
-        if (self.chunks == self.max_chunks) return error.ChunkLimitExceeded;
+        if (state.chunks == state.max_chunks) return error.ChunkLimitExceeded;
 
         if (unit.len < UnitHeader.len) return error.InvalidHistoryUnit;
         var header_source: std.Io.Reader = .fixed(unit[0..UnitHeader.len]);
         const unit_header = try UnitHeader.decode(&header_source);
         if (!std.meta.eql(
             unit_header.checkpoint,
-            self.expected_checkpoint,
-        ) or unit_header.sequence != self.expected_sequence) {
+            state.expected_checkpoint,
+        ) or unit_header.sequence != state.expected_sequence) {
             return error.UnexpectedHistoryUnit;
         }
         const payload_len: usize = @intCast(unit_header.payload_len);
@@ -680,16 +773,6 @@ pub const HistoryImporter = struct {
             payload_len,
         ) catch return error.InvalidHistoryUnit;
         if (expected_len != unit.len) return error.InvalidHistoryUnit;
-        const payload = unit[UnitHeader.len..];
-        const expected_authenticator = unit_header.authenticate(
-            self.secret,
-            payload,
-        );
-        if (!std.crypto.timing_safe.eql(
-            [32]u8,
-            expected_authenticator,
-            unit_header.authenticator,
-        )) return error.InvalidHistoryUnit;
         const rows: usize = @intCast(unit_header.rows);
         if (unit.len > budget.bytes or rows > budget.rows) {
             return .{ .too_small = .{
@@ -698,7 +781,19 @@ pub const HistoryImporter = struct {
             } };
         }
 
-        var source: std.Io.Reader = .fixed(unit[UnitHeader.len..]);
+        const payload = unit[UnitHeader.len..];
+        state.authenticated_bytes += payload.len;
+        const expected_authenticator = unit_header.authenticate(
+            state.secret,
+            payload,
+        );
+        if (!std.crypto.timing_safe.eql(
+            [32]u8,
+            expected_authenticator,
+            unit_header.authenticator,
+        )) return error.InvalidHistoryUnit;
+
+        var source: std.Io.Reader = .fixed(payload);
         var decoder: page.Decoder = undefined;
         try decoder.init(&source);
         if (decoder.header.rows != unit_header.rows) {
@@ -711,71 +806,63 @@ pub const HistoryImporter = struct {
         defer allocation.deinit();
         try decoder.decode(allocation.page(), terminal_screen.alloc);
         const contains_prompt = hasSemanticPrompt(allocation.page());
-        const retained = try self.import.prepend(&allocation);
-        self.imported_prompt = self.imported_prompt or
+        const retained = try state.import.prepend(&allocation);
+        state.imported_prompt = state.imported_prompt or
             (retained and contains_prompt);
-        self.chunks += 1;
-        self.expected_sequence += 1;
+        state.chunks += 1;
+        state.expected_sequence += 1;
         return .{ .imported = .{
             .rows = rows,
             .retained = retained,
         } };
     }
 
-    pub fn inspectedPrefixNodes(self: *const HistoryImporter) usize {
-        return self.import.inspectedPrefixNodes();
+    pub fn inspectedPrefixNodes(
+        self: *const HistoryImporter,
+        terminal_: *Terminal,
+    ) usize {
+        const resolved = resolveImporter(self.bytes, terminal_) catch return 0;
+        return resolved.state.import.inspectedPrefixNodes();
+    }
+
+    pub fn authenticatedBytes(
+        self: *const HistoryImporter,
+        terminal_: *Terminal,
+    ) usize {
+        const resolved = resolveImporter(self.bytes, terminal_) catch return 0;
+        return resolved.state.authenticated_bytes;
     }
 
     pub fn commit(
-        self: *HistoryImporter,
+        self: *const HistoryImporter,
         terminal_: *Terminal,
     ) ImportError!void {
-        const terminal_screen = try self.validate(terminal_);
-        self.import.commit();
-        if (self.imported_prompt) terminal_screen.semantic_prompt.seen = true;
-        self.active = false;
-    }
-
-    pub fn abort(self: *HistoryImporter) void {
-        self.deinit();
-    }
-
-    pub fn deinit(self: *HistoryImporter) void {
-        if (self.deinitialized) return;
-        self.deinitialized = true;
-        if (self.active) {
-            self.active = false;
-            if (self.terminal.screens.generation(self.key) !=
-                self.screen_generation or
-                self.terminal.screens.get(self.key) == null)
-            {
-                self.import.abandon();
-            }
+        const resolved = try resolveImporter(self.bytes, terminal_);
+        resolved.state.import.commit();
+        if (resolved.state.imported_prompt) {
+            resolved.screen.semantic_prompt.seen = true;
         }
-        self.import.deinit();
+        resolved.screen.pages.releaseHistoryLease(self.bytes);
     }
 
-    fn validate(
-        self: *HistoryImporter,
+    pub fn abort(
+        self: *const HistoryImporter,
         terminal_: *Terminal,
-    ) ImportError!*TerminalScreen {
-        if (!self.active) return error.Stale;
-        if (terminal_ != self.terminal) return error.WrongTerminal;
-        if (terminal_.screens.generation(self.key) != self.screen_generation) {
-            return error.WrongGeneration;
+    ) void {
+        self.deinit(terminal_);
+    }
+
+    pub fn deinit(
+        self: *const HistoryImporter,
+        terminal_: *Terminal,
+    ) void {
+        const terminal_address = std.mem.readInt(u64, self.bytes[0..8], .little);
+        if (terminal_address != @as(u64, @intCast(@intFromPtr(terminal_)))) {
+            return;
         }
-        const terminal_screen = terminal_.screens.get(self.key) orelse
-            return error.WrongGeneration;
-        if (terminal_screen.pages.historyGeneration() !=
-            self.history_generation)
-        {
-            return switch (terminal_screen.pages.historyInvalidation()) {
-                .reset => error.Reset,
-                .resize => error.Resize,
-                .none, .stale => error.Stale,
-            };
-        }
-        return terminal_screen;
+        const key = tokenScreenKey(self.bytes) orelse return;
+        const terminal_screen = terminal_.screens.get(key) orelse return;
+        terminal_screen.pages.releaseHistoryLease(self.bytes);
     }
 };
 
@@ -1751,7 +1838,18 @@ test "history cursor pages newest first within strict budgets" {
         &source,
         checkpoint_value,
     );
-    defer importer.deinit();
+    defer importer.deinit(&destination);
+    var forged_importer = importer;
+    forged_importer.bytes[31] ^= 0x7E;
+    try testing.expectError(
+        error.InvalidHandle,
+        forged_importer.prepend(
+            &destination,
+            units[0],
+            .{ .bytes = units[0].len, .rows = 1 },
+        ),
+    );
+    forged_importer.deinit(&destination);
     try testing.expectEqual(
         @as(std.meta.Tag(ImportResult), .zero_budget),
         std.meta.activeTag(try importer.prepend(
@@ -1763,11 +1861,15 @@ test "history cursor pages newest first within strict budgets" {
     const import_too_small = try importer.prepend(
         &destination,
         units[0],
-        .{ .bytes = units[0].len - 1, .rows = 1 },
+        .{ .bytes = 1, .rows = 1 },
     );
     try testing.expectEqual(
         @as(std.meta.Tag(ImportResult), .too_small),
         std.meta.activeTag(import_too_small),
+    );
+    try testing.expectEqual(
+        @as(usize, 0),
+        importer.authenticatedBytes(&destination),
     );
 
     const rejected_pages = destination_screen.pages.totalPages();
@@ -1878,7 +1980,10 @@ test "history cursor pages newest first within strict budgets" {
         try testing.expect(imported.retained);
         try testing.expectEqual(@as(usize, 1), imported.rows);
     }
-    try testing.expectEqual(units.len - 1, importer.inspectedPrefixNodes());
+    try testing.expectEqual(
+        units.len - 1,
+        importer.inspectedPrefixNodes(&destination),
+    );
     try importer.commit(&destination);
 
     try testing.expectEqualStrings("live destination", destination.getTitle().?);
@@ -2131,13 +2236,13 @@ test "history cursor invalidation and transactional abort outcomes" {
         &abort_source,
         abort_lease.checkpoint(),
     );
-    defer abort_import.deinit();
+    defer abort_import.deinit(&abort_destination);
     _ = try abort_import.prepend(
         &abort_destination,
         unit.written(),
         .{ .bytes = unit.written().len, .rows = 2 },
     );
-    abort_import.abort();
+    abort_import.abort(&abort_destination);
     try testing.expectEqual(abort_pages, abort_screen.pages.totalPages());
     try testing.expectEqual(
         abort_active,
@@ -2250,8 +2355,8 @@ test "history lease slots recycle while stale aliases remain invalid" {
     const testing = std.testing;
     var terminal_value = try testCursorTerminal(testing.allocator, 1, 'A');
     defer terminal_value.deinit(testing.allocator);
-    const screen = terminal_value.screens.get(.primary).?;
-    const initial_pins = screen.pages.countTrackedPins();
+    const terminal_screen = terminal_value.screens.get(.primary).?;
+    const initial_pins = terminal_screen.pages.countTrackedPins();
 
     var stale: ?HistoryLease = null;
     for (0..1024) |index| {
@@ -2259,7 +2364,10 @@ test "history lease slots recycle while stale aliases remain invalid" {
         if (index == 0) stale = lease;
         lease.deinit(&terminal_value);
     }
-    try testing.expectEqual(initial_pins, screen.pages.countTrackedPins());
+    try testing.expectEqual(
+        initial_pins,
+        terminal_screen.pages.countTrackedPins(),
+    );
     try testing.expectError(
         error.Stale,
         stale.?.cursor(&terminal_value),
@@ -2274,5 +2382,8 @@ test "history lease slots recycle while stale aliases remain invalid" {
         HistoryLease.init(&terminal_value, .primary),
     );
     for (&active) |*lease| lease.deinit(&terminal_value);
-    try testing.expectEqual(initial_pins, screen.pages.countTrackedPins());
+    try testing.expectEqual(
+        initial_pins,
+        terminal_screen.pages.countTrackedPins(),
+    );
 }
