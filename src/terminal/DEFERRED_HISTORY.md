@@ -422,43 +422,43 @@ canonical section sequence, or nonzero trailing alignment byte.
 Superblocks A and B begin at object offsets 0 and 4096 and are exactly 4096
 bytes:
 
-| Offset | Width | Field |
-| ---: | ---: | --- |
-| 0 | 8 | ASCII magic `GHHSB001` |
-| 8 | 2 | major = 1 |
-| 10 | 2 | minor = 0 |
-| 12 | 2 | header length = 144 |
-| 14 | 2 | checksum algorithm = 1 (BLAKE3-256) |
-| 16 | 8 | required feature bits |
-| 24 | 16 | stream ID |
-| 40 | 8 | superblock sequence |
-| 48 | 8 | manifest object offset |
-| 56 | 8 | manifest byte length |
-| 64 | 32 | manifest digest |
-| 96 | 8 | prune page sequence |
-| 104 | 4 | prune row ordinal |
-| 108 | 4 | flags |
-| 112 | 32 | superblock checksum |
-| 144 | 3952 | zero reserved bytes |
+| Offset | Width | Field                               |
+| -----: | ----: | ----------------------------------- |
+|      0 |     8 | ASCII magic `GHHSB001`              |
+|      8 |     2 | major = 1                           |
+|     10 |     2 | minor = 0                           |
+|     12 |     2 | header length = 144                 |
+|     14 |     2 | checksum algorithm = 1 (BLAKE3-256) |
+|     16 |     8 | required feature bits               |
+|     24 |    16 | stream ID                           |
+|     40 |     8 | superblock sequence                 |
+|     48 |     8 | manifest object offset              |
+|     56 |     8 | manifest byte length                |
+|     64 |    32 | manifest digest                     |
+|     96 |     8 | prune page sequence                 |
+|    104 |     4 | prune row ordinal                   |
+|    108 |     4 | flags                               |
+|    112 |    32 | superblock checksum                 |
+|    144 |  3952 | zero reserved bytes                 |
 
 The five record magics are `GHSEG001`, `GHIDX001`, `GHCKP001`, `GHQUA001`, and
 `GHMAN001`. Each starts with this 96-byte common header:
 
-| Offset | Width | Field |
-| ---: | ---: | --- |
-| 0 | 8 | type-specific magic |
-| 8 | 2 | major = 1 |
-| 10 | 2 | minor = 0 |
-| 12 | 2 | type: segment=1, index=2, checkpoint=3, quarantine=4, manifest=5 |
-| 14 | 2 | flags; v1 writes zero |
-| 16 | 4 | header length |
-| 20 | 4 | zero reserved |
-| 24 | 8 | total record length, including final zero alignment |
-| 32 | 8 | record sequence |
-| 40 | 32 | record digest |
-| 72 | 8 | body length excluding header and final alignment |
-| 80 | 8 | required feature bits |
-| 88 | 8 | zero reserved |
+| Offset | Width | Field                                                            |
+| -----: | ----: | ---------------------------------------------------------------- |
+|      0 |     8 | type-specific magic                                              |
+|      8 |     2 | major = 1                                                        |
+|     10 |     2 | minor = 0                                                        |
+|     12 |     2 | type: segment=1, index=2, checkpoint=3, quarantine=4, manifest=5 |
+|     14 |     2 | flags; v1 writes zero                                            |
+|     16 |     4 | header length                                                    |
+|     20 |     4 | zero reserved                                                    |
+|     24 |     8 | total record length, including final zero alignment              |
+|     32 |     8 | record sequence                                                  |
+|     40 |    32 | record digest                                                    |
+|     72 |     8 | body length excluding header and final alignment                 |
+|     80 |     8 | required feature bits                                            |
+|     88 |     8 | zero reserved                                                    |
 
 Except for a segment, `header_length` is 96, the body begins at offset 96, and
 `total_record_length = align8(96 + body_length)`. The bytes between the body end
@@ -468,26 +468,26 @@ required feature are known to be optional; unknown v1 types are rejected.
 
 A segment has `header_length = 256`. Its extension is:
 
-| Offset | Width | Field |
-| ---: | ---: | --- |
-| 96 | 8 | segment ID |
-| 104 | 8 | previous committed segment ID, or zero |
-| 112 | 8 | first page sequence |
-| 120 | 8 | last page sequence, inclusive |
-| 128 | 4 | page count |
-| 132 | 4 | logical row count |
-| 136 | 2 | codec: none=0, independent LZ4 block=1 |
-| 138 | 2 | block digest algorithm = 1 (BLAKE3-256) |
-| 140 | 4 | block count |
-| 144 | 8 | page directory offset, exactly 256 |
-| 152 | 8 | page directory byte length, exactly page_count * 64 |
-| 160 | 8 | block directory offset |
-| 168 | 8 | block directory byte length, exactly block_count * 48 |
-| 176 | 8 | compressed payload offset |
-| 184 | 8 | compressed payload length |
-| 192 | 8 | canonical uncompressed payload length |
-| 200 | 32 | canonical payload digest |
-| 232 | 24 | zero reserved |
+| Offset | Width | Field                                                  |
+| -----: | ----: | ------------------------------------------------------ |
+|     96 |     8 | segment ID                                             |
+|    104 |     8 | previous committed segment ID, or zero                 |
+|    112 |     8 | first page sequence                                    |
+|    120 |     8 | last page sequence, inclusive                          |
+|    128 |     4 | page count                                             |
+|    132 |     4 | logical row count                                      |
+|    136 |     2 | codec: none=0, independent LZ4 block=1                 |
+|    138 |     2 | block digest algorithm = 1 (BLAKE3-256)                |
+|    140 |     4 | block count                                            |
+|    144 |     8 | page directory offset, exactly 256                     |
+|    152 |     8 | page directory byte length, exactly page_count \* 64   |
+|    160 |     8 | block directory offset                                 |
+|    168 |     8 | block directory byte length, exactly block_count \* 48 |
+|    176 |     8 | compressed payload offset                              |
+|    184 |     8 | compressed payload length                              |
+|    192 |     8 | canonical uncompressed payload length                  |
+|    200 |    32 | canonical payload digest                               |
+|    232 |    24 | zero reserved                                          |
 
 For a segment, `block_directory_offset = 256 + page_directory_byte_length`,
 `compressed_payload_offset = align8(block_directory_offset +
@@ -500,25 +500,25 @@ compressed_payload_length)`. Its final alignment is zero and is excluded from
 The page directory immediately follows the segment header. Each 64-byte entry is
 ordered by increasing page sequence:
 
-| Entry offset | Width | Field |
-| ---: | ---: | --- |
-| 0 | 8 | page sequence |
-| 8 | 4 | row count |
-| 12 | 2 | canonical segmentation version |
-| 14 | 2 | page flags |
-| 16 | 8 | offset in uncompressed canonical payload |
-| 24 | 8 | canonical page byte length |
-| 32 | 32 | canonical page digest |
+| Entry offset | Width | Field                                    |
+| -----------: | ----: | ---------------------------------------- |
+|            0 |     8 | page sequence                            |
+|            8 |     4 | row count                                |
+|           12 |     2 | canonical segmentation version           |
+|           14 |     2 | page flags                               |
+|           16 |     8 | offset in uncompressed canonical payload |
+|           24 |     8 | canonical page byte length               |
+|           32 |    32 | canonical page digest                    |
 
 The block directory follows immediately, then zero padding to the next 8-byte
 boundary, then the compressed payload. Each 48-byte block entry is:
 
-| Entry offset | Width | Field |
-| ---: | ---: | --- |
-| 0 | 8 | offset relative to compressed payload |
-| 8 | 4 | compressed length, 1..65536 |
-| 12 | 4 | produced length, 1..65536 |
-| 16 | 32 | digest of the exact compressed block bytes |
+| Entry offset | Width | Field                                      |
+| -----------: | ----: | ------------------------------------------ |
+|            0 |     8 | offset relative to compressed payload      |
+|            8 |     4 | compressed length, 1..65536                |
+|           12 |     4 | produced length, 1..65536                  |
+|           16 |    32 | digest of the exact compressed block bytes |
 
 Block offsets start at zero, are contiguous with no padding, and end exactly at
 compressed payload length. Codec 0 requires compressed length equal produced
@@ -539,21 +539,21 @@ writer output but readers accept every structurally valid v1 block.
 The uncompressed payload is a contiguous sequence of canonical logical pages.
 Each starts with an 80-byte header:
 
-| Page offset | Width | Field |
-| ---: | ---: | --- |
-| 0 | 8 | ASCII magic `GHLPAG01` |
-| 8 | 2 | logical page version = 1 |
-| 10 | 2 | header length = 80 |
-| 12 | 4 | page flags |
-| 16 | 16 | stream ID |
-| 32 | 8 | page sequence |
-| 40 | 4 | row count |
-| 44 | 2 | segmentation version |
-| 46 | 2 | zero reserved |
-| 48 | 8 | row directory offset, exactly 80 |
-| 56 | 8 | row data offset |
-| 64 | 8 | total page length |
-| 72 | 8 | zero reserved |
+| Page offset | Width | Field                            |
+| ----------: | ----: | -------------------------------- |
+|           0 |     8 | ASCII magic `GHLPAG01`           |
+|           8 |     2 | logical page version = 1         |
+|          10 |     2 | header length = 80               |
+|          12 |     4 | page flags                       |
+|          16 |    16 | stream ID                        |
+|          32 |     8 | page sequence                    |
+|          40 |     4 | row count                        |
+|          44 |     2 | segmentation version             |
+|          46 |     2 | zero reserved                    |
+|          48 |     8 | row directory offset, exactly 80 |
+|          56 |     8 | row data offset                  |
+|          64 |     8 | total page length                |
+|          72 |     8 | zero reserved                    |
 
 Its `row_count` 64-byte entries follow the header. An entry stores, in order:
 `row_ordinal:u32`, `row_flags:u16`, `reserved:u16`,
@@ -1092,25 +1092,25 @@ resize waiting for compression. A miss blocks default enablement.
 
 ## Test, fuzz, and benchmark matrix
 
-| Area          | Tests and properties                                                                      | Benchmark                   |
-| ------------- | ----------------------------------------------------------------------------------------- | --------------------------- |
-| identity      | survive compression/move/compact/reopen/width; line spans and sliced pages never alias    | index overhead 1K..10M rows |
-| anchors       | round trips for affinity; frozen segmentation keeps anchors across Unicode upgrades       | warm/cold lookup            |
-| Unicode       | combining/ZWJ/VS/zero/wide edge/width one; malformed cells; span fences                   | grapheme/reflow throughput  |
-| semantics     | prompt/style/hyperlink/protection/blank runs survive split/merge                          | projected run memory        |
-| Kitty/glyph   | placeholders atomic; missing/live unsupported state rejects before output                 | placeholder-heavy reflow    |
-| resize        | provisional tail seal/anchor rollback; layout-gap visibility; exact hot bounds          | both overscan gates         |
-| budgets       | zero/exact/one-less; bounded-write admission is atomic; checkpoint cap backpressures    | step/write overhead         |
-| cancellation  | cancel at every block boundary; <=64 KiB consumed/produced; no late publish             | cancellation latency        |
-| cache/pins    | eviction caps; pin expiration/status/renewal/sublease reclaim schedules                 | hit rate at fixed bytes     |
-| concurrency   | deterministic owner/handle use-cancel-close-completion and mutation schedules           | VT throughput during work   |
+| Area          | Tests and properties                                                                     | Benchmark                   |
+| ------------- | ---------------------------------------------------------------------------------------- | --------------------------- |
+| identity      | survive compression/move/compact/reopen/width; line spans and sliced pages never alias   | index overhead 1K..10M rows |
+| anchors       | round trips for affinity; frozen segmentation keeps anchors across Unicode upgrades      | warm/cold lookup            |
+| Unicode       | combining/ZWJ/VS/zero/wide edge/width one; malformed cells; span fences                  | grapheme/reflow throughput  |
+| semantics     | prompt/style/hyperlink/protection/blank runs survive split/merge                         | projected run memory        |
+| Kitty/glyph   | placeholders atomic; missing/live unsupported state rejects before output                | placeholder-heavy reflow    |
+| resize        | provisional tail seal/anchor rollback; layout-gap visibility; exact hot bounds           | both overscan gates         |
+| budgets       | zero/exact/one-less; bounded-write admission is atomic; checkpoint cap backpressures     | step/write overhead         |
+| cancellation  | cancel at every block boundary; <=64 KiB consumed/produced; no late publish              | cancellation latency        |
+| cache/pins    | eviction caps; pin expiration/status/renewal/sublease reclaim schedules                  | hit rate at fixed bytes     |
+| concurrency   | deterministic owner/handle use-cancel-close-completion and mutation schedules            | VT throughput during work   |
 | container     | independent golden parser; exact offsets/digests/LZ4; mutate reserved/length/frame bytes | encode/decode/ratio         |
-| crashes       | fail/tear/reorder every host op; CAS/reference and each flush old-or-new only           | recovery/tail size          |
+| crashes       | fail/tear/reorder every host op; CAS/reference and each flush old-or-new only            | recovery/tail size          |
 | recovery      | no-manifest failed-closed; demand quarantine races/failure/reopen/cap/removal            | open/header scan            |
-| repair        | exact authenticated replacement only; slice gaps/overlap/replay/wrong stream rejected   | repair/headroom             |
+| repair        | exact authenticated replacement only; slice gaps/overlap/replay/wrong stream rejected    | repair/headroom             |
 | ABI           | handle tombstone reuse/limits/exhaustion and thread races; fuzz wasm/native pointers     | boundary copy overhead      |
-| compatibility | v1/v2 and `GHUNIT2` goldens unchanged; mixed units reject                                 | snapshot regression         |
-| security      | token/request forgery, bombs, arithmetic edges, hostile completions                       | auth/checksum cost          |
+| compatibility | v1/v2 and `GHUNIT2` goldens unchanged; mixed units reject                                | snapshot regression         |
+| security      | token/request forgery, bombs, arithmetic edges, hostile completions                      | auth/checksum cost          |
 
 Every persistent version has checked-in golden bytes and an independent parser
 fixture. Crash tests use a fake transport that records and tears operations.
