@@ -304,17 +304,36 @@ static void exercise_history_units(
     GhosttyTerminal source,
     GhosttyTerminal destination)
 {
+    FailAllocator cursor_alloc = { .fail_after = SIZE_MAX };
+    GhosttyAllocator cursor_allocator = {
+        .ctx = &cursor_alloc,
+        .vtable = &fail_vtable,
+    };
     GhosttyTerminalHistoryLeaseResult lease = {
         .size = sizeof(lease),
         .version = GHOSTTY_TERMINAL_SNAPSHOT_ABI_VERSION,
     };
-    assert(ghostty_terminal_history_lease_new(NULL, source, 0, &lease) ==
+    assert(ghostty_terminal_history_lease_new(
+        &cursor_allocator, source, 0, &lease) ==
         GHOSTTY_TERMINAL_SNAPSHOT_STATUS_SUCCESS);
+    GhosttyTerminalHistoryLeaseResult unavailable = {
+        .size = sizeof(unavailable),
+        .version = GHOSTTY_TERMINAL_SNAPSHOT_ABI_VERSION,
+    };
+    assert(ghostty_terminal_history_lease_new(
+        NULL, source, 1, &unavailable) ==
+        GHOSTTY_TERMINAL_SNAPSHOT_STATUS_WRONG_GENERATION);
 
     GhosttyTerminalHistoryCursorResult cursor = {
         .size = sizeof(cursor),
         .version = GHOSTTY_TERMINAL_SNAPSHOT_ABI_VERSION,
     };
+    cursor_alloc.fail_after = cursor_alloc.calls;
+    assert(ghostty_terminal_history_lease_cursor(
+        lease.lease, source, &cursor) ==
+        GHOSTTY_TERMINAL_SNAPSHOT_STATUS_OUT_OF_MEMORY);
+    assert(cursor.cursor == NULL);
+    cursor_alloc.fail_after = SIZE_MAX;
     assert(ghostty_terminal_history_lease_cursor(
         lease.lease, source, &cursor) ==
         GHOSTTY_TERMINAL_SNAPSHOT_STATUS_SUCCESS);
@@ -340,6 +359,14 @@ static void exercise_history_units(
     assert(ghostty_terminal_history_importer_new(
         NULL, destination, 0, source, &forged, &options, &rejected) ==
         GHOSTTY_TERMINAL_SNAPSHOT_STATUS_INVALID_HANDLE);
+    GhosttyTerminalHistoryImporterResult unavailable_importer = {
+        .size = sizeof(unavailable_importer),
+        .version = GHOSTTY_TERMINAL_SNAPSHOT_ABI_VERSION,
+    };
+    assert(ghostty_terminal_history_importer_new(
+        NULL, destination, 1, source, &lease.checkpoint, &options,
+        &unavailable_importer) ==
+        GHOSTTY_TERMINAL_SNAPSHOT_STATUS_WRONG_GENERATION);
     assert(ghostty_terminal_history_importer_new(
         NULL, destination, 0, source, &lease.checkpoint, &options, &importer) ==
         GHOSTTY_TERMINAL_SNAPSHOT_STATUS_SUCCESS);
@@ -424,8 +451,32 @@ static void exercise_history_units(
         importer.importer, destination) ==
         GHOSTTY_TERMINAL_SNAPSHOT_STATUS_SUCCESS);
     ghostty_terminal_history_importer_free(importer.importer);
+    GhosttyTerminalHistoryImporterResult abort_importer = {
+        .size = sizeof(abort_importer),
+        .version = GHOSTTY_TERMINAL_SNAPSHOT_ABI_VERSION,
+    };
+    assert(ghostty_terminal_history_importer_new(
+        NULL, destination, 0, source, &lease.checkpoint, &options,
+        &abort_importer) == GHOSTTY_TERMINAL_SNAPSHOT_STATUS_SUCCESS);
+    assert(ghostty_terminal_history_importer_abort(
+        abort_importer.importer, source) ==
+        GHOSTTY_TERMINAL_SNAPSHOT_STATUS_WRONG_TERMINAL);
+    ghostty_terminal_history_importer_free(abort_importer.importer);
+
+    abort_importer = (GhosttyTerminalHistoryImporterResult){
+        .size = sizeof(abort_importer),
+        .version = GHOSTTY_TERMINAL_SNAPSHOT_ABI_VERSION,
+    };
+    assert(ghostty_terminal_history_importer_new(
+        NULL, destination, 0, source, &lease.checkpoint, &options,
+        &abort_importer) == GHOSTTY_TERMINAL_SNAPSHOT_STATUS_SUCCESS);
+    assert(ghostty_terminal_history_importer_abort(
+        abort_importer.importer, destination) ==
+        GHOSTTY_TERMINAL_SNAPSHOT_STATUS_SUCCESS);
+    ghostty_terminal_history_importer_free(abort_importer.importer);
     ghostty_terminal_history_cursor_free(cursor.cursor);
     ghostty_terminal_history_lease_free(lease.lease);
+    assert(cursor_alloc.active == 0);
 }
 
 int main(void) {
@@ -479,8 +530,48 @@ int main(void) {
         &fail_allocator, allocation_terminal, &allocation_options,
         &allocation_capture) ==
         GHOSTTY_TERMINAL_SNAPSHOT_STATUS_SUCCESS);
+    assert(ghostty_terminal_snapshot_capture_abort(allocation_capture) ==
+        GHOSTTY_TERMINAL_SNAPSHOT_STATUS_SUCCESS);
+    GhosttyTerminalSnapshotCaptureEvent aborted_event = {
+        .size = sizeof(aborted_event),
+        .version = GHOSTTY_TERMINAL_SNAPSHOT_ABI_VERSION,
+    };
+    assert(ghostty_terminal_snapshot_capture_next(
+        allocation_capture, NULL, 0, &aborted_event) ==
+        GHOSTTY_TERMINAL_SNAPSHOT_STATUS_INVALID_STATE);
     ghostty_terminal_snapshot_capture_free(allocation_capture);
     assert(fail_state.active == 0);
+    GhosttyTerminalSnapshotCaptureOptions bounded_options =
+        capture_options();
+    bounded_options.max_record_bytes = 10;
+    GhosttyTerminalSnapshotCapture bounded_capture = NULL;
+    assert(ghostty_terminal_snapshot_capture_new(
+        NULL, allocation_terminal, &bounded_options, &bounded_capture) ==
+        GHOSTTY_TERMINAL_SNAPSHOT_STATUS_SUCCESS);
+    uint8_t bounded_record[10];
+    GhosttyTerminalSnapshotCaptureEvent bounded_event = {
+        .size = sizeof(bounded_event),
+        .version = GHOSTTY_TERMINAL_SNAPSHOT_ABI_VERSION,
+    };
+    assert(ghostty_terminal_snapshot_capture_next(
+        bounded_capture, bounded_record, sizeof(bounded_record),
+        &bounded_event) == GHOSTTY_TERMINAL_SNAPSHOT_STATUS_SUCCESS);
+    assert(bounded_event.written == sizeof(bounded_record));
+    assert(ghostty_terminal_snapshot_capture_next(
+        bounded_capture, bounded_record, sizeof(bounded_record),
+        &bounded_event) == GHOSTTY_TERMINAL_SNAPSHOT_STATUS_LIMIT_EXCEEDED);
+    ghostty_terminal_snapshot_capture_free(bounded_capture);
+    static const uint8_t bounded_continuation[] = "\x1b[31";
+    ghostty_terminal_vt_write(
+        allocation_terminal,
+        bounded_continuation,
+        sizeof(bounded_continuation) - 1);
+    bounded_options.max_record_bytes = 12;
+    bounded_capture = NULL;
+    assert(ghostty_terminal_snapshot_capture_new(
+        NULL, allocation_terminal, &bounded_options, &bounded_capture) ==
+        GHOSTTY_TERMINAL_SNAPSHOT_STATUS_LIMIT_EXCEEDED);
+    assert(bounded_capture == NULL);
     ghostty_terminal_free(allocation_terminal);
 
     GhosttyTerminal source = NULL;
@@ -539,15 +630,81 @@ int main(void) {
         .size = sizeof(finish),
         .version = GHOSTTY_TERMINAL_SNAPSHOT_ABI_VERSION,
     };
-    assert(ghostty_terminal_snapshot_decoder_push(
-        decoder, finish_tail.data, finish_tail.len, &finish) ==
-        GHOSTTY_TERMINAL_SNAPSHOT_STATUS_SUCCESS);
-    assert(finish.kind == GHOSTTY_TERMINAL_SNAPSHOT_DECODE_FINISH);
-    assert(finish.consumed == bytes.len - bytes.finish_offset);
+    size_t finish_consumed = 0;
+    do {
+        assert(ghostty_terminal_snapshot_decoder_push(
+            decoder, finish_tail.data + finish_consumed,
+            finish_tail.len - finish_consumed, &finish) ==
+            GHOSTTY_TERMINAL_SNAPSHOT_STATUS_SUCCESS);
+        assert(finish.consumed > 0);
+        finish_consumed += finish.consumed;
+    } while (finish.kind != GHOSTTY_TERMINAL_SNAPSHOT_DECODE_FINISH);
+    assert(finish_consumed == bytes.len - bytes.finish_offset);
     ghostty_terminal_vt_write(live_terminal,
-        finish_tail.data + finish.consumed, finish_tail.len - finish.consumed);
+        finish_tail.data + finish_consumed,
+        finish_tail.len - finish_consumed);
     ghostty_terminal_snapshot_decoder_free(decoder);
     free(finish_tail.data);
+
+    GhosttyTerminalSnapshotDecoder corrupt_decoder = NULL;
+    assert(ghostty_terminal_snapshot_decoder_new(
+        NULL, &decode_options, &corrupt_decoder) ==
+        GHOSTTY_TERMINAL_SNAPSHOT_STATUS_SUCCESS);
+    size_t corrupt_offset = 0;
+    GhosttyTerminal corrupt_terminal = NULL;
+    while (corrupt_offset < bytes.finish_offset) {
+        GhosttyTerminalSnapshotDecodeEvent event = {
+            .size = sizeof(event),
+            .version = GHOSTTY_TERMINAL_SNAPSHOT_ABI_VERSION,
+        };
+        assert(ghostty_terminal_snapshot_decoder_push(
+            corrupt_decoder, bytes.data + corrupt_offset,
+            bytes.finish_offset - corrupt_offset, &event) ==
+            GHOSTTY_TERMINAL_SNAPSHOT_STATUS_SUCCESS);
+        corrupt_offset += event.consumed;
+        if (event.kind == GHOSTTY_TERMINAL_SNAPSHOT_DECODE_READY) {
+            GhosttyTerminalSnapshotTakeTerminalResult take = {
+                .size = sizeof(take),
+                .version = GHOSTTY_TERMINAL_SNAPSHOT_ABI_VERSION,
+            };
+            assert(ghostty_terminal_snapshot_decoder_take_terminal(
+                corrupt_decoder, &take) ==
+                GHOSTTY_TERMINAL_SNAPSHOT_STATUS_SUCCESS);
+            corrupt_terminal = take.terminal;
+            assert(ghostty_terminal_snapshot_decoder_replay_continuation(
+                corrupt_decoder, corrupt_terminal) ==
+                GHOSTTY_TERMINAL_SNAPSHOT_STATUS_SUCCESS);
+        }
+    }
+    Bytes corrupt_finish_tail = {0};
+    append(&corrupt_finish_tail, bytes.data + bytes.finish_offset,
+        bytes.len - bytes.finish_offset);
+    corrupt_finish_tail.data[10] ^= 0x80;
+    append(&corrupt_finish_tail, tail, sizeof(tail) - 1);
+    size_t corrupt_consumed = 0;
+    GhosttyTerminalSnapshotStatus corrupt_status =
+        GHOSTTY_TERMINAL_SNAPSHOT_STATUS_SUCCESS;
+    while (corrupt_status == GHOSTTY_TERMINAL_SNAPSHOT_STATUS_SUCCESS) {
+        GhosttyTerminalSnapshotDecodeEvent event = {
+            .size = sizeof(event),
+            .version = GHOSTTY_TERMINAL_SNAPSHOT_ABI_VERSION,
+        };
+        corrupt_status = ghostty_terminal_snapshot_decoder_push(
+            corrupt_decoder,
+            corrupt_finish_tail.data + corrupt_consumed,
+            corrupt_finish_tail.len - corrupt_consumed,
+            &event);
+        corrupt_consumed += event.consumed;
+    }
+    assert(corrupt_status == GHOSTTY_TERMINAL_SNAPSHOT_STATUS_CORRUPTION);
+    assert(corrupt_consumed == bytes.len - bytes.finish_offset);
+    ghostty_terminal_vt_write(
+        corrupt_terminal,
+        corrupt_finish_tail.data + corrupt_consumed,
+        corrupt_finish_tail.len - corrupt_consumed);
+    ghostty_terminal_snapshot_decoder_free(corrupt_decoder);
+    ghostty_terminal_free(corrupt_terminal);
+    free(corrupt_finish_tail.data);
 
     exercise_history_units(source, live_terminal);
 

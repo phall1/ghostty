@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const lib = @import("../lib.zig");
 const snapshot = @import("../snapshot/main.zig");
 const terminal_c = @import("terminal.zig");
@@ -175,6 +176,7 @@ pub const HistoryImportEvent = extern struct {
 
 const codec_identity = "ghostty.snapshot.v1-v2.incremental.v1";
 const build_options = @import("terminal_options");
+const authenticated_history = builtin.os.tag != .freestanding;
 
 pub fn capabilities(out_: ?*Capabilities) callconv(lib.calling_conv) Status {
     const out = out_ orelse return .invalid_handle;
@@ -186,14 +188,20 @@ pub fn capabilities(out_: ?*Capabilities) callconv(lib.calling_conv) Status {
     out.incremental = true;
     out.ready = true;
     out.history = true;
-    out.authenticated_tokens = true;
+    out.authenticated_tokens = authenticated_history;
     out.bounded_records = true;
     out.bounded_pages = true;
-    out.bounded_units = true;
+    out.bounded_units = authenticated_history;
     out.max_record_bytes = std.math.maxInt(u32);
     out.max_pages = std.math.maxInt(u32);
-    out.max_unit_bytes = std.math.maxInt(u32);
-    out.max_rows = std.math.maxInt(u32);
+    out.max_unit_bytes = if (authenticated_history)
+        std.math.maxInt(u32)
+    else
+        0;
+    out.max_rows = if (authenticated_history)
+        std.math.maxInt(u32)
+    else
+        0;
     out.codec_identity = .{ .ptr = codec_identity.ptr, .len = codec_identity.len };
     out.build_identity = .{
         .ptr = build_options.version_string.ptr,
@@ -230,9 +238,9 @@ fn mapError(err: anyerror) Status {
         => .limit_exceeded,
         error.Stale => .stale,
         error.Pruned => .pruned,
-        error.WrongGeneration => .wrong_generation,
+        error.WrongGeneration, error.ScreenUnavailable => .wrong_generation,
         error.WrongTerminal => .wrong_terminal,
-        error.InvalidCheckpoint => .invalid_handle,
+        error.InvalidHandle, error.InvalidCheckpoint => .invalid_handle,
         error.InvalidHistoryUnit => .corruption,
         error.ImportBusy => .import_busy,
         error.WriteFailed => .out_of_memory,
@@ -261,11 +269,12 @@ const CaptureState = struct {
     alloc: std.mem.Allocator,
     terminal: terminal_c.Terminal,
     continuation: []u8,
-    output: std.Io.Writer.Allocating,
+    output_buffer: []u8,
+    output: std.Io.Writer,
     encoder: snapshot.Encoder,
-    max_record_bytes: usize,
     max_pages: usize,
-    pending: ?[]u8 = null,
+    pending: bool = false,
+    pending_len: usize = 0,
     pending_kind: CaptureEventKind = .record,
     pending_codec_version: u16 = 0,
     pending_key: u16 = 0,
@@ -302,26 +311,40 @@ pub fn captureNew(
     snapshot.validateSupportedState(zig_terminal) catch |err| return mapError(err);
 
     const alloc = lib.alloc.default(alloc_);
-    var continuation_writer: std.Io.Writer.Allocating = .init(alloc);
-    defer continuation_writer.deinit();
-    terminal_c.writeSnapshotContinuation(
-        terminal,
-        &continuation_writer.writer,
-    ) catch |err| return mapError(err);
-    const continuation = continuation_writer.toOwnedSlice() catch
-        return .out_of_memory;
-    errdefer alloc.free(continuation);
-
     const state = alloc.create(CaptureState) catch return .out_of_memory;
     errdefer alloc.destroy(state);
+    const output_buffer = alloc.alloc(u8, options.max_record_bytes) catch
+        return .out_of_memory;
+    errdefer alloc.free(output_buffer);
+
+    var continuation_writer: std.Io.Writer = .fixed(output_buffer);
+    terminal_c.writeSnapshotContinuation(
+        terminal,
+        &continuation_writer,
+    ) catch |err| return if (err == error.WriteFailed)
+        .limit_exceeded
+    else
+        mapError(err);
+    if (continuation_writer.end >
+        options.max_record_bytes -| snapshot.record.Header.len)
+    {
+        return .limit_exceeded;
+    }
+    const continuation = alloc.dupe(
+        u8,
+        continuation_writer.buffered(),
+    ) catch return .out_of_memory;
+    errdefer alloc.free(continuation);
+
     state.* = undefined;
     state.alloc = alloc;
     state.terminal = terminal;
     state.continuation = continuation;
-    state.output = .init(alloc);
-    state.max_record_bytes = options.max_record_bytes;
+    state.output_buffer = output_buffer;
+    state.output = .fixed(output_buffer);
     state.max_pages = options.max_pages;
-    state.pending = null;
+    state.pending = false;
+    state.pending_len = 0;
     state.pending_kind = .record;
     state.pending_codec_version = 0;
     state.pending_key = 0;
@@ -338,15 +361,13 @@ pub fn captureNew(
         .ground
     else
         .{ .bytes = continuation };
-    state.encoder = snapshot.Encoder.init(
+    state.encoder = snapshot.Encoder.initLimited(
         alloc,
-        &state.output.writer,
+        &state.output,
         zig_terminal,
         .{ .continuation = continuation_value },
-    ) catch |err| {
-        state.output.deinit();
-        return mapError(err);
-    };
+        options.max_record_bytes,
+    ) catch |err| return mapError(err);
     out.* = state;
     return .success;
 }
@@ -418,30 +439,26 @@ pub fn captureNext(
     if (state.terminal_state) return .invalid_state;
     if (buffer_ == null and buffer_len != 0) return .invalid_state;
 
-    if (state.pending == null) {
+    if (!state.pending) {
+        state.output.end = 0;
         const encode_event = state.encoder.next() catch |err| {
             state.terminal_state = true;
-            return mapError(err);
+            return if (err == error.WriteFailed)
+                .limit_exceeded
+            else
+                mapError(err);
         };
-        const bytes = state.output.toOwnedSlice() catch {
-            state.terminal_state = true;
-            return .out_of_memory;
-        };
-        if (bytes.len > state.max_record_bytes) {
-            state.alloc.free(bytes);
-            state.terminal_state = true;
-            return .limit_exceeded;
-        }
+        const bytes = state.output.buffered();
         const status = classifyCapture(state, encode_event, bytes);
         if (status != .success) {
-            state.alloc.free(bytes);
             state.terminal_state = true;
             return status;
         }
-        state.pending = bytes;
+        state.pending = true;
+        state.pending_len = bytes.len;
     }
 
-    const pending = state.pending.?;
+    const pending = state.output_buffer[0..state.pending_len];
     out.kind = state.pending_kind;
     out.codec_version = state.pending_codec_version;
     out.screen_key = state.pending_key;
@@ -452,8 +469,8 @@ pub fn captureNext(
     if (pending.len > buffer_len) return .out_of_space;
     if (pending.len > 0) @memcpy(buffer_.?[0..pending.len], pending);
     out.written = pending.len;
-    state.alloc.free(pending);
-    state.pending = null;
+    state.pending = false;
+    state.pending_len = 0;
     if (state.pending_kind == .finish) state.terminal_state = true;
     return .success;
 }
@@ -466,9 +483,8 @@ pub fn captureAbort(capture: Capture) callconv(lib.calling_conv) Status {
 
 pub fn captureFree(capture: Capture) callconv(lib.calling_conv) void {
     const state = capture orelse return;
-    if (state.pending) |bytes| state.alloc.free(bytes);
     state.encoder.deinit();
-    state.output.deinit();
+    state.alloc.free(state.output_buffer);
     state.alloc.free(state.continuation);
     const alloc = state.alloc;
     alloc.destroy(state);
@@ -548,6 +564,7 @@ pub fn decoderPush(
     }
     const data = data_.?[0..len];
     const result = state.decoder.push(data) catch |err| {
+        out.consumed = state.decoder.consumedOnError();
         state.terminal_state = true;
         return mapError(err);
     };
@@ -658,6 +675,7 @@ pub fn historyLeaseNew(
     if (!validVersioned(out, HistoryLeaseResult)) return .invalid_state;
     out.lease = null;
     out.checkpoint = emptyToken();
+    if (!authenticated_history) return .unsupported_feature;
     const zig_terminal = terminal_c.zigTerminal(terminal) orelse
         return .wrong_terminal;
     const io_ = terminal_c.terminalIo(terminal) orelse return .wrong_terminal;
@@ -688,9 +706,11 @@ pub fn historyLeaseCursor(
     out.capability = emptyToken();
     const zig_terminal = terminal_c.zigTerminal(terminal) orelse
         return .wrong_terminal;
-    const cursor = state.lease.cursor(zig_terminal) catch |err| return mapError(err);
     const cursor_state = state.alloc.create(HistoryCursorState) catch
         return .out_of_memory;
+    errdefer state.alloc.destroy(cursor_state);
+    const cursor = state.lease.cursor(zig_terminal) catch |err|
+        return mapError(err);
     cursor_state.* = .{
         .alloc = state.alloc,
         .terminal = state.terminal,
@@ -800,6 +820,7 @@ pub fn historyImporterNew(
         !validBound(options.max_units)) return .invalid_state;
     out.importer = null;
     out.capability = emptyToken();
+    if (!authenticated_history) return .unsupported_feature;
     const zig_terminal = terminal_c.zigTerminal(terminal) orelse
         return .wrong_terminal;
     const zig_source = terminal_c.zigTerminal(source_terminal) orelse
@@ -886,6 +907,8 @@ pub fn historyImporterAbort(
     terminal: terminal_c.Terminal,
 ) callconv(lib.calling_conv) Status {
     const state = importer_ orelse return .invalid_handle;
+    if (terminal == null or terminal != state.terminal)
+        return .wrong_terminal;
     const zig_terminal = terminal_c.zigTerminal(terminal) orelse
         return .wrong_terminal;
     state.importer.abort(zig_terminal);

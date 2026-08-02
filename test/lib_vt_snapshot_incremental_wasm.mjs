@@ -68,6 +68,7 @@ const getI32 = (s, member) => view().getInt32(
   s.ptr + field(s.name, member), true);
 
 const SUCCESS = 0;
+const UNSUPPORTED_FEATURE = -1;
 const UNKNOWN_VERSION = -2;
 const OUT_OF_SPACE = -13;
 const CAPTURE_READY = 1;
@@ -91,6 +92,16 @@ assert.equal(e.ghostty_terminal_snapshot_incremental_capabilities(
   capabilities.ptr), SUCCESS);
 assert.equal(view().getUint8(
   capabilities.ptr + field(capabilities.name, "incremental")), 1);
+assert.equal(view().getUint8(
+  capabilities.ptr + field(capabilities.name, "authenticated_tokens")), 0);
+assert.equal(view().getUint8(
+  capabilities.ptr + field(capabilities.name, "bounded_units")), 0);
+const unavailableLease = struct("GhosttyTerminalHistoryLeaseResult");
+assert.equal(e.ghostty_terminal_history_lease_new(
+  0, source, 0, unavailableLease.ptr), UNSUPPORTED_FEATURE);
+assert.equal(view().getUint32(
+  unavailableLease.ptr + field(unavailableLease.name, "lease"), true), 0);
+dispose(unavailableLease);
 dispose(capabilities);
 
 const captureOptions = struct("GhosttyTerminalSnapshotCaptureOptions");

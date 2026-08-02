@@ -184,6 +184,10 @@ typedef struct {
  * Incremental ABI feature and identity metadata.
  *
  * `codec_identity` and `build_identity` are immutable library-owned strings.
+ * Standalone freestanding/wasm builds do not have a secure entropy source:
+ * `authenticated_tokens` and `bounded_units` are false there, and the
+ * history lease/importer constructors return UNSUPPORTED_FEATURE. Snapshot
+ * capture and READY/history stream decoding remain available.
  */
 typedef struct {
     size_t size;
@@ -418,7 +422,9 @@ ghostty_terminal_snapshot_decoder_abort(
 GHOSTTY_API void ghostty_terminal_snapshot_decoder_free(
     GhosttyTerminalSnapshotDecoder decoder);
 
-/** Acquire one engine-owned, generation-bound history cut. */
+/** Acquire one engine-owned, generation-bound history cut.
+ * Returns UNSUPPORTED_FEATURE when secure token entropy is unavailable.
+ */
 GHOSTTY_API GhosttyTerminalSnapshotStatus
 ghostty_terminal_history_lease_new(
     const GhosttyAllocator* allocator,
@@ -456,6 +462,7 @@ GHOSTTY_API void ghostty_terminal_history_cursor_free(
  * Create a transactional importer for units authenticated by `checkpoint`.
  * The source terminal and its lease must still be live; the destination owns
  * imported pages and may receive serialized live VT writes between pushes.
+ * Returns UNSUPPORTED_FEATURE when secure token entropy is unavailable.
  */
 GHOSTTY_API GhosttyTerminalSnapshotStatus
 ghostty_terminal_history_importer_new(

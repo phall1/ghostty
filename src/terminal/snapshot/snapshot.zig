@@ -128,12 +128,14 @@ pub fn validateSupportedState(t: *const Terminal) UnsupportedStateError!void {
 }
 
 /// Errors possible while encoding one complete terminal snapshot.
-pub const EncodeError = UnsupportedStateError ||
+pub const EncodeError = Allocator.Error ||
+    UnsupportedStateError ||
     terminal.EncodeError ||
     screen.EncodeError ||
     history.EncodeError ||
     checkpoint.EncodeError ||
-    continuation.EncodeError;
+    continuation.EncodeError ||
+    error{RecordLimitExceeded};
 
 pub const EncodeOptions = struct {
     continuation: Continuation,
@@ -190,6 +192,28 @@ pub const Encoder = struct {
             t,
             options,
             capabilities.default_encode_version,
+            null,
+        );
+    }
+
+    /// Initialize an encoder whose destination and per-record payload scratch
+    /// can never grow past `max_record_bytes`.
+    pub fn initLimited(
+        alloc: Allocator,
+        destination: *std.Io.Writer,
+        t: *const Terminal,
+        options: EncodeOptions,
+        max_record_bytes: usize,
+    ) EncodeError!Encoder {
+        if (max_record_bytes < record.Header.len)
+            return error.RecordLimitExceeded;
+        return initVersion(
+            alloc,
+            destination,
+            t,
+            options,
+            capabilities.default_encode_version,
+            max_record_bytes,
         );
     }
 
@@ -199,6 +223,7 @@ pub const Encoder = struct {
         t: *const Terminal,
         options: EncodeOptions,
         version: Version,
+        max_record_bytes: ?usize,
     ) EncodeError!Encoder {
         switch (version) {
             .v1 => switch (options.continuation) {
@@ -210,12 +235,20 @@ pub const Encoder = struct {
 
         try validateSupportedState(t);
 
+        const stream = if (max_record_bytes) |limit|
+            try record.Writer.initLimited(
+                alloc,
+                destination,
+                limit - record.Header.len,
+            )
+        else
+            record.Writer.init(alloc, destination);
         return .{
             .alloc = alloc,
             .terminal_ = t,
             .options = options,
             .version = version,
-            .stream = .init(alloc, destination),
+            .stream = stream,
         };
     }
 
@@ -346,6 +379,7 @@ fn encodeVersion(
         t,
         options,
         version,
+        null,
     );
     defer encoder.deinit();
     while (!encoder.finished()) _ = try encoder.next();
@@ -515,6 +549,7 @@ pub const Decoder = struct {
     history_key: TerminalScreenKey = .primary,
     imports: [2]?TerminalPageList.HistoryImport = .{ null, null },
     imported_prompt: [2]bool = .{ false, false },
+    last_consumed: usize = 0,
 
     pub fn init(
         alloc: Allocator,
@@ -542,6 +577,12 @@ pub const Decoder = struct {
         return self.expected_len - self.buffer.items.len;
     }
 
+    /// Bytes accepted from the most recent push when that push returned an
+    /// error after completing a bounded transition.
+    pub fn consumedOnError(self: *const Decoder) usize {
+        return self.last_consumed;
+    }
+
     /// Consume at most the bytes needed for one envelope or record.
     pub fn push(
         self: *Decoder,
@@ -555,6 +596,7 @@ pub const Decoder = struct {
             },
             else => {},
         }
+        self.last_consumed = 0;
 
         // The fixed envelope validates version dispatch before the decoder
         // performs its first allocation. Record staging begins only afterward.
@@ -566,6 +608,7 @@ pub const Decoder = struct {
                 input[0..consumed],
             );
             self.envelope_len += consumed;
+            self.last_consumed = consumed;
             if (self.envelope_len < envelope.encoded_len) {
                 return .{ .consumed = consumed, .event = .need_input };
             }
@@ -589,6 +632,7 @@ pub const Decoder = struct {
                 return err;
             };
         }
+        self.last_consumed = consumed;
 
         if (self.buffer.items.len < self.expected_len) {
             return .{ .consumed = consumed, .event = .need_input };
@@ -2447,6 +2491,28 @@ test "incremental decoder authenticates READY with every-byte fragmentation" {
     const after_finish = try decoder.push("pty");
     try testing.expectEqual(@as(usize, 0), after_finish.consumed);
     try testing.expect(std.meta.activeTag(after_finish.event) == .finish);
+}
+
+test "incremental decoder reports bytes consumed by a failed transition" {
+    const testing = std.testing;
+    var invalid = test_complete_v2_fixture;
+    invalid[8] = 0xFF;
+    invalid[9] = 0x7F;
+
+    var decoder: Decoder = .init(
+        testing.allocator,
+        testing.io,
+        test_decode_options,
+    );
+    defer decoder.deinit();
+    try testing.expectError(
+        error.UnsupportedVersion,
+        decoder.push(&invalid),
+    );
+    try testing.expectEqual(
+        envelope.encoded_len,
+        decoder.consumedOnError(),
+    );
 }
 
 test "incremental decoder rejects a forged READY digest" {
