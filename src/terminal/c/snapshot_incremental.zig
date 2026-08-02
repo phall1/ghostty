@@ -556,12 +556,12 @@ pub fn decoderPush(
             break :ready .ready;
         },
         .history_begin => |value| history: {
-            out.screen_key = @intFromEnum(value.key);
+            out.screen_key = @intCast(@intFromEnum(value.key));
             out.count = value.page_count;
             break :history .history_begin;
         },
         .history_page => |value| page: {
-            out.screen_key = @intFromEnum(value.key);
+            out.screen_key = @intCast(@intFromEnum(value.key));
             out.index = value.index;
             out.count = value.count;
             out.retained = value.retained;

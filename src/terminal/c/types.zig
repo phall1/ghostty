@@ -95,7 +95,7 @@ pub const structs: std.StaticStringMap(StructInfo) = structs: {
 
 /// The comptime-generated JSON string of all structs.
 pub const json: [:0]const u8 = json: {
-    @setEvalBranchQuota(100000);
+    @setEvalBranchQuota(500_000);
     var counter: std.Io.Writer.Discarding = .init(&.{});
     jsonWriteAll(&counter.writer) catch unreachable;
 
