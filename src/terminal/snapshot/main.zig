@@ -185,5 +185,6 @@ pub const decode = codec.decode;
 pub const decodeExact = codec.decodeExact;
 
 test {
+    _ = @import("fuzz.zig");
     @import("std").testing.refAllDecls(@This());
 }

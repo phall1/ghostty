@@ -190,6 +190,26 @@ pub fn build(b: *std.Build) !void {
         incremental_c_test.root_module.addObjectFile(libghostty_vt_static.output);
         const incremental_c_test_run = b.addRunArtifact(incremental_c_test);
         test_lib_vt_step.dependOn(&incremental_c_test_run.step);
+
+        const incremental_property_test = b.addExecutable(.{
+            .name = "lib-vt-snapshot-incremental-property-test",
+            .root_module = b.createModule(.{
+                .target = config.target,
+                .optimize = .Debug,
+                .link_libc = true,
+            }),
+        });
+        incremental_property_test.root_module.addIncludePath(b.path("include"));
+        incremental_property_test.root_module.addCSourceFile(.{
+            .file = b.path("test/lib_vt_snapshot_incremental_property.c"),
+            .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+        });
+        incremental_property_test.root_module.addObjectFile(
+            libghostty_vt_static.output,
+        );
+        const incremental_property_test_run =
+            b.addRunArtifact(incremental_property_test);
+        test_lib_vt_step.dependOn(&incremental_property_test_run.step);
     }
 
     // libghostty-vt xcframework (Apple only, universal binary).
