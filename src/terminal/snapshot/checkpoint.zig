@@ -93,7 +93,18 @@ pub fn decode(
         stream.source()
     else
         stream.reader();
+    try decodeExpected(kind, source, expected);
+}
 
+/// Decode one checkpoint record against an explicitly maintained prefix.
+///
+/// Incremental snapshot drivers use this after buffering exactly one record,
+/// while the complete stream adapter above derives the same digest internally.
+pub fn decodeExpected(
+    kind: Kind,
+    source: *std.Io.Reader,
+    expected: Digest,
+) DecodeError!void {
     var record_reader: record.Reader = undefined;
     try record_reader.init(source);
     if (record_reader.header.tag != kind.tag()) {

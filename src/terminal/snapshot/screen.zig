@@ -237,49 +237,81 @@ pub const EncodeError = PayloadEncodeError || page.EncodeError || error{
     PageCountOverflow,
 };
 
+/// Incremental encoder for one SCREEN record and its PAGE sequence.
+///
+/// Each call to `next` emits exactly one complete record. The source Screen
+/// must not be mutated until `finished` becomes true.
+pub const Encoder = struct {
+    screen: *const TerminalScreen,
+    key: TerminalScreenKey,
+    next_node: ?*TerminalPageList.List.Node,
+    page_count: u16,
+    header_pending: bool = true,
+
+    pub fn init(
+        terminal_screen: *const TerminalScreen,
+        key: TerminalScreenKey,
+    ) EncodeError!Encoder {
+        const first = terminal_screen.pages.getTopLeft(.active).node;
+        var page_count: usize = 0;
+        var node: ?*TerminalPageList.List.Node = first;
+        while (node) |current| : (node = current.next) page_count += 1;
+
+        return .{
+            .screen = terminal_screen,
+            .key = key,
+            .next_node = first,
+            .page_count = std.math.cast(
+                u16,
+                page_count,
+            ) orelse return error.PageCountOverflow,
+        };
+    }
+
+    pub fn finished(self: *const Encoder) bool {
+        return !self.header_pending and self.next_node == null;
+    }
+
+    /// Emit the next complete record in this sequence.
+    pub fn next(
+        self: *Encoder,
+        destination: *record.Writer,
+    ) EncodeError!void {
+        std.debug.assert(!self.finished());
+
+        if (self.header_pending) {
+            const payload = destination.begin(.screen);
+            errdefer destination.cancel();
+            try encodePayload(
+                self.screen,
+                self.key,
+                self.page_count,
+                payload,
+            );
+            try destination.finish();
+            self.header_pending = false;
+            return;
+        }
+
+        const current = self.next_node.?;
+        std.debug.assert(current.pageIfResident() != null);
+        try page.encode(current.pageAssumeResident(), destination);
+        self.next_node = current.next;
+    }
+};
+
 /// Encode one SCREEN and its minimal suffix of complete native pages.
 ///
 /// The suffix begins with the page containing the active area's first row and
 /// ends with the newest page. Completed records may already be emitted if a
 /// later record fails; the missing READY checkpoint makes that prefix invalid.
 pub fn encode(
-    screen: *const TerminalScreen,
+    terminal_screen: *const TerminalScreen,
     key: TerminalScreenKey,
     destination: *record.Writer,
 ) EncodeError!void {
-    // The active top may fall inside this page, leaving an incidental history
-    // prefix. Every earlier complete page is history and is omitted.
-    const first = screen.pages.getTopLeft(.active).node;
-    var page_count: usize = 0;
-    var node: ?@TypeOf(first) = first;
-    while (node) |current| : (node = current.next) page_count += 1;
-    const encoded_page_count = std.math.cast(
-        u16,
-        page_count,
-    ) orelse return error.PageCountOverflow;
-
-    // SCREEN declares exactly how many immediately following PAGE records
-    // belong to it.
-    {
-        const payload = destination.begin(.screen);
-        errdefer destination.cancel();
-        try encodePayload(
-            screen,
-            key,
-            encoded_page_count,
-            payload,
-        );
-        try destination.finish();
-    }
-
-    // PageList never compresses the active-boundary page or any later page.
-    // Encoding this resident suffix therefore does not restore cold history or
-    // otherwise mutate the source screen.
-    node = first;
-    while (node) |current| : (node = current.next) {
-        std.debug.assert(current.pageIfResident() != null);
-        try page.encode(current.pageAssumeResident(), destination);
-    }
+    var encoder = try Encoder.init(terminal_screen, key);
+    while (!encoder.finished()) try encoder.next(destination);
 }
 
 /// Errors possible while restoring a SCREEN and its declared PAGE sequence.
@@ -295,6 +327,9 @@ pub const DecodeError = PayloadDecodeError ||
 
         /// A SCREEN must declare at least one PAGE.
         InvalidPageCount,
+
+        /// The caller tried to finish before every declared PAGE arrived.
+        IncompletePageSequence,
     };
 
 /// One decoded SCREEN sequence and the native screen identified by its header.
@@ -311,91 +346,112 @@ pub const Decoded = struct {
     }
 };
 
-/// Restore one SCREEN and its declared PAGE records into native terminal state.
-///
-/// The caller supplies terminal-wide dimensions and policy. The record sequence
-/// is decoded transactionally: on failure, all page, pin, hyperlink, and
-/// temporary allocations are released and no partially restored Screen escapes.
-/// The returned key selects the ScreenSet slot that owns the decoded screen.
-pub fn decode(
-    source: *std.Io.Reader,
+/// Bounded record-at-a-time SCREEN sequence decoder.
+pub const Decoder = struct {
     io_: std.Io,
     alloc: Allocator,
     options: TerminalScreen.Options,
-) DecodeError!Decoded {
-    // Decode and finish the self-contained SCREEN record before consuming any
-    // of the PAGE records which follow it.
-    var record_reader: record.Reader = undefined;
-    try record_reader.init(source);
-    if (record_reader.header.tag != .screen) {
-        return error.UnexpectedRecordTag;
-    }
+    header: Header,
+    saved_cursor: ?SavedCursor,
+    cursor_hyperlink: CursorHyperlink,
+    builder: TerminalPageList.Builder,
+    pages_decoded: u16 = 0,
+    finished: bool = false,
 
-    // The optional saved cursor and cursor hyperlink are both part of the
-    // SCREEN payload. Keep ownership of the decoded hyperlink locally until it
-    // has been copied into the native Screen.
-    const payload_reader = record_reader.payloadReader();
-    const header = try Header.decode(payload_reader);
-    const saved_cursor = if (header.saved_cursor_present)
-        try SavedCursor.decode(payload_reader)
-    else
-        null;
-    var cursor_hyperlink = try decodeCursorHyperlink(
-        payload_reader,
-        alloc,
-    );
-    defer if (cursor_hyperlink) |*value| value.deinit(alloc);
-    try record_reader.finish();
+    /// Decode the SCREEN record and allocate only the empty native builder.
+    pub fn init(
+        source: *std.Io.Reader,
+        io_: std.Io,
+        alloc: Allocator,
+        options: TerminalScreen.Options,
+    ) DecodeError!Decoder {
+        var record_reader: record.Reader = undefined;
+        try record_reader.init(source);
+        if (record_reader.header.tag != .screen) {
+            return error.UnexpectedRecordTag;
+        }
 
-    const key = header.key;
-    if (header.page_count == 0) return error.InvalidPageCount;
+        const payload_reader = record_reader.payloadReader();
+        const header = try Header.decode(payload_reader);
+        const saved_cursor = if (header.saved_cursor_present)
+            try SavedCursor.decode(payload_reader)
+        else
+            null;
+        var cursor_hyperlink = try decodeCursorHyperlink(
+            payload_reader,
+            alloc,
+        );
+        errdefer if (cursor_hyperlink) |*value| value.deinit(alloc);
+        try record_reader.finish();
 
-    // Dimensions are terminal-wide state supplied by the enclosing snapshot.
-    // Validate them, and all cursor invariants which depend on them, before
-    // allocating the declared pages.
-    if (options.cols == 0 or options.rows == 0) {
-        return error.InvalidDimensions;
-    }
+        if (header.page_count == 0) return error.InvalidPageCount;
+        if (options.cols == 0 or options.rows == 0) {
+            return error.InvalidDimensions;
+        }
 
-    // Build the native page list transactionally. Alternate screens never
-    // retain scrollback, while primary screens inherit the caller's limits.
-    var result: TerminalScreen = result: {
-        var builder = try TerminalPageList.Builder.init(alloc, .{
+        const builder = try TerminalPageList.Builder.init(alloc, .{
             .cols = options.cols,
             .rows = options.rows,
-            .max_size = if (key == .alternate)
+            .max_size = if (header.key == .alternate)
                 0
             else
                 options.max_scrollback_bytes,
-            .max_lines = if (key == .alternate)
+            .max_lines = if (header.key == .alternate)
                 0
             else
                 options.max_scrollback_lines,
         });
-        defer builder.deinit();
 
-        // Allocate each PAGE at its declared capacity and decode directly into
-        // builder-owned storage, avoiding an intermediate page representation.
-        for (0..header.page_count) |_| {
-            var decoder: page.Decoder = undefined;
-            try decoder.init(source);
-            const native_page = try builder.allocatePage(decoder.capacity());
-            try decoder.decode(native_page, alloc);
-        }
+        return .{
+            .io_ = io_,
+            .alloc = alloc,
+            .options = options,
+            .header = header,
+            .saved_cursor = saved_cursor,
+            .cursor_hyperlink = cursor_hyperlink,
+            .builder = builder,
+        };
+    }
 
-        // Finishing validates that the decoded suffix covers the active area
-        // and establishes the PageList's active viewport.
-        var pages = try builder.finish();
+    pub fn deinit(self: *Decoder) void {
+        if (!self.finished) self.builder.deinit();
+        if (self.cursor_hyperlink) |*value| value.deinit(self.alloc);
+        self.cursor_hyperlink = null;
+        self.finished = true;
+    }
+
+    pub fn needsPage(self: *const Decoder) bool {
+        return self.pages_decoded < self.header.page_count;
+    }
+
+    /// Decode exactly one PAGE record into detached builder-owned storage.
+    pub fn decodePage(
+        self: *Decoder,
+        source: *std.Io.Reader,
+    ) DecodeError!void {
+        std.debug.assert(!self.finished);
+        std.debug.assert(self.needsPage());
+
+        var decoder: page.Decoder = undefined;
+        try decoder.init(source);
+        const native_page = try self.builder.allocatePage(decoder.capacity());
+        try decoder.decode(native_page, self.alloc);
+        self.pages_decoded += 1;
+    }
+
+    /// Validate the complete suffix and transfer the native Screen.
+    pub fn finish(self: *Decoder) DecodeError!Decoded {
+        if (self.needsPage()) return error.IncompletePageSequence;
+
+        var pages = try self.builder.finish();
         errdefer pages.deinit();
+        self.builder.deinit();
+        self.finished = true;
 
-        // Convert the payload-relative cursor position into the tracked native
-        // pin and page-local row/cell pointers required by TerminalScreen.
+        const header = self.header;
+        const options = self.options;
         const cursor: TerminalScreen.Cursor = cursor: {
             const y = @min(header.cursor_y, options.rows - 1);
-
-            // The active area can temporarily contain mixed-width pages after
-            // a reflow. Locate the row at column zero, then clamp the encoded
-            // x coordinate to the width of that physical page.
             const row_pin = pages.pin(.{ .active = .{ .y = y } }) orelse unreachable;
             const x = @min(header.cursor_x, row_pin.node.cols() - 1);
             const pin = try pages.trackPin(.{
@@ -423,16 +479,14 @@ pub fn decode(
             };
         };
 
-        // Assemble the remaining native state from stable snapshot registries.
-        // Derived state and page-local table references are repaired below.
-        break :result .{
-            .io = io_,
-            .alloc = alloc,
+        var result: TerminalScreen = .{
+            .io = self.io_,
+            .alloc = self.alloc,
             .pages = pages,
-            .no_scrollback = key == .alternate or
+            .no_scrollback = header.key == .alternate or
                 options.max_scrollback_bytes == 0,
             .cursor = cursor,
-            .saved_cursor = if (saved_cursor) |value|
+            .saved_cursor = if (self.saved_cursor) |value|
                 value.terminal()
             else
                 null,
@@ -444,78 +498,81 @@ pub fn decode(
                 .click = header.semantic_click,
             },
         };
-    };
-    errdefer result.deinit();
+        errdefer result.deinit();
 
-    // Reinsert the concrete cursor style into its page-local style table. This
-    // existing Screen path grows or splits the page when the decoded table is
-    // already full.
-    try result.manualStyleUpdate();
+        try result.manualStyleUpdate();
 
-    // Reinsert the cursor hyperlink into its page-local hyperlink table. For an
-    // implicit link, temporarily seed the counter with the encoded link ID,
-    // then restore the independent next-ID counter from the header.
-    if (cursor_hyperlink) |value| {
-        switch (value.id) {
-            .explicit => |id| try result.startHyperlink(value.uri, id),
-            .implicit => |id| {
-                result.cursor.hyperlink_implicit_id = id;
-                try result.startHyperlink(value.uri, null);
-                result.cursor.hyperlink_implicit_id =
-                    header.hyperlink_implicit_id;
-            },
+        if (self.cursor_hyperlink) |value| {
+            switch (value.id) {
+                .explicit => |id| try result.startHyperlink(value.uri, id),
+                .implicit => |id| {
+                    result.cursor.hyperlink_implicit_id = id;
+                    try result.startHyperlink(value.uri, null);
+                    result.cursor.hyperlink_implicit_id =
+                        header.hyperlink_implicit_id;
+                },
+            }
         }
-    }
+        if (self.cursor_hyperlink) |*value| value.deinit(self.alloc);
+        self.cursor_hyperlink = null;
 
-    // `seen` is derived state. Only resident prompt metadata participates
-    // because omitted history is outside the restored Screen model.
-    result.semantic_prompt.seen = seen: {
-        if (result.cursor.semantic_content == .prompt) break :seen true;
+        result.semantic_prompt.seen = seen: {
+            if (result.cursor.semantic_content == .prompt) break :seen true;
 
-        var node = result.pages.getTopLeft(.screen).node;
-        while (true) {
-            const native_page = node.pageAssumeResident();
-            const rows = native_page.rows.ptr(
-                native_page.memory,
-            )[0..native_page.size.rows];
-            for (rows) |row| {
-                if (row.semantic_prompt != .none) break :seen true;
-
-                const cells = row.cells.ptr(
+            var node = result.pages.getTopLeft(.screen).node;
+            while (true) {
+                const native_page = node.pageAssumeResident();
+                const rows = native_page.rows.ptr(
                     native_page.memory,
-                )[0..native_page.size.cols];
-                for (cells) |cell| {
-                    if (cell.semantic_content == .prompt) break :seen true;
+                )[0..native_page.size.rows];
+                for (rows) |row| {
+                    if (row.semantic_prompt != .none) break :seen true;
+
+                    const cells = row.cells.ptr(
+                        native_page.memory,
+                    )[0..native_page.size.cols];
+                    for (cells) |cell| {
+                        if (cell.semantic_content == .prompt) break :seen true;
+                    }
                 }
+
+                node = node.next orelse break :seen false;
             }
 
-            node = node.next orelse break :seen false;
+            unreachable;
+        };
+
+        if (comptime build_options.kitty_graphics) {
+            result.kitty_images.setLimit(
+                self.io_,
+                self.alloc,
+                &result,
+                options.kitty_image_storage_limit,
+            ) catch unreachable;
+            result.kitty_images.image_limits = options.kitty_image_loading_limits;
         }
 
-        unreachable;
-    };
-
-    // Kitty image payloads are outside this record, but the restored Screen
-    // must still receive the caller's terminal-wide storage policy.
-    if (comptime build_options.kitty_graphics) {
-        result.kitty_images.setLimit(
-            io_,
-            alloc,
-            &result,
-            options.kitty_image_storage_limit,
-        ) catch unreachable;
-        result.kitty_images.image_limits = options.kitty_image_loading_limits;
+        result.pages.assertIntegrity();
+        result.assertIntegrity();
+        return .{
+            .key = header.key,
+            .history_rows = header.history_rows,
+            .screen = result,
+        };
     }
+};
 
-    // All fallible reconstruction is complete; verify the native invariants
-    // before transferring ownership to the caller.
-    result.pages.assertIntegrity();
-    result.assertIntegrity();
-    return .{
-        .key = key,
-        .history_rows = header.history_rows,
-        .screen = result,
-    };
+/// Restore one SCREEN and its declared PAGE records into native terminal state.
+pub fn decode(
+    source: *std.Io.Reader,
+    io_: std.Io,
+    alloc: Allocator,
+    options: TerminalScreen.Options,
+) DecodeError!Decoded {
+    var decoder = try Decoder.init(source, io_, alloc, options);
+    defer decoder.deinit();
+    while (decoder.needsPage()) try decoder.decodePage(source);
+    return decoder.finish();
 }
 
 /// Errors possible while decoding fixed SCREEN payload fields.

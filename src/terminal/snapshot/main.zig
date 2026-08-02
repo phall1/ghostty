@@ -101,11 +101,13 @@
 //! const bytes = output.written();
 //! ```
 //!
-//! Encoding begins at the writer's current position, so unrelated bytes may
-//! precede the snapshot. The encoder buffers only the current record payload
-//! to calculate its length and CRC32C; completed records stream immediately
-//! and BLAKE3 checkpoint coverage is updated incrementally. Buffering is an
-//! encoder implementation detail, not a requirement of the wire format.
+//! `Encoder.next` emits at most one envelope or record per call and reports the
+//! authenticated READY boundary before it begins history. `snapshot.encode` is
+//! the blocking adapter over that same state machine. Encoding begins at the
+//! writer's current position, so unrelated bytes may precede the snapshot.
+//! Only the current record payload is buffered to calculate its length and
+//! CRC32C; completed records stream immediately and BLAKE3 checkpoint coverage
+//! is updated incrementally.
 //!
 //! A failure may leave prior complete records, or a partial record if the
 //! destination itself fails. Such a prefix has no valid FINISH checkpoint and
@@ -116,11 +118,12 @@
 //!
 //! ## Decoding
 //!
-//! `snapshot.decode` consumes exactly one snapshot through FINISH and leaves
-//! any following bytes unread. This permits multiple snapshots or live protocol
-//! data to share a stream without waiting for the peer to close it. Transports
-//! that deliver live PTY data before history finishes must multiplex that data
-//! outside this ordered snapshot record sequence.
+//! `Decoder.push` accepts arbitrary fragments, buffers at most one
+//! caller-bounded record, and publishes the authenticated Terminal exactly at
+//! READY through `takeReady`. The caller may attach its persistent Stream and
+//! serialize PTY writes between later history records. `snapshot.decode` is the
+//! blocking adapter and still consumes exactly one snapshot through FINISH,
+//! leaving following bytes unread.
 //!
 //! ```zig
 //! var decoded = try snapshot.decode(alloc, io, &reader, .{
@@ -156,8 +159,14 @@ pub const Capabilities = codec.Capabilities;
 pub const capabilities = codec.capabilities;
 pub const Continuation = codec.Continuation;
 pub const EncodeOptions = codec.EncodeOptions;
+pub const EncodeEvent = codec.EncodeEvent;
+pub const Encoder = codec.Encoder;
 pub const DecodeOptions = codec.DecodeOptions;
 pub const Decoded = codec.Decoded;
+pub const Ready = codec.Ready;
+pub const DecodeEvent = codec.DecodeEvent;
+pub const PushResult = codec.PushResult;
+pub const Decoder = codec.Decoder;
 pub const encode = codec.encode;
 pub const decode = codec.decode;
 pub const decodeExact = codec.decodeExact;

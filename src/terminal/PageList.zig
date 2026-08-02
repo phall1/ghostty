@@ -4337,6 +4337,126 @@ pub const PageAllocation = struct {
     }
 };
 
+/// Transactional owner for historical pages imported into a live PageList.
+///
+/// Imported pages are prepended and may be rendered immediately while normal
+/// terminal writes continue at the active end. Until `commit`, `deinit`
+/// removes every imported page which is still resident. Pages already evicted
+/// by configured scrollback limits are harmless and are ignored.
+pub const HistoryImport = struct {
+    destination: *PageList,
+    alloc: Allocator,
+    serials: []u64,
+    count: usize = 0,
+    active: bool = true,
+
+    pub fn init(
+        destination: *PageList,
+        alloc: Allocator,
+        max_pages: usize,
+    ) Allocator.Error!HistoryImport {
+        return .{
+            .destination = destination,
+            .alloc = alloc,
+            .serials = try alloc.alloc(u64, max_pages),
+        };
+    }
+
+    /// Prepend one completely decoded page.
+    ///
+    /// A page rejected only because the live PageList has reached its byte or
+    /// line limit is valid but not retained. No imported state is published for
+    /// that case.
+    pub fn prepend(
+        self: *HistoryImport,
+        allocation: *PageAllocation,
+    ) PageAllocation.FinalizeError!bool {
+        assert(self.active);
+        assert(self.count < self.serials.len);
+        const serial = allocation.node.?.serial;
+        allocation.finalize(.prepend) catch |err| switch (err) {
+            error.MaxSizeExceeded,
+            error.MaxLinesExceeded,
+            => return false,
+            else => return err,
+        };
+        self.serials[self.count] = serial;
+        self.count += 1;
+        return true;
+    }
+
+    /// Keep all successfully imported history.
+    pub fn commit(self: *HistoryImport) void {
+        assert(self.active);
+        self.active = false;
+    }
+
+    /// Remove surviving imported history without disturbing later live writes.
+    pub fn rollback(self: *HistoryImport) void {
+        if (!self.active) return;
+        self.active = false;
+
+        while (self.destination.pages.first) |node| {
+            if (!self.contains(node.serial)) break;
+            self.remove(node);
+        }
+        self.destination.assertIntegrity();
+    }
+
+    pub fn deinit(self: *HistoryImport) void {
+        self.rollback();
+        self.alloc.free(self.serials);
+        self.* = undefined;
+    }
+
+    fn contains(self: *const HistoryImport, serial: u64) bool {
+        var low: usize = 0;
+        var high = self.count;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            const candidate = self.serials[mid];
+            if (candidate < serial) {
+                low = mid + 1;
+            } else if (candidate > serial) {
+                high = mid;
+            } else {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn remove(self: *HistoryImport, node: *List.Node) void {
+        const destination = self.destination;
+        const replacement = node.next.?;
+        const removed_rows = node.rows();
+
+        if (destination.viewport == .pin) {
+            if (destination.viewport_pin.node == node) {
+                destination.viewport = .top;
+                destination.viewport_pin_row_offset = null;
+            } else if (destination.viewport_pin_row_offset) |*offset| {
+                offset.* -= removed_rows;
+            }
+        }
+
+        const pin_keys = destination.tracked_pins.keys();
+        for (pin_keys) |pin| {
+            if (pin.node != node) continue;
+            pin.node = replacement;
+            pin.x = 0;
+            pin.y = 0;
+            pin.garbage = true;
+        }
+        destination.viewport_pin.garbage = false;
+
+        destination.pages.remove(node);
+        destination.total_rows -= removed_rows;
+        destination.destroyNode(node);
+        destination.page_compression.markActivity();
+    }
+};
+
 /// Options for createPage and createPageExt.
 const CreatePage = struct {
     /// The capacity to allocate the page with.

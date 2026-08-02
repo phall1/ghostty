@@ -135,54 +135,79 @@ pub const EncodeError = Allocator.Error ||
         PageCountOverflow,
     };
 
-/// Encode one screen's HISTORY and its complete historical pages.
+/// Incremental encoder for one HISTORY record and its PAGE sequence.
 ///
-/// Pages are encoded newest-to-oldest. Compressed source pages are inspected
-/// without changing their storage state. Completed records may already be
-/// emitted if a later page fails.
+/// Each call to `next` emits one complete record. Pages are emitted
+/// newest-to-oldest so a decoder can prepend each page immediately.
+pub const Encoder = struct {
+    terminal_screen: *const TerminalScreen,
+    key: TerminalScreenKey,
+    next_node: ?*TerminalPageList.List.Node,
+    page_count: u32,
+    header_pending: bool = true,
+
+    pub fn init(
+        terminal_screen: *const TerminalScreen,
+        key: TerminalScreenKey,
+    ) EncodeError!Encoder {
+        const first = terminal_screen.pages.getTopLeft(.active).node.prev;
+        var page_count: usize = 0;
+        var node = first;
+        while (node) |current| : (node = current.prev) page_count += 1;
+
+        return .{
+            .terminal_screen = terminal_screen,
+            .key = key,
+            .next_node = first,
+            .page_count = std.math.cast(
+                u32,
+                page_count,
+            ) orelse return error.PageCountOverflow,
+        };
+    }
+
+    pub fn finished(self: *const Encoder) bool {
+        return !self.header_pending and self.next_node == null;
+    }
+
+    /// Emit the next complete record in the sequence.
+    pub fn next(
+        self: *Encoder,
+        destination: *record.Writer,
+    ) EncodeError!void {
+        std.debug.assert(!self.finished());
+
+        if (self.header_pending) {
+            const payload = destination.begin(.history);
+            errdefer destination.cancel();
+            const header: Header = .{
+                .key = self.key,
+                .page_count = self.page_count,
+            };
+            try header.encode(payload);
+            try destination.finish();
+            self.header_pending = false;
+            return;
+        }
+
+        const current = self.next_node.?;
+        var preserved = try current.pagePreservingState(
+            self.terminal_screen.alloc,
+        );
+        defer preserved.deinit();
+        try page.encode(preserved.page(), destination);
+        self.next_node = current.prev;
+    }
+};
+
+/// Encode one screen's HISTORY and its complete historical pages.
 pub fn encode(
     terminal_screen: *const TerminalScreen,
     key: TerminalScreenKey,
     destination: *record.Writer,
 ) EncodeError!void {
-    // SCREEN begins at the page containing the active area's first row. Its
-    // leading rows are already resident; every previous complete page belongs
-    // to this HISTORY sequence.
-    const first = terminal_screen.pages.getTopLeft(.active).node.prev;
-    const page_count: usize = count: {
-        var page_count: usize = 0;
-        var node = first;
-        while (node) |current| : (node = current.prev) {
-            page_count += 1;
-        }
-        break :count page_count;
-    };
-
-    const header: Header = .{
-        .key = key,
-        .page_count = std.math.cast(
-            u32,
-            page_count,
-        ) orelse return error.PageCountOverflow,
-    };
-
-    // HISTORY declares exactly how many PAGE records follow.
-    {
-        const payload = destination.begin(.history);
-        errdefer destination.cancel();
-        try header.encode(payload);
-        try destination.finish();
-    }
-
-    // Walk backward so each page can be prepended by the decoder immediately.
-    // PreservedPage borrows resident pages and clones compressed pages without
-    // changing the source node's representation.
-    var node = first;
-    while (node) |current| : (node = current.prev) {
-        var preserved = try current.pagePreservingState(terminal_screen.alloc);
-        defer preserved.deinit();
-        try page.encode(preserved.page(), destination);
-    }
+    var encoder = try Encoder.init(terminal_screen, key);
+    while (!encoder.finished()) try encoder.next(destination);
 }
 
 /// Errors possible while restoring one HISTORY and its PAGE sequence.
@@ -194,12 +219,9 @@ pub const DecodeError = Decoder.InitError ||
     };
 
 /// A decoded HISTORY manifest ready to restore its following PAGE records.
-///
-/// Keeping manifest decoding separate lets the full snapshot wrapper route a
-/// HISTORY sequence by its encoded key before any pages mutate a Screen.
 pub const Decoder = struct {
-    source: *std.Io.Reader,
     header: Header,
+    pages_decoded: u32 = 0,
 
     pub const InitError = Header.DecodeError ||
         record.Reader.InitError ||
@@ -226,52 +248,50 @@ pub const Decoder = struct {
         }
         const header = try Header.decode(record_reader.payloadReader());
         try record_reader.finish();
-        self.* = .{ .source = source, .header = header };
+        self.* = .{ .header = header };
     }
 
-    /// Restore the declared PAGE records into the selected native Screen.
-    pub fn decode(
+    pub fn needsPage(self: *const Decoder) bool {
+        return self.pages_decoded < self.header.page_count;
+    }
+
+    pub const PageResult = struct {
+        retained: bool,
+        contains_prompt: bool,
+    };
+
+    /// Restore one validated PAGE into a live transactional history import.
+    ///
+    /// The returned boolean reports whether the receiving PageList retained
+    /// the page under its configured byte and line limits.
+    pub fn decodePage(
         self: *Decoder,
+        source: *std.Io.Reader,
         alloc: Allocator,
         terminal_screen: *TerminalScreen,
-    ) RestoreError!void {
-        // A freshly restored SCREEN may carry overlap inside its first page,
-        // but cannot already contain a complete historical page before that
-        // boundary.
-        const active_top = terminal_screen.pages.getTopLeft(.active);
-        if (terminal_screen.pages.getTopLeft(.screen).node != active_top.node) {
-            return error.ExistingHistory;
-        }
+        import: *TerminalPageList.HistoryImport,
+    ) RestoreError!PageResult {
+        std.debug.assert(self.needsPage());
 
-        // Native row totals remain derived from the actual PAGE dimensions.
-        for (0..self.header.page_count) |_| {
-            // PAGE exposes its exact capacity before decoding the payload,
-            // allowing the destination PageList to allocate the final backing
-            // memory once.
-            var decoder: page.Decoder = undefined;
-            try decoder.init(self.source);
-            var allocation = try terminal_screen.pages.allocatePage(
-                decoder.capacity(),
-            );
-            defer allocation.deinit();
-            try decoder.decode(allocation.page(), alloc);
+        var decoder: page.Decoder = undefined;
+        try decoder.init(source);
+        var allocation = try terminal_screen.pages.allocatePage(
+            decoder.capacity(),
+        );
+        defer allocation.deinit();
+        try decoder.decode(allocation.page(), alloc);
+        const contains_prompt = hasSemanticPrompt(allocation.page());
 
-            const contains_prompt = hasSemanticPrompt(allocation.page());
-            try allocation.finalize(.prepend);
-            if (contains_prompt) terminal_screen.semantic_prompt.seen = true;
-        }
-
-        terminal_screen.pages.assertIntegrity();
-        terminal_screen.assertIntegrity();
+        const retained = try import.prepend(&allocation);
+        self.pages_decoded += 1;
+        return .{
+            .retained = retained,
+            .contains_prompt = retained and contains_prompt,
+        };
     }
 };
 
 /// Restore one HISTORY and its declared PAGE records into a native Screen.
-///
-/// Each PAGE is decoded directly into a detached PageList-pooled allocation and
-/// prepended only after its record and native integrity are validated. If a
-/// later PAGE fails, earlier successful pages remain as a contiguous recent
-/// history prefix.
 pub fn decode(
     source: *std.Io.Reader,
     alloc: Allocator,
@@ -281,7 +301,29 @@ pub fn decode(
     var decoder: Decoder = undefined;
     try decoder.init(source);
     if (decoder.header.key != expected_key) return error.UnexpectedScreenKey;
-    try decoder.decode(alloc, terminal_screen);
+
+    const active_top = terminal_screen.pages.getTopLeft(.active);
+    if (terminal_screen.pages.getTopLeft(.screen).node != active_top.node) {
+        return error.ExistingHistory;
+    }
+
+    var import = try TerminalPageList.HistoryImport.init(
+        &terminal_screen.pages,
+        alloc,
+        @as(usize, decoder.header.page_count),
+    );
+    var contains_prompt = false;
+    while (decoder.needsPage()) {
+        const result = try decoder.decodePage(
+            source,
+            alloc,
+            terminal_screen,
+            &import,
+        );
+        contains_prompt = contains_prompt or result.contains_prompt;
+    }
+    if (contains_prompt) terminal_screen.semantic_prompt.seen = true;
+    import.commit();
 }
 
 fn hasSemanticPrompt(terminal_page: *const TerminalPage) bool {
@@ -541,8 +583,8 @@ test "HISTORY encodes newest first and restores complete history" {
     truncated.pages.assertIntegrity();
     truncated.assertIntegrity();
 
-    // Corrupt only the older PAGE tag. A failure in a later PAGE keeps only
-    // the successfully prepended newer pages, contiguous with SCREEN.
+    // Corrupt only the older PAGE tag. The transactional import rolls back
+    // the successfully decoded newer page when the later record fails.
     std.mem.writeInt(
         u16,
         encoded[second_page_offset..][0..2],
@@ -574,11 +616,11 @@ test "HISTORY encodes newest first and restores complete history" {
         ),
     );
     try std.testing.expectEqual(
-        screen_page_count + 1,
+        screen_page_count,
         partial.pages.totalPages(),
     );
     try std.testing.expectEqual(
-        @as(u21, 'B'),
+        @as(u21, 'C'),
         partial.pages.getTopLeft(.screen).node
             .page().getRowAndCell(0, 0).cell.codepoint(),
     );

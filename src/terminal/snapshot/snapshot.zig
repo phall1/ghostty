@@ -17,6 +17,7 @@ const terminal_kitty = @import("../kitty.zig");
 const TerminalPageList = @import("../PageList.zig");
 const TerminalScreen = @import("../Screen.zig");
 const TerminalScreenKey = @import("../ScreenSet.zig").Key;
+const Blake3 = std.crypto.hash.Blake3;
 
 const test_complete_v1_fixture = test_fixture.parse(
     @embedFile("testdata/complete-v1.hex"),
@@ -27,6 +28,37 @@ const test_complete_v2_fixture = test_fixture.parse(
 
 const test_encode_options: EncodeOptions = .{ .continuation = .ground };
 const test_decode_options: DecodeOptions = .{ .max_continuation_bytes = 1024 };
+
+fn testRecordOffset(
+    bytes: []const u8,
+    expected_tag: record.Tag,
+    after_ready: bool,
+    occurrence: usize,
+) usize {
+    var offset: usize = envelope.encoded_len;
+    var seen_ready = false;
+    var found: usize = 0;
+    while (offset + record.Header.len <= bytes.len) {
+        const tag_raw = std.mem.readInt(
+            u16,
+            bytes[offset..][0..2],
+            .little,
+        );
+        const payload_len: usize = std.mem.readInt(
+            u32,
+            bytes[offset + 2 ..][0..4],
+            .little,
+        );
+        const tag = std.enums.fromInt(record.Tag, tag_raw) orelse unreachable;
+        if ((!after_ready or seen_ready) and tag == expected_tag) {
+            if (found == occurrence) return offset;
+            found += 1;
+        }
+        if (tag == .ready) seen_ready = true;
+        offset += record.Header.len + payload_len;
+    }
+    unreachable;
+}
 
 pub const Version = envelope.Version;
 
@@ -69,12 +101,182 @@ pub const EncodeOptions = struct {
     continuation: Continuation,
 };
 
-/// Encode one complete terminal snapshot using `capabilities.default_encode_version`.
+pub const EncodeEvent = enum {
+    /// One envelope or ordinary data record was emitted.
+    progress,
+
+    /// The authenticated active state and continuation are now complete.
+    ready,
+
+    /// FINISH was emitted. No further call to `next` is valid.
+    finish,
+};
+
+/// Bounded incremental complete-snapshot encoder.
 ///
-/// Encoding starts at the destination's current position. Only one record
-/// payload is buffered at a time; completed records stream immediately. On
-/// failure, the destination may contain a snapshot prefix without its required
-/// checkpoints, and an output failure may have written part of a record.
+/// Every call to `next` emits exactly one envelope or framed record. The
+/// Terminal and continuation bytes are borrowed and must remain immutable until
+/// FINISH or `deinit`.
+pub const Encoder = struct {
+    const State = enum {
+        envelope,
+        terminal,
+        screens,
+        continuation,
+        ready,
+        histories,
+        finish,
+        done,
+    };
+    const keys = [_]TerminalScreenKey{ .primary, .alternate };
+
+    alloc: Allocator,
+    terminal_: *const Terminal,
+    options: EncodeOptions,
+    version: Version,
+    stream: record.Writer,
+    state: State = .envelope,
+    key_index: usize = 0,
+    screen_encoder: ?screen.Encoder = null,
+    history_encoder: ?history.Encoder = null,
+
+    pub fn init(
+        alloc: Allocator,
+        destination: *std.Io.Writer,
+        t: *const Terminal,
+        options: EncodeOptions,
+    ) EncodeError!Encoder {
+        return initVersion(
+            alloc,
+            destination,
+            t,
+            options,
+            capabilities.default_encode_version,
+        );
+    }
+
+    fn initVersion(
+        alloc: Allocator,
+        destination: *std.Io.Writer,
+        t: *const Terminal,
+        options: EncodeOptions,
+        version: Version,
+    ) EncodeError!Encoder {
+        switch (version) {
+            .v1 => switch (options.continuation) {
+                .ground => {},
+                .bytes => unreachable,
+            },
+            .v2 => try continuation.validate(options.continuation),
+        }
+
+        return .{
+            .alloc = alloc,
+            .terminal_ = t,
+            .options = options,
+            .version = version,
+            .stream = .init(alloc, destination),
+        };
+    }
+
+    pub fn deinit(self: *Encoder) void {
+        self.stream.deinit();
+        self.* = undefined;
+    }
+
+    pub fn finished(self: *const Encoder) bool {
+        return self.state == .done;
+    }
+
+    /// Emit at most one unit of caller-controlled work.
+    pub fn next(self: *Encoder) EncodeError!EncodeEvent {
+        while (true) switch (self.state) {
+            .envelope => {
+                try envelope.encodeVersion(self.stream.writer(), self.version);
+                self.state = .terminal;
+                return .progress;
+            },
+            .terminal => {
+                try terminal.encode(self.terminal_, &self.stream);
+                self.state = .screens;
+                return .progress;
+            },
+            .screens => {
+                if (self.screen_encoder == null) {
+                    while (self.key_index < keys.len) {
+                        const key = keys[self.key_index];
+                        const value = self.terminal_.screens.get(key) orelse {
+                            self.key_index += 1;
+                            continue;
+                        };
+                        self.screen_encoder = try .init(value, key);
+                        break;
+                    }
+                    if (self.screen_encoder == null) {
+                        self.key_index = 0;
+                        self.state = .continuation;
+                        continue;
+                    }
+                }
+
+                var active = &self.screen_encoder.?;
+                try active.next(&self.stream);
+                if (active.finished()) {
+                    self.screen_encoder = null;
+                    self.key_index += 1;
+                }
+                return .progress;
+            },
+            .continuation => {
+                if (self.version == .v1) {
+                    self.state = .ready;
+                    continue;
+                }
+                try continuation.encode(self.options.continuation, &self.stream);
+                self.state = .ready;
+                return .progress;
+            },
+            .ready => {
+                try checkpoint.encode(.ready, &self.stream);
+                self.state = .histories;
+                return .ready;
+            },
+            .histories => {
+                if (self.history_encoder == null) {
+                    while (self.key_index < keys.len) {
+                        const key = keys[self.key_index];
+                        const value = self.terminal_.screens.get(key) orelse {
+                            self.key_index += 1;
+                            continue;
+                        };
+                        self.history_encoder = try .init(value, key);
+                        break;
+                    }
+                    if (self.history_encoder == null) {
+                        self.state = .finish;
+                        continue;
+                    }
+                }
+
+                var active = &self.history_encoder.?;
+                try active.next(&self.stream);
+                if (active.finished()) {
+                    self.history_encoder = null;
+                    self.key_index += 1;
+                }
+                return .progress;
+            },
+            .finish => {
+                try checkpoint.encode(.finish, &self.stream);
+                self.state = .done;
+                return .finish;
+            },
+            .done => unreachable,
+        };
+    }
+};
+
+/// Encode one complete terminal snapshot using the incremental state machine.
 pub fn encode(
     alloc: Allocator,
     destination: *std.Io.Writer,
@@ -90,8 +292,7 @@ pub fn encode(
     );
 }
 
-/// Version-selectable encoder kept private so public encoding has one
-/// unambiguous compatibility policy. Tests use v1 to freeze its legacy bytes.
+/// Version-selectable adapter kept private to freeze legacy v1 fixtures.
 fn encodeVersion(
     alloc: Allocator,
     destination: *std.Io.Writer,
@@ -99,59 +300,15 @@ fn encodeVersion(
     options: EncodeOptions,
     version: Version,
 ) EncodeError!void {
-    switch (version) {
-        .v1 => switch (options.continuation) {
-            .ground => {},
-            .bytes => unreachable,
-        },
-        .v2 => {
-            // Continuation errors must not emit even the snapshot envelope.
-            try continuation.validate(options.continuation);
-        },
-    }
-    // All version-specific input validation must precede the envelope.
-
-    var stream: record.Writer = .init(alloc, destination);
-    defer stream.deinit();
-
-    // 1. Envelope
-    try envelope.encodeVersion(stream.writer(), version);
-    // 2. Terminal
-    try terminal.encode(t, &stream);
-
-    // 3. Primary and alt screen
-    try screen.encode(
-        t.screens.get(.primary).?,
-        .primary,
-        &stream,
+    var encoder = try Encoder.initVersion(
+        alloc,
+        destination,
+        t,
+        options,
+        version,
     );
-    if (t.screens.get(.alternate)) |alternate| try screen.encode(
-        alternate,
-        .alternate,
-        &stream,
-    );
-
-    // 4. Version 2 adds standard Stream continuation before READY. Version 1
-    // proceeds directly to READY and therefore always restores at ground.
-    if (version == .v2) try continuation.encode(options.continuation, &stream);
-
-    // 5. Ready checkpoint.
-    try checkpoint.encode(.ready, &stream);
-
-    // 6. History
-    try history.encode(
-        t.screens.get(.primary).?,
-        .primary,
-        &stream,
-    );
-    if (t.screens.get(.alternate)) |alternate| try history.encode(
-        alternate,
-        .alternate,
-        &stream,
-    );
-
-    // 7. Finish
-    try checkpoint.encode(.finish, &stream);
+    defer encoder.deinit();
+    while (!encoder.finished()) _ = try encoder.next();
 }
 
 /// Errors possible while restoring one complete terminal snapshot.
@@ -173,12 +330,534 @@ pub const DecodeError = envelope.DecodeError ||
 
         /// More than one HISTORY names the same key.
         DuplicateHistory,
+
+        /// A record payload exceeds caller policy.
+        RecordLimitExceeded,
+
+        /// A declared PAGE sequence exceeds caller policy.
+        PageLimitExceeded,
+
+        /// History bytes arrived before the caller transferred READY.
+        ReadyNotTaken,
+
+        /// This decoder is no longer able to consume input.
+        DecoderTerminal,
     };
 
 pub const DecodeOptions = struct {
     /// Largest non-ground continuation the decoder may allocate and return.
     /// Set this to zero when only ground-state snapshots are acceptable.
     max_continuation_bytes: usize,
+
+    /// Largest payload accepted for any single framed record. The default
+    /// preserves the complete frozen grammar; streaming callers should set a
+    /// smaller transport policy.
+    max_record_bytes: usize = std.math.maxInt(u32),
+
+    /// Largest declared SCREEN or HISTORY page sequence. The default preserves
+    /// the complete frozen grammar; streaming callers should set a work bound.
+    max_pages: usize = std.math.maxInt(u32),
+};
+
+/// Ownership transferred exactly once at the authenticated READY boundary.
+pub const Ready = struct {
+    alloc: Allocator,
+    version: Version,
+    continuation: ?Continuation,
+
+    /// Replay the authenticated continuation exactly once against the Stream
+    /// already attached to the Terminal's final address.
+    pub fn replay(
+        self: *Ready,
+        stream: *TerminalStream,
+    ) !void {
+        const value = self.continuation orelse
+            return error.ContinuationAlreadyReplayed;
+        self.continuation = null;
+
+        switch (value) {
+            .ground => {},
+            .bytes => |bytes| {
+                defer self.alloc.free(bytes);
+                stream.nextSlice(bytes);
+
+                const verification = try self.alloc.alloc(u8, bytes.len);
+                defer self.alloc.free(verification);
+                var writer: std.Io.Writer = .fixed(verification);
+                try stream.writeContinuation(&writer);
+                if (!std.mem.eql(u8, bytes, writer.buffered())) {
+                    return error.ContinuationReplayMismatch;
+                }
+            },
+        }
+    }
+
+    /// Release an unreplayed continuation.
+    pub fn deinit(self: *Ready) void {
+        if (self.continuation) |value| switch (value) {
+            .ground => {},
+            .bytes => |bytes| self.alloc.free(bytes),
+        };
+        self.* = undefined;
+    }
+};
+
+pub const DecodeEvent = union(enum) {
+    need_input,
+    progress,
+    ready: Version,
+    history_begin: struct {
+        key: TerminalScreenKey,
+        page_count: u32,
+    },
+    history_page: struct {
+        key: TerminalScreenKey,
+        index: u32,
+        count: u32,
+        retained: bool,
+    },
+    finish,
+};
+
+pub const PushResult = struct {
+    consumed: usize,
+    event: DecodeEvent,
+};
+
+/// Bounded incremental decoder for one complete snapshot.
+///
+/// Input may be fragmented at any byte. Only the current record is retained,
+/// and its payload length is checked against `DecodeOptions.max_record_bytes`
+/// before payload bytes are copied.
+pub const Decoder = struct {
+    const State = enum {
+        envelope,
+        terminal,
+        screen,
+        screen_page,
+        continuation,
+        ready,
+        history,
+        history_page,
+        finish,
+        done,
+        failed,
+        aborted,
+    };
+
+    alloc: Allocator,
+    io_: std.Io,
+    options: DecodeOptions,
+    state: State = .envelope,
+    buffer: std.ArrayListUnmanaged(u8) = .empty,
+    expected_len: usize = envelope.encoded_len,
+    hasher: Blake3 = Blake3.init(.{}),
+    version: ?Version = null,
+    terminal_: ?Terminal = null,
+    live_terminal: ?*Terminal = null,
+    decoded_continuation: ?Continuation = null,
+    ready_available: bool = false,
+    ready_taken: bool = false,
+    screen_remaining: usize = 0,
+    screen_decoder: ?screen.Decoder = null,
+    screen_seen: [2]bool = .{ false, false },
+    history_seen: [2]bool = .{ false, false },
+    history_remaining: usize = 0,
+    history_decoder: ?history.Decoder = null,
+    history_key: TerminalScreenKey = .primary,
+    imports: [2]?TerminalPageList.HistoryImport = .{ null, null },
+    imported_prompt: [2]bool = .{ false, false },
+
+    pub fn init(
+        alloc: Allocator,
+        io_: std.Io,
+        options: DecodeOptions,
+    ) Decoder {
+        return .{
+            .alloc = alloc,
+            .io_ = io_,
+            .options = options,
+        };
+    }
+
+    /// Number of bytes required before the next bounded state transition.
+    pub fn bytesNeeded(self: *const Decoder) usize {
+        if (self.state == .done or
+            self.state == .failed or
+            self.state == .aborted)
+        {
+            return 0;
+        }
+        return self.expected_len - self.buffer.items.len;
+    }
+
+    /// Consume at most the bytes needed for one envelope or record.
+    pub fn push(
+        self: *Decoder,
+        input: []const u8,
+    ) DecodeError!PushResult {
+        switch (self.state) {
+            .done => return .{ .consumed = 0, .event = .finish },
+            .failed, .aborted => return error.DecoderTerminal,
+            .history, .history_page, .finish => {
+                if (!self.ready_taken) return error.ReadyNotTaken;
+            },
+            else => {},
+        }
+
+        const wanted = self.expected_len - self.buffer.items.len;
+        const consumed = @min(wanted, input.len);
+        if (consumed > 0) {
+            self.buffer.appendSlice(
+                self.alloc,
+                input[0..consumed],
+            ) catch |err| {
+                self.fail();
+                return err;
+            };
+        }
+
+        if (self.buffer.items.len < self.expected_len) {
+            return .{ .consumed = consumed, .event = .need_input };
+        }
+
+        if (self.state != .envelope and
+            self.expected_len == record.Header.len)
+        {
+            var header_source: std.Io.Reader = .fixed(self.buffer.items);
+            const header = record.Header.decode(&header_source) catch |err| {
+                self.fail();
+                return err;
+            };
+            const payload_len: usize = header.payload_len;
+            if (payload_len > self.options.max_record_bytes) {
+                self.fail();
+                return error.RecordLimitExceeded;
+            }
+            self.expected_len = record.Header.len + payload_len;
+            if (self.buffer.items.len < self.expected_len) {
+                return .{ .consumed = consumed, .event = .need_input };
+            }
+        }
+
+        const event = self.process(self.buffer.items) catch |err| {
+            self.fail();
+            return err;
+        };
+        self.buffer.clearRetainingCapacity();
+        if (self.state != .done) self.expected_len = record.Header.len;
+        return .{ .consumed = consumed, .event = event };
+    }
+
+    /// Move the READY Terminal exactly once into caller-owned final storage.
+    pub fn takeReady(
+        self: *Decoder,
+        destination: *Terminal,
+    ) error{ ReadyUnavailable, ReadyAlreadyTaken }!Ready {
+        if (!self.ready_available) return error.ReadyUnavailable;
+        if (self.ready_taken) return error.ReadyAlreadyTaken;
+
+        destination.* = self.terminal_.?;
+        self.terminal_ = null;
+        self.live_terminal = destination;
+        self.ready_taken = true;
+
+        const value = self.decoded_continuation.?;
+        self.decoded_continuation = null;
+        return .{
+            .alloc = self.alloc,
+            .version = self.version.?,
+            .continuation = value,
+        };
+    }
+
+    /// Abort decoding, rolling back uncommitted history and releasing all
+    /// decoder-owned state. A transferred READY Terminal remains caller-owned.
+    pub fn abort(self: *Decoder) void {
+        if (self.state == .aborted) return;
+        self.rollbackHistory();
+        if (self.screen_decoder) |*value| value.deinit();
+        self.screen_decoder = null;
+        if (self.terminal_) |*value| value.deinit(self.alloc);
+        self.terminal_ = null;
+        if (self.decoded_continuation) |value| switch (value) {
+            .ground => {},
+            .bytes => |bytes| self.alloc.free(bytes),
+        };
+        self.decoded_continuation = null;
+        self.buffer.clearRetainingCapacity();
+        self.state = .aborted;
+    }
+
+    pub fn deinit(self: *Decoder) void {
+        self.abort();
+        for (&self.imports) |*entry| {
+            if (entry.*) |*value| value.deinit();
+            entry.* = null;
+        }
+        self.buffer.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    fn process(
+        self: *Decoder,
+        bytes: []const u8,
+    ) DecodeError!DecodeEvent {
+        if (self.state == .envelope) {
+            var source: std.Io.Reader = .fixed(bytes);
+            self.version = try envelope.decode(&source);
+            self.hasher.update(bytes);
+            self.state = .terminal;
+            return .progress;
+        }
+
+        const state = self.state;
+        var source: std.Io.Reader = .fixed(bytes);
+        const event = switch (state) {
+            .terminal => try self.processTerminal(&source),
+            .screen => try self.processScreen(&source),
+            .screen_page => try self.processScreenPage(&source),
+            .continuation => try self.processContinuation(&source),
+            .ready => try self.processReady(&source),
+            .history => try self.processHistory(&source),
+            .history_page => try self.processHistoryPage(&source),
+            .finish => try self.processFinish(&source),
+            else => unreachable,
+        };
+        if (state != .finish) self.hasher.update(bytes);
+        return event;
+    }
+
+    fn processTerminal(
+        self: *Decoder,
+        source: *std.Io.Reader,
+    ) DecodeError!DecodeEvent {
+        var value = try terminal.decode(source, self.io_, self.alloc);
+        errdefer value.deinit(self.alloc);
+        self.screen_remaining = value.screens.all.count();
+        self.history_remaining = self.screen_remaining;
+        self.terminal_ = value;
+        self.state = .screen;
+        return .progress;
+    }
+
+    fn screenOptions(self: *Decoder) TerminalScreen.Options {
+        const value = &self.terminal_.?;
+        const primary = value.screens.get(.primary).?;
+        const explicit_bytes = primary.pages.limits.bytes.explicit;
+        const explicit_lines = primary.pages.limits.lines.explicit;
+        return .{
+            .cols = value.cols,
+            .rows = value.rows,
+            .max_scrollback_bytes = if (explicit_bytes == std.math.maxInt(usize))
+                null
+            else
+                explicit_bytes,
+            .max_scrollback_lines = if (explicit_lines == std.math.maxInt(usize))
+                null
+            else
+                explicit_lines,
+        };
+    }
+
+    fn processScreen(
+        self: *Decoder,
+        source: *std.Io.Reader,
+    ) DecodeError!DecodeEvent {
+        std.debug.assert(self.screen_remaining > 0);
+        var decoder = try screen.Decoder.init(
+            source,
+            self.io_,
+            self.alloc,
+            self.screenOptions(),
+        );
+        errdefer decoder.deinit();
+        if (@as(usize, decoder.header.page_count) > self.options.max_pages) {
+            return error.PageLimitExceeded;
+        }
+
+        const value = &self.terminal_.?;
+        if (value.screens.get(decoder.header.key) == null) {
+            return error.UnexpectedScreenKey;
+        }
+        const index = keyIndex(decoder.header.key);
+        if (self.screen_seen[index]) return error.DuplicateScreen;
+        self.screen_seen[index] = true;
+
+        self.screen_decoder = decoder;
+        self.state = .screen_page;
+        return .progress;
+    }
+
+    fn processScreenPage(
+        self: *Decoder,
+        source: *std.Io.Reader,
+    ) DecodeError!DecodeEvent {
+        var active = &self.screen_decoder.?;
+        try active.decodePage(source);
+        if (active.needsPage()) return .progress;
+
+        var decoded = try active.finish();
+        errdefer decoded.deinit();
+        active.deinit();
+        self.screen_decoder = null;
+
+        const value = &self.terminal_.?;
+        const slot = value.screens.get(decoded.key) orelse
+            return error.UnexpectedScreenKey;
+        slot.deinit();
+        slot.* = decoded.screen;
+        decoded.screen = undefined;
+
+        self.screen_remaining -= 1;
+        self.state = if (self.screen_remaining == 0)
+            if (self.version.? == .v2) .continuation else .ready
+        else
+            .screen;
+        return .progress;
+    }
+
+    fn processContinuation(
+        self: *Decoder,
+        source: *std.Io.Reader,
+    ) DecodeError!DecodeEvent {
+        self.decoded_continuation = try continuation.decode(
+            self.alloc,
+            source,
+            self.options.max_continuation_bytes,
+        );
+        self.state = .ready;
+        return .progress;
+    }
+
+    fn prefixDigest(self: *const Decoder) record.PrefixDigest {
+        var result: record.PrefixDigest = undefined;
+        self.hasher.final(&result);
+        return result;
+    }
+
+    fn processReady(
+        self: *Decoder,
+        source: *std.Io.Reader,
+    ) DecodeError!DecodeEvent {
+        if (self.version.? == .v1) self.decoded_continuation = .ground;
+        try checkpoint.decodeExpected(.ready, source, self.prefixDigest());
+        self.ready_available = true;
+        self.state = .history;
+        return .{ .ready = self.version.? };
+    }
+
+    fn processHistory(
+        self: *Decoder,
+        source: *std.Io.Reader,
+    ) DecodeError!DecodeEvent {
+        std.debug.assert(self.history_remaining > 0);
+
+        var decoder: history.Decoder = undefined;
+        try decoder.init(source);
+        if (@as(usize, decoder.header.page_count) > self.options.max_pages) {
+            return error.PageLimitExceeded;
+        }
+
+        const value = self.live_terminal.?;
+        const restored = value.screens.get(decoder.header.key) orelse
+            return error.UnexpectedHistoryKey;
+        const index = keyIndex(decoder.header.key);
+        if (self.history_seen[index]) return error.DuplicateHistory;
+        self.history_seen[index] = true;
+
+        self.imports[index] = try .init(
+            &restored.pages,
+            self.alloc,
+            @as(usize, decoder.header.page_count),
+        );
+        self.history_decoder = decoder;
+        self.history_key = decoder.header.key;
+
+        if (decoder.needsPage()) {
+            self.state = .history_page;
+        } else {
+            self.history_remaining -= 1;
+            self.state = if (self.history_remaining == 0) .finish else .history;
+        }
+
+        return .{ .history_begin = .{
+            .key = decoder.header.key,
+            .page_count = decoder.header.page_count,
+        } };
+    }
+
+    fn processHistoryPage(
+        self: *Decoder,
+        source: *std.Io.Reader,
+    ) DecodeError!DecodeEvent {
+        var decoder = &self.history_decoder.?;
+        const value = self.live_terminal.?;
+        const restored = value.screens.get(self.history_key).?;
+        const index = keyIndex(self.history_key);
+        const page_index = decoder.pages_decoded;
+        const result = try decoder.decodePage(
+            source,
+            self.alloc,
+            restored,
+            &self.imports[index].?,
+        );
+        self.imported_prompt[index] =
+            self.imported_prompt[index] or result.contains_prompt;
+
+        const event: DecodeEvent = .{ .history_page = .{
+            .key = self.history_key,
+            .index = page_index,
+            .count = decoder.header.page_count,
+            .retained = result.retained,
+        } };
+        if (!decoder.needsPage()) {
+            self.history_decoder = null;
+            self.history_remaining -= 1;
+            self.state = if (self.history_remaining == 0) .finish else .history;
+        }
+        return event;
+    }
+
+    fn processFinish(
+        self: *Decoder,
+        source: *std.Io.Reader,
+    ) DecodeError!DecodeEvent {
+        try checkpoint.decodeExpected(.finish, source, self.prefixDigest());
+        const value = self.live_terminal.?;
+        for (&self.imports, 0..) |*entry, index| {
+            if (entry.*) |*import| import.commit();
+            if (self.imported_prompt[index]) {
+                const key: TerminalScreenKey = if (index == 0)
+                    .primary
+                else
+                    .alternate;
+                if (value.screens.get(key)) |restored| {
+                    restored.semantic_prompt.seen = true;
+                }
+            }
+        }
+        self.state = .done;
+        return .finish;
+    }
+
+    fn fail(self: *Decoder) void {
+        self.rollbackHistory();
+        self.state = .failed;
+    }
+
+    fn rollbackHistory(self: *Decoder) void {
+        for (&self.imports) |*entry| {
+            if (entry.*) |*value| value.rollback();
+        }
+    }
+
+    fn keyIndex(key: TerminalScreenKey) usize {
+        return switch (key) {
+            .primary => 0,
+            .alternate => 1,
+        };
+    }
 };
 
 /// One complete decoded Terminal and the bytes needed to resume its Stream.
@@ -236,146 +915,68 @@ pub const Decoded = struct {
     }
 };
 
-/// Restore one complete snapshot into a native Terminal and continuation.
+/// Restore one complete snapshot through the bounded incremental decoder.
 ///
-/// This consumes one snapshot through FINISH and leaves any following bytes in
-/// the reader for the containing transport. Restoration is transactional: the
-/// returned result is either complete and ready or not (error return).
-/// Individual record codecs normalize optional semantic state, while framing,
-/// checkpoints, declared sequence counts, and unique cross-record screen
-/// routing remain strict.
+/// Reads are capped at the decoder's exact current need, so FINISH leaves
+/// following transport bytes untouched.
 pub fn decode(
     alloc: Allocator,
     io_: std.Io,
     source: *std.Io.Reader,
     options: DecodeOptions,
 ) DecodeError!Decoded {
-    // StreamReader owns a zero-buffer hashing adapter, making checkpoint
-    // boundaries part of its API rather than a caller-maintained invariant.
-    var stream: record.StreamReader = .init(source);
-    const reader = stream.reader();
+    var decoder: Decoder = .init(alloc, io_, options);
 
-    // Version dispatch completes before TERMINAL performs its first allocation.
-    const version = try envelope.decode(reader);
+    var restored: Terminal = undefined;
+    var restored_initialized = false;
+    errdefer if (restored_initialized) restored.deinit(alloc);
+    defer decoder.deinit();
 
-    // TERMINAL establishes terminal-wide state and allocates empty screen
-    // slots with their final routing. SCREEN values replace those slots in
-    // place so ScreenSet pointers, including the active pointer, stay valid.
-    var result = try terminal.decode(reader, io_, alloc);
-    errdefer result.deinit(alloc);
+    var ready: ?Ready = null;
+    defer if (ready) |*value| value.deinit();
 
-    // TERMINAL initializes exactly the number of screen slots it declared.
-    // Decode that many SCREEN sequences and route each one by its encoded key.
-    const screen_count = result.screens.all.count();
-    const screen_options: TerminalScreen.Options = options: {
-        const primary = result.screens.get(.primary).?;
-        const explicit_bytes = primary.pages.limits.bytes.explicit;
-        const explicit_lines = primary.pages.limits.lines.explicit;
-        break :options .{
-            .cols = result.cols,
-            .rows = result.rows,
-            .max_scrollback_bytes = if (explicit_bytes == std.math.maxInt(usize))
-                null
-            else
-                explicit_bytes,
-            .max_scrollback_lines = if (explicit_lines == std.math.maxInt(usize))
-                null
-            else
-                explicit_lines,
-        };
-    };
+    var input: [4096]u8 = undefined;
+    while (true) {
+        const needed = decoder.bytesNeeded();
+        std.debug.assert(needed > 0);
+        const len = @min(input.len, needed);
+        try source.readSliceAll(input[0..len]);
+        const pushed = try decoder.push(input[0..len]);
+        std.debug.assert(pushed.consumed == len);
 
-    for (0..screen_count) |_| {
-        var decoded = try screen.decode(
-            reader,
-            io_,
-            alloc,
-            screen_options,
-        );
-        errdefer decoded.deinit();
+        switch (pushed.event) {
+            .ready => {
+                ready = try decoder.takeReady(&restored);
+                restored_initialized = true;
+            },
+            .finish => {
+                const ready_value = &ready.?;
+                const decoded_continuation = ready_value.continuation.?;
+                ready_value.continuation = null;
+                const version = ready_value.version;
 
-        const slot = result.screens.get(decoded.key) orelse
-            return error.UnexpectedScreenKey;
+                if (comptime build_options.slow_runtime_safety) {
+                    for ([_]TerminalScreenKey{
+                        .primary,
+                        .alternate,
+                    }) |key| {
+                        const restored_screen =
+                            restored.screens.get(key) orelse continue;
+                        restored_screen.pages.assertIntegrity();
+                        restored_screen.assertIntegrity();
+                    }
+                }
 
-        // The fresh ScreenSet starts every declared slot at generation zero.
-        // Replacing a slot advances its generation, so a nonzero value means
-        // an earlier SCREEN in this snapshot already supplied the same key.
-        if (result.screens.generation(decoded.key) != 0) return error.DuplicateScreen;
-
-        slot.deinit();
-        slot.* = decoded.screen;
-        decoded.screen = undefined;
-
-        // We put an artificial generation in just so we can detect duplicates.
-        result.screens.generations.put(
-            decoded.key,
-            result.screens.generation(decoded.key) +% 1,
-        );
-    }
-
-    // Version 1 proceeds directly to READY and explicitly restores a ground
-    // stream. Version 2 requires CONTINUATION before READY. Keeping this switch
-    // here prevents either record order from being reinterpreted as the other.
-    const decoded_continuation: Continuation = switch (version) {
-        .v1 => .ground,
-        .v2 => try continuation.decode(
-            alloc,
-            reader,
-            options.max_continuation_bytes,
-        ),
-    };
-    errdefer switch (decoded_continuation) {
-        .ground => {},
-        .bytes => |bytes| alloc.free(bytes),
-    };
-
-    // READY covers the exact version-specific prefix: through the active
-    // SCREEN/PAGE sequences in v1, and through CONTINUATION in v2.
-    try checkpoint.decode(.ready, &stream);
-
-    // HISTORY keys make this sequence order-independent just like SCREEN.
-    // Although a decoder may publish recent pages as they validate, any later
-    // full-snapshot failure deinitializes the whole result.
-    for (0..screen_count) |_| {
-        var decoder: history.Decoder = undefined;
-        try decoder.init(reader);
-
-        const key = decoder.header.key;
-        const restored = result.screens.get(key) orelse
-            return error.UnexpectedHistoryKey;
-
-        // SCREEN routing advanced every decoded slot from generation zero to
-        // one. A value other than one means this key already received HISTORY.
-        if (result.screens.generation(key) != 1) {
-            return error.DuplicateHistory;
-        }
-
-        try decoder.decode(alloc, restored);
-        result.screens.generations.put(key, 2);
-    }
-
-    // FINISH authenticates READY and all history. Decode it directly from the
-    // underlying reader so the digest does not include FINISH itself.
-    try checkpoint.decode(.finish, &stream);
-
-    const keys = [_]TerminalScreenKey{ .primary, .alternate };
-    if (comptime build_options.slow_runtime_safety) {
-        for (keys) |key| {
-            const restored = result.screens.get(key) orelse continue;
-            restored.pages.assertIntegrity();
-            restored.assertIntegrity();
+                restored_initialized = false;
+                return .{
+                    .terminal = restored,
+                    .version = version,
+                    .continuation = decoded_continuation,
+                };
+            },
+            else => {},
         }
     }
-
-    // Generations are only scratch state while routing the two keyed sequence
-    // groups. The completed terminal has not escaped yet, so reset them to the
-    // same initial state as any newly constructed ScreenSet.
-    for (keys) |key| result.screens.generations.put(key, 0);
-    return .{
-        .terminal = result,
-        .version = version,
-        .continuation = decoded_continuation,
-    };
 }
 
 /// Errors possible while restoring a snapshot that must end at end-of-file.
@@ -1415,7 +2016,400 @@ test "complete snapshots decode sequentially from one reader" {
     try testing.expectError(error.EndOfStream, source.takeByte());
 }
 
-test "complete snapshot decode allocation failures are transactional" {
+test "incremental decoder authenticates READY with every-byte fragmentation" {
+    const testing = std.testing;
+    var decoder: Decoder = .init(
+        testing.allocator,
+        testing.io,
+        test_decode_options,
+    );
+    defer decoder.deinit();
+
+    var restored: Terminal = undefined;
+    var restored_owned = false;
+    defer if (restored_owned) restored.deinit(testing.allocator);
+    var ready: ?Ready = null;
+    defer if (ready) |*value| value.deinit();
+    var saw_finish = false;
+
+    for (test_complete_v2_fixture) |byte| {
+        const pushed = try decoder.push(&.{byte});
+        try testing.expectEqual(@as(usize, 1), pushed.consumed);
+        switch (pushed.event) {
+            .ready => |version| {
+                try testing.expectEqual(Version.v2, version);
+                ready = try decoder.takeReady(&restored);
+                restored_owned = true;
+
+                var duplicate: Terminal = undefined;
+                try testing.expectError(
+                    error.ReadyAlreadyTaken,
+                    decoder.takeReady(&duplicate),
+                );
+            },
+            .finish => saw_finish = true,
+            else => {},
+        }
+    }
+    try testing.expect(saw_finish);
+
+    // The incremental result re-encodes to the frozen public v2 grammar.
+    var reencoded: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer reencoded.deinit();
+    var incremental_encoder = try Encoder.init(
+        testing.allocator,
+        &reencoded.writer,
+        &restored,
+        .{ .continuation = ready.?.continuation.? },
+    );
+    defer incremental_encoder.deinit();
+    const ready_offset = testRecordOffset(
+        &test_complete_v2_fixture,
+        .ready,
+        false,
+        0,
+    );
+    const ready_payload_len: usize = std.mem.readInt(
+        u32,
+        test_complete_v2_fixture[ready_offset + 2 ..][0..4],
+        .little,
+    );
+    var encoder_saw_ready = false;
+    while (!incremental_encoder.finished()) {
+        const event = try incremental_encoder.next();
+        if (event == .ready) {
+            encoder_saw_ready = true;
+            try testing.expectEqual(
+                ready_offset + record.Header.len + ready_payload_len,
+                reencoded.written().len,
+            );
+        }
+    }
+    try testing.expect(encoder_saw_ready);
+    try testing.expectEqualSlices(
+        u8,
+        &test_complete_v2_fixture,
+        reencoded.written(),
+    );
+
+    var stream = TerminalStream.init(.{
+        .allocator = testing.allocator,
+        .handler = .init(&restored),
+        .continuation_max_bytes = 1024,
+    });
+    defer stream.deinit();
+    try ready.?.replay(&stream);
+    try testing.expectError(
+        error.ContinuationAlreadyReplayed,
+        ready.?.replay(&stream),
+    );
+
+    // FINISH is terminal and leaves every following transport byte untouched.
+    const after_finish = try decoder.push("pty");
+    try testing.expectEqual(@as(usize, 0), after_finish.consumed);
+    try testing.expect(std.meta.activeTag(after_finish.event) == .finish);
+}
+
+test "incremental decoder rejects a forged READY digest" {
+    const testing = std.testing;
+    var invalid = test_complete_v2_fixture;
+    const offset = testRecordOffset(&invalid, .ready, false, 0);
+    const payload_len: usize = std.mem.readInt(
+        u32,
+        invalid[offset + 2 ..][0..4],
+        .little,
+    );
+    invalid[offset + record.Header.len] ^= 0x80;
+
+    var checksum: record.Checksum = .init(.ready, @intCast(payload_len));
+    try checksum.writer().writeAll(
+        invalid[offset + record.Header.len ..][0..payload_len],
+    );
+    std.mem.writeInt(
+        u32,
+        invalid[offset + 6 ..][0..4],
+        checksum.final(),
+        .little,
+    );
+
+    var source: std.Io.Reader = .fixed(&invalid);
+    try testing.expectError(
+        error.InvalidDigest,
+        decode(
+            testing.allocator,
+            testing.io,
+            &source,
+            test_decode_options,
+        ),
+    );
+}
+
+test "incremental history accepts serialized VT writes between pages" {
+    const testing = std.testing;
+    var decoder: Decoder = .init(
+        testing.allocator,
+        testing.io,
+        test_decode_options,
+    );
+    defer decoder.deinit();
+
+    var restored: Terminal = undefined;
+    var restored_owned = false;
+    defer if (restored_owned) restored.deinit(testing.allocator);
+    var ready: ?Ready = null;
+    defer if (ready) |*value| value.deinit();
+    var stream: ?TerminalStream = null;
+    defer if (stream) |*value| value.deinit();
+
+    var offset: usize = 0;
+    var history_pages: usize = 0;
+    var saw_finish = false;
+    while (offset < test_complete_v2_fixture.len) {
+        const pushed = try decoder.push(test_complete_v2_fixture[offset..]);
+        try testing.expect(pushed.consumed > 0);
+        offset += pushed.consumed;
+
+        switch (pushed.event) {
+            .ready => {
+                ready = try decoder.takeReady(&restored);
+                restored_owned = true;
+                stream = TerminalStream.init(.{
+                    .allocator = testing.allocator,
+                    .handler = .init(&restored),
+                    .continuation_max_bytes = 1024,
+                });
+                try ready.?.replay(&stream.?);
+            },
+            .history_page => {
+                history_pages += 1;
+                if (history_pages == 1) {
+                    stream.?.nextSlice("\x1b]2;LIVE\x07");
+                }
+            },
+            .finish => saw_finish = true,
+            else => {},
+        }
+    }
+
+    try testing.expect(history_pages >= 2);
+    try testing.expect(saw_finish);
+    try testing.expectEqualStrings("LIVE", restored.getTitle().?);
+}
+
+test "malformed and truncated post-READY history are isolated" {
+    const testing = std.testing;
+    const second_page = testRecordOffset(
+        &test_complete_v2_fixture,
+        .page,
+        true,
+        1,
+    );
+
+    // A later malformed PAGE rolls back an earlier validated import while
+    // preserving PTY writes serialized between the two page arrivals.
+    {
+        var invalid = test_complete_v2_fixture;
+        std.mem.writeInt(
+            u16,
+            invalid[second_page..][0..2],
+            @intFromEnum(record.Tag.screen),
+            .little,
+        );
+
+        var decoder: Decoder = .init(
+            testing.allocator,
+            testing.io,
+            test_decode_options,
+        );
+        defer decoder.deinit();
+        var restored: Terminal = undefined;
+        var restored_owned = false;
+        defer if (restored_owned) restored.deinit(testing.allocator);
+        var ready: ?Ready = null;
+        defer if (ready) |*value| value.deinit();
+        var stream: ?TerminalStream = null;
+        defer if (stream) |*value| value.deinit();
+        var ready_page_count: usize = 0;
+        var offset: usize = 0;
+        var saw_first_history = false;
+        var saw_error = false;
+
+        while (offset < invalid.len) {
+            const pushed = decoder.push(invalid[offset..]) catch |err| {
+                try testing.expectEqual(error.UnexpectedRecordTag, err);
+                saw_error = true;
+                break;
+            };
+            offset += pushed.consumed;
+            switch (pushed.event) {
+                .ready => {
+                    ready = try decoder.takeReady(&restored);
+                    restored_owned = true;
+                    ready_page_count =
+                        restored.screens.get(.primary).?.pages.totalPages();
+                    stream = TerminalStream.init(.{
+                        .allocator = testing.allocator,
+                        .handler = .init(&restored),
+                        .continuation_max_bytes = 1024,
+                    });
+                    try ready.?.replay(&stream.?);
+                    stream.?.nextSlice("\x1b]2;pre\x07");
+                },
+                .history_page => {
+                    saw_first_history = true;
+                    stream.?.nextSlice("\x1b]2;mid\x07");
+                },
+                else => {},
+            }
+        }
+
+        try testing.expect(saw_error);
+        try testing.expect(saw_first_history);
+        try testing.expectEqual(
+            ready_page_count,
+            restored.screens.get(.primary).?.pages.totalPages(),
+        );
+        try testing.expectEqualStrings("mid", restored.getTitle().?);
+    }
+
+    // A forged FINISH rolls back every page published after READY.
+    {
+        var invalid = test_complete_v2_fixture;
+        const finish_offset = testRecordOffset(&invalid, .finish, false, 0);
+        const payload_len: usize = std.mem.readInt(
+            u32,
+            invalid[finish_offset + 2 ..][0..4],
+            .little,
+        );
+        invalid[finish_offset + record.Header.len] ^= 0x40;
+        var checksum: record.Checksum = .init(.finish, @intCast(payload_len));
+        try checksum.writer().writeAll(
+            invalid[finish_offset + record.Header.len ..][0..payload_len],
+        );
+        std.mem.writeInt(
+            u32,
+            invalid[finish_offset + 6 ..][0..4],
+            checksum.final(),
+            .little,
+        );
+
+        var decoder: Decoder = .init(
+            testing.allocator,
+            testing.io,
+            test_decode_options,
+        );
+        defer decoder.deinit();
+        var restored: Terminal = undefined;
+        var restored_owned = false;
+        defer if (restored_owned) restored.deinit(testing.allocator);
+        var ready: ?Ready = null;
+        defer if (ready) |*value| value.deinit();
+        var ready_page_count: usize = 0;
+        var offset: usize = 0;
+        var saw_error = false;
+        while (offset < invalid.len) {
+            const pushed = decoder.push(invalid[offset..]) catch |err| {
+                try testing.expectEqual(error.InvalidDigest, err);
+                saw_error = true;
+                break;
+            };
+            offset += pushed.consumed;
+            if (std.meta.activeTag(pushed.event) == .ready) {
+                ready = try decoder.takeReady(&restored);
+                restored_owned = true;
+                ready_page_count =
+                    restored.screens.get(.primary).?.pages.totalPages();
+            }
+        }
+        try testing.expect(saw_error);
+        try testing.expectEqual(
+            ready_page_count,
+            restored.screens.get(.primary).?.pages.totalPages(),
+        );
+    }
+
+    // Aborting with a later PAGE fragment buffered performs the same rollback.
+    {
+        const cutoff = second_page + record.Header.len + 1;
+        var decoder: Decoder = .init(
+            testing.allocator,
+            testing.io,
+            test_decode_options,
+        );
+        defer decoder.deinit();
+        var restored: Terminal = undefined;
+        var restored_owned = false;
+        defer if (restored_owned) restored.deinit(testing.allocator);
+        var ready: ?Ready = null;
+        defer if (ready) |*value| value.deinit();
+        var ready_page_count: usize = 0;
+        var offset: usize = 0;
+        while (offset < cutoff) {
+            const pushed = try decoder.push(
+                test_complete_v2_fixture[offset..cutoff],
+            );
+            try testing.expect(pushed.consumed > 0);
+            offset += pushed.consumed;
+            if (std.meta.activeTag(pushed.event) == .ready) {
+                ready = try decoder.takeReady(&restored);
+                restored_owned = true;
+                ready_page_count =
+                    restored.screens.get(.primary).?.pages.totalPages();
+            }
+        }
+        decoder.abort();
+        try testing.expectEqual(
+            ready_page_count,
+            restored.screens.get(.primary).?.pages.totalPages(),
+        );
+    }
+}
+
+test "incremental decoder enforces caller bounds and one-record work" {
+    const testing = std.testing;
+
+    var decoder: Decoder = .init(
+        testing.allocator,
+        testing.io,
+        test_decode_options,
+    );
+    defer decoder.deinit();
+    const first = try decoder.push(&test_complete_v2_fixture);
+    try testing.expectEqual(envelope.encoded_len, first.consumed);
+    try testing.expect(std.meta.activeTag(first.event) == .progress);
+    try testing.expectEqual(@as(usize, 0), decoder.buffer.items.len);
+
+    var record_limited: std.Io.Reader = .fixed(&test_complete_v2_fixture);
+    try testing.expectError(
+        error.RecordLimitExceeded,
+        decode(
+            testing.allocator,
+            testing.io,
+            &record_limited,
+            .{
+                .max_continuation_bytes = 1024,
+                .max_record_bytes = 1,
+            },
+        ),
+    );
+
+    var page_limited: std.Io.Reader = .fixed(&test_complete_v2_fixture);
+    try testing.expectError(
+        error.PageLimitExceeded,
+        decode(
+            testing.allocator,
+            testing.io,
+            &page_limited,
+            .{
+                .max_continuation_bytes = 1024,
+                .max_pages = 1,
+            },
+        ),
+    );
+}
+
+
+test "incremental complete decode allocation failures are transactional" {
     const testing = std.testing;
     const S = struct {
         fn exercise(bytes: []const u8) !void {
