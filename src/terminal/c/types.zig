@@ -17,6 +17,7 @@ const formatter = @import("formatter.zig");
 const selection = @import("selection.zig");
 const selection_gesture = @import("selection_gesture.zig");
 const snapshot = @import("snapshot.zig");
+const snapshot_incremental = @import("snapshot_incremental.zig");
 const render = @import("render.zig");
 const style_c = @import("style.zig");
 const mouse_encode = @import("mouse_encode.zig");
@@ -74,6 +75,20 @@ pub const structs: std.StaticStringMap(StructInfo) = structs: {
         .{ "GhosttyTerminalScrollbar", StructInfo.init(terminal.TerminalScrollbar) },
         .{ "GhosttyTerminalScrollViewport", StructInfo.init(terminal.ScrollViewport) },
         .{ "GhosttyTerminalSnapshot", StructInfo.init(snapshot.Encoded) },
+        .{ "GhosttyTerminalSnapshotCapabilities", StructInfo.init(snapshot.Capabilities) },
+        .{ "GhosttyTerminalSnapshotIncrementalCapabilities", StructInfo.init(snapshot_incremental.Capabilities) },
+        .{ "GhosttyTerminalSnapshotCaptureOptions", StructInfo.init(snapshot_incremental.CaptureOptions) },
+        .{ "GhosttyTerminalSnapshotCaptureEvent", StructInfo.init(snapshot_incremental.CaptureEvent) },
+        .{ "GhosttyTerminalSnapshotDecoderOptions", StructInfo.init(snapshot_incremental.DecoderOptions) },
+        .{ "GhosttyTerminalSnapshotDecodeEvent", StructInfo.init(snapshot_incremental.DecodeEvent) },
+        .{ "GhosttyTerminalSnapshotTakeTerminalResult", StructInfo.init(snapshot_incremental.TakeTerminalResult) },
+        .{ "GhosttyTerminalHistoryToken", StructInfo.init(snapshot_incremental.Token) },
+        .{ "GhosttyTerminalHistoryOptions", StructInfo.init(snapshot_incremental.HistoryOptions) },
+        .{ "GhosttyTerminalHistoryLeaseResult", StructInfo.init(snapshot_incremental.HistoryLeaseResult) },
+        .{ "GhosttyTerminalHistoryCursorResult", StructInfo.init(snapshot_incremental.HistoryCursorResult) },
+        .{ "GhosttyTerminalHistoryEvent", StructInfo.init(snapshot_incremental.HistoryEvent) },
+        .{ "GhosttyTerminalHistoryImporterResult", StructInfo.init(snapshot_incremental.HistoryImporterResult) },
+        .{ "GhosttyTerminalHistoryImportEvent", StructInfo.init(snapshot_incremental.HistoryImportEvent) },
         .{ "GhosttyTerminalSnapshotDecodeResult", StructInfo.init(snapshot.DecodeResult) },
     });
 };

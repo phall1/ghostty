@@ -404,6 +404,22 @@ pub fn writeSnapshotContinuation(
     try wrapper.stream.writeContinuation(writer);
 }
 
+pub fn terminalIo(terminal_: Terminal) ?std.Io {
+    const wrapper = terminal_ orelse return null;
+    return if (comptime builtin.os.tag != .freestanding)
+        wrapper.io_impl.io()
+    else
+        std.Io.failing;
+}
+
+pub fn replaySnapshotContinuation(
+    terminal_: Terminal,
+    ready: *snapshot_codec.Ready,
+) !void {
+    const wrapper = terminal_ orelse return error.InvalidValue;
+    try ready.replay(&wrapper.stream);
+}
+
 /// Owns the persistent I/O implementation needed while transactionally
 /// decoding a terminal snapshot. Ownership transfers to the restored wrapper
 /// only after the terminal and its stream continuation are complete.
@@ -422,6 +438,45 @@ pub const SnapshotDecodeContext = struct {
         return .{
             .alloc = alloc,
             .io_impl = io_impl,
+        };
+    }
+
+    pub const ReadyTransfer = struct {
+        terminal: Terminal,
+        ready: snapshot_codec.Ready,
+    };
+
+    /// Transfer an authenticated incremental READY terminal into the same
+    /// persistent C wrapper used by ordinary terminal construction. The stream
+    /// is attached at the terminal's final address before continuation replay.
+    pub fn restoreReady(
+        self: *SnapshotDecodeContext,
+        decoder: *snapshot_codec.Decoder,
+    ) !ReadyTransfer {
+        const t = try self.alloc.create(ZigTerminal);
+        errdefer self.alloc.destroy(t);
+        const wrapper = try self.alloc.create(TerminalWrapper);
+        errdefer self.alloc.destroy(wrapper);
+
+        var ready = try decoder.takeReady(t);
+        errdefer ready.deinit();
+        errdefer t.deinit(self.alloc);
+        wrapper.* = .{
+            .terminal = t,
+            .io_impl = self.io_impl,
+            .tmp_dir_path = undefined,
+            .stream = Stream.init(.{
+                .allocator = self.alloc,
+                .handler = streamHandler(t),
+                .continuation_max_bytes = snapshot_continuation_max_bytes,
+            }),
+        };
+        errdefer wrapper.stream.deinit();
+
+        self.transferred = true;
+        return .{
+            .terminal = wrapper,
+            .ready = ready,
         };
     }
 

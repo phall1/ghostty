@@ -96,6 +96,21 @@ typedef enum GHOSTTY_ENUM_TYPED {
  */
 typedef struct GhosttyTerminalImpl* GhosttyTerminal;
 
+/** Opaque incremental snapshot capture state. */
+typedef struct GhosttyTerminalSnapshotCaptureImpl* GhosttyTerminalSnapshotCapture;
+
+/** Opaque incremental snapshot decoder state. */
+typedef struct GhosttyTerminalSnapshotDecoderImpl* GhosttyTerminalSnapshotDecoder;
+
+/** Opaque generation-bound terminal history lease. */
+typedef struct GhosttyTerminalHistoryLeaseImpl* GhosttyTerminalHistoryLease;
+
+/** Opaque newest-to-oldest terminal history cursor. */
+typedef struct GhosttyTerminalHistoryCursorImpl* GhosttyTerminalHistoryCursor;
+
+/** Opaque transactional terminal history importer. */
+typedef struct GhosttyTerminalHistoryImporterImpl* GhosttyTerminalHistoryImporter;
+
 /**
  * Opaque handle to a tracked grid reference.
  *

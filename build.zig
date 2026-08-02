@@ -69,6 +69,10 @@ pub fn build(b: *std.Build) !void {
         "test-lib-vt",
         "Run libghostty-vt tests",
     );
+    const test_lib_vt_wasm_smoke_step = b.step(
+        "test-lib-vt-wasm-smoke",
+        "Run standalone Node smoke against ghostty-vt.wasm",
+    );
     const test_valgrind_step = b.step(
         "test-valgrind",
         "Run tests under valgrind",
@@ -129,6 +133,19 @@ pub fn build(b: *std.Build) !void {
         );
     };
     libghostty_vt_shared.install(b.getInstallStep());
+    if (config.target.result.cpu.arch.isWasm()) {
+        const wasm_smoke = b.addSystemCommand(&.{
+            "node",
+            "test/lib_vt_snapshot_incremental_wasm.mjs",
+        });
+        wasm_smoke.addFileArg(libghostty_vt_shared.output);
+        test_lib_vt_wasm_smoke_step.dependOn(&wasm_smoke.step);
+    } else {
+        try test_lib_vt_wasm_smoke_step.addError(
+            "test-lib-vt-wasm-smoke requires -Dtarget=wasm32-freestanding",
+            .{},
+        );
+    }
 
     // libghostty-vt static lib
     const libghostty_vt_static = try buildpkg.GhosttyLibVt.initStatic(
@@ -151,6 +168,28 @@ pub fn build(b: *std.Build) !void {
             libghostty_vt_static.output,
             static_lib_name,
         ).step);
+    }
+
+    // Pure C contract test for the callback-free incremental snapshot/history
+    // ABI. This deliberately links the installed-form static archive rather
+    // than importing Zig declarations, so header and symbol drift fails here.
+    if (!config.target.result.cpu.arch.isWasm()) {
+        const incremental_c_test = b.addExecutable(.{
+            .name = "lib-vt-snapshot-incremental-c-test",
+            .root_module = b.createModule(.{
+                .target = config.target,
+                .optimize = .Debug,
+                .link_libc = true,
+            }),
+        });
+        incremental_c_test.root_module.addIncludePath(b.path("include"));
+        incremental_c_test.root_module.addCSourceFile(.{
+            .file = b.path("test/lib_vt_snapshot_incremental.c"),
+            .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+        });
+        incremental_c_test.root_module.addObjectFile(libghostty_vt_static.output);
+        const incremental_c_test_run = b.addRunArtifact(incremental_c_test);
+        test_lib_vt_step.dependOn(&incremental_c_test_run.step);
     }
 
     // libghostty-vt xcframework (Apple only, universal binary).
