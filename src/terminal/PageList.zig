@@ -4496,9 +4496,15 @@ pub const HistoryImport = struct {
         const convert_viewport = !self.viewport_converted and
             self.destination.viewport == .top;
         if (convert_viewport) {
-            self.destination.scroll(.{ .pin = .{
+            // `scroll(.pin)` deliberately normalizes the current first row
+            // back to `.top`; that would make the following prepend shift the
+            // visible content. Install the internal pin directly so finalize
+            // can advance its absolute offset while preserving this row.
+            self.destination.viewport_pin.* = .{
                 .node = self.destination.pages.first.?,
-            } });
+            };
+            self.destination.viewport = .pin;
+            self.destination.viewport_pin_row_offset = 0;
             self.viewport_was_top = true;
             self.viewport_converted = true;
         }
