@@ -108,39 +108,39 @@ pub const CursorError = Allocator.Error ||
         Stale,
         Pruned,
         WrongTerminal,
+        InvalidHandle,
         WrongGeneration,
         Reset,
         Resize,
         CursorAlreadyTaken,
     };
 
-/// Stable identity for one captured history cut.
+/// Authenticated identity for one captured history cut.
 ///
-/// Fields intentionally remain private. Callers can compare checkpoints but
-/// cannot infer native page layout or addresses from them.
+/// `bytes` are semantically opaque: callers may copy them, but construction or
+/// mutation is rejected by the owning PageList's private authenticator.
 pub const HistoryCheckpoint = struct {
-    session_id: u64,
+    bytes: TerminalPageList.HistoryLeaseToken,
+
+    pub fn eql(a: HistoryCheckpoint, b: HistoryCheckpoint) bool {
+        return std.mem.eql(u8, &a.bytes, &b.bytes);
+    }
+};
+
+const CheckpointData = struct {
     screen_generation: usize,
     history_generation: u64,
     newest_serial: u64,
     newest_y: u16,
     oldest_serial: u64,
-
-    pub fn eql(a: HistoryCheckpoint, b: HistoryCheckpoint) bool {
-        return std.meta.eql(a, b);
-    }
-};
-
-const LeaseToken = struct {
-    terminal: *Terminal,
-    key: TerminalScreenKey,
-    screen_generation: usize,
-    id: u64,
 };
 
 const LeaseState = struct {
     alloc: Allocator,
-    checkpoint: HistoryCheckpoint,
+    terminal: *Terminal,
+    key: TerminalScreenKey,
+    checkpoint: CheckpointData,
+    secret: [32]u8,
     current: ?*TerminalPageList.Pin,
     boundary: ?*TerminalPageList.Pin,
     current_serial: u64,
@@ -151,32 +151,53 @@ const LeaseState = struct {
     sequence: u64 = 0,
 };
 
-var next_history_session: std.atomic.Value(u64) = .init(1);
-
 fn releaseLeaseState(raw: *anyopaque, pages: *TerminalPageList) void {
     const state: *LeaseState = @ptrCast(@alignCast(raw));
     if (state.current) |pin_| pages.untrackPin(pin_);
     if (state.boundary) |pin_| pages.untrackPin(pin_);
-    const alloc = state.alloc;
-    alloc.destroy(state);
+    state.alloc.destroy(state);
+}
+
+fn tokenScreenKey(
+    token: TerminalPageList.HistoryLeaseToken,
+) ?TerminalScreenKey {
+    const Tag = @typeInfo(TerminalScreenKey).@"enum".tag_type;
+    const value = std.math.cast(Tag, token[8]) orelse return null;
+    return @enumFromInt(value);
 }
 
 fn resolveLease(
-    token: LeaseToken,
+    token: TerminalPageList.HistoryLeaseToken,
     terminal_: *Terminal,
 ) CursorError!struct {
     screen: *TerminalScreen,
     state: *LeaseState,
 } {
-    if (terminal_ != token.terminal) return error.WrongTerminal;
-    if (terminal_.screens.generation(token.key) != token.screen_generation) {
+    const terminal_address = std.mem.readInt(u64, token[0..8], .little);
+    if (terminal_address != @as(u64, @intCast(@intFromPtr(terminal_)))) {
+        return error.WrongTerminal;
+    }
+    const key = tokenScreenKey(token) orelse return error.InvalidHandle;
+    const terminal_screen = terminal_.screens.get(key) orelse
+        return error.WrongGeneration;
+    const token_screen_generation =
+        std.mem.readInt(u32, token[18..22], .little);
+    if (token_screen_generation !=
+        @as(u32, @truncate(terminal_.screens.generation(key))))
+    {
         return error.WrongGeneration;
     }
-    const terminal_screen = terminal_.screens.get(token.key) orelse
-        return error.WrongGeneration;
-    const raw = terminal_screen.pages.historyLease(token.id) orelse
-        return error.Stale;
+    const raw = switch (terminal_screen.pages.historyLease(token)) {
+        .active => |ptr| ptr,
+        .stale => return error.Stale,
+        .invalid => return error.InvalidHandle,
+    };
     const state: *LeaseState = @ptrCast(@alignCast(raw));
+    if (terminal_.screens.generation(key) !=
+        state.checkpoint.screen_generation)
+    {
+        return error.WrongGeneration;
+    }
     if (terminal_screen.pages.historyGeneration() !=
         state.checkpoint.history_generation)
     {
@@ -198,16 +219,24 @@ fn resolveLease(
     return .{ .screen = terminal_screen, .state = state };
 }
 
-/// Engine-owned lease over one screen's complete historical prefix.
-///
-/// The public value is a copy-safe token. Pin ownership lives in PageList's
-/// stable private registry, so moved or aliased handles share one lifetime and
-/// observe Stale after the first deinit.
-pub const HistoryLease = struct {
-    token: LeaseToken,
-    checkpoint_: HistoryCheckpoint,
+fn resolveCheckpoint(
+    terminal_: *Terminal,
+    checkpoint: HistoryCheckpoint,
+) error{InvalidCheckpoint}!*LeaseState {
+    const resolved = resolveLease(checkpoint.bytes, terminal_) catch
+        return error.InvalidCheckpoint;
+    return resolved.state;
+}
 
-    pub const InitError = Allocator.Error || error{ScreenUnavailable};
+/// Engine-owned lease over one screen's complete historical prefix.
+pub const HistoryLease = struct {
+    bytes: TerminalPageList.HistoryLeaseToken,
+
+    pub const InitError = Allocator.Error || error{
+        ScreenUnavailable,
+        LeaseLimitExceeded,
+        LeaseGenerationExhausted,
+    };
 
     pub fn init(
         terminal_: *Terminal,
@@ -241,92 +270,94 @@ pub const HistoryLease = struct {
             }
         }
 
-        const id = next_history_session.fetchAdd(1, .monotonic);
-        const screen_generation = terminal_.screens.generation(key);
-        const checkpoint_: HistoryCheckpoint = .{
-            .session_id = id,
-            .screen_generation = screen_generation,
-            .history_generation = terminal_screen.pages.historyGeneration(),
-            .newest_serial = current_serial,
-            .newest_y = newest_y,
-            .oldest_serial = oldest_serial,
-        };
         const state = try terminal_screen.alloc.create(LeaseState);
         errdefer terminal_screen.alloc.destroy(state);
         state.* = .{
             .alloc = terminal_screen.alloc,
-            .checkpoint = checkpoint_,
+            .terminal = terminal_,
+            .key = key,
+            .checkpoint = .{
+                .screen_generation = terminal_.screens.generation(key),
+                .history_generation = terminal_screen.pages.historyGeneration(),
+                .newest_serial = current_serial,
+                .newest_y = newest_y,
+                .oldest_serial = oldest_serial,
+            },
+            .secret = undefined,
             .current = current,
             .boundary = boundary,
             .current_serial = current_serial,
             .boundary_serial = oldest_serial,
         };
-        try terminal_screen.pages.registerHistoryLease(id, .{
-            .ptr = state,
-            .release = releaseLeaseState,
-        });
+        std.crypto.random.bytes(&state.secret);
+        const token = try terminal_screen.pages.registerHistoryLease(
+            @intCast(@intFromPtr(terminal_)),
+            @intCast(@intFromEnum(key)),
+            @truncate(terminal_.screens.generation(key)),
+            .{
+                .ptr = state,
+                .release = releaseLeaseState,
+                .generation = undefined,
+            },
+        );
         current = null;
         boundary = null;
-        return .{
-            .token = .{
-                .terminal = terminal_,
-                .key = key,
-                .screen_generation = screen_generation,
-                .id = id,
-            },
-            .checkpoint_ = checkpoint_,
-        };
+        return .{ .bytes = token };
     }
 
     pub fn checkpoint(self: *const HistoryLease) HistoryCheckpoint {
-        return self.checkpoint_;
+        return .{ .bytes = self.bytes };
     }
 
-    pub fn cursor(self: *const HistoryLease) CursorError!HistoryCursor {
-        const resolved = try resolveLease(self.token, self.token.terminal);
+    pub fn cursor(
+        self: *const HistoryLease,
+        terminal_: *Terminal,
+    ) CursorError!HistoryCursor {
+        const resolved = try resolveLease(self.bytes, terminal_);
         if (resolved.state.cursor_taken) return error.CursorAlreadyTaken;
         resolved.state.cursor_taken = true;
-        return .{
-            .token = self.token,
-        };
+        return .{ .bytes = self.bytes };
     }
 
-    pub fn inspectedPages(self: *const HistoryLease) usize {
-        const terminal_screen = self.token.terminal.screens.get(
-            self.token.key,
-        ) orelse return 0;
-        const raw = terminal_screen.pages.historyLease(self.token.id) orelse
-            return 0;
-        const state: *LeaseState = @ptrCast(@alignCast(raw));
-        return state.pages_inspected;
+    pub fn inspectedPages(
+        self: *const HistoryLease,
+        terminal_: *Terminal,
+    ) usize {
+        const resolved = resolveLease(self.bytes, terminal_) catch return 0;
+        return resolved.state.pages_inspected;
     }
 
-    pub fn abort(self: *const HistoryLease) void {
-        self.deinit();
+    pub fn abort(self: *const HistoryLease, terminal_: *Terminal) void {
+        self.deinit(terminal_);
     }
 
-    pub fn deinit(self: *const HistoryLease) void {
-        if (self.token.terminal.screens.generation(self.token.key) !=
-            self.token.screen_generation) return;
-        const terminal_screen = self.token.terminal.screens.get(
-            self.token.key,
-        ) orelse return;
-        terminal_screen.pages.releaseHistoryLease(self.token.id);
+    pub fn deinit(self: *const HistoryLease, terminal_: *Terminal) void {
+        const terminal_address = std.mem.readInt(u64, self.bytes[0..8], .little);
+        if (terminal_address != @as(u64, @intCast(@intFromPtr(terminal_)))) {
+            return;
+        }
+        const key = tokenScreenKey(self.bytes) orelse return;
+        const terminal_screen = terminal_.screens.get(key) orelse return;
+        terminal_screen.pages.releaseHistoryLease(self.bytes);
     }
 };
 
 const UnitHeader = struct {
-    const magic: u64 = 0x3154494E554847; // "GHUNIT1"
-    const len = 66;
+    const magic: u64 = 0x3254494E554847; // "GHUNIT2"
+    const prefix_len = 58;
+    const len = prefix_len + 32;
 
-    checkpoint: HistoryCheckpoint,
+    checkpoint: CheckpointData,
     sequence: u64,
     rows: u32,
     payload_len: u32,
+    authenticator: [32]u8,
 
-    fn encode(self: UnitHeader, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    fn encodePrefix(
+        self: UnitHeader,
+        writer: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
         try io.writeInt(writer, u64, magic);
-        try io.writeInt(writer, u64, self.checkpoint.session_id);
         try io.writeInt(
             writer,
             u64,
@@ -341,6 +372,27 @@ const UnitHeader = struct {
         try io.writeInt(writer, u32, self.payload_len);
     }
 
+    fn authenticate(
+        self: UnitHeader,
+        secret: [32]u8,
+        payload: []const u8,
+    ) [32]u8 {
+        var prefix: [prefix_len]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&prefix);
+        self.encodePrefix(&writer) catch unreachable;
+        var hasher = std.crypto.hash.Blake3.init(.{ .key = secret });
+        hasher.update(&prefix);
+        hasher.update(payload);
+        var result: [32]u8 = undefined;
+        hasher.final(&result);
+        return result;
+    }
+
+    fn encode(self: UnitHeader, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try self.encodePrefix(writer);
+        try writer.writeAll(&self.authenticator);
+    }
+
     const UnitDecodeError = std.Io.Reader.Error || error{
         InvalidHistoryUnit,
         WrongGeneration,
@@ -350,7 +402,6 @@ const UnitHeader = struct {
         if (try io.readInt(reader, u64) != magic) {
             return error.InvalidHistoryUnit;
         }
-        const session_id = try io.readInt(reader, u64);
         const screen_generation_u64 = try io.readInt(reader, u64);
         const screen_generation = std.math.cast(
             usize,
@@ -358,7 +409,6 @@ const UnitHeader = struct {
         ) orelse return error.WrongGeneration;
         return .{
             .checkpoint = .{
-                .session_id = session_id,
                 .screen_generation = screen_generation,
                 .history_generation = try io.readInt(reader, u64),
                 .newest_serial = try io.readInt(reader, u64),
@@ -368,14 +418,13 @@ const UnitHeader = struct {
             .sequence = try io.readInt(reader, u64),
             .rows = try io.readInt(reader, u32),
             .payload_len = try io.readInt(reader, u32),
+            .authenticator = (try reader.takeArray(32)).*,
         };
     }
 };
 
-/// Opaque newest-to-oldest continuation over a HistoryLease.
 pub const HistoryCursor = struct {
-    token: LeaseToken,
-
+    bytes: TerminalPageList.HistoryLeaseToken,
     /// Emit one authenticated history unit without advancing on a budget
     /// outcome or allocation/encoding failure.
     pub fn next(
@@ -384,7 +433,7 @@ pub const HistoryCursor = struct {
         budget: Budget,
         destination: *std.Io.Writer,
     ) CursorError!NextResult {
-        const resolved = try resolveLease(self.token, terminal_);
+        const resolved = try resolveLease(self.bytes, terminal_);
         const terminal_screen = resolved.screen;
         const state = resolved.state;
         const pin_ = state.current orelse return .end;
@@ -441,13 +490,17 @@ pub const HistoryCursor = struct {
         );
         defer encoded.deinit();
         const encoded_len = UnitHeader.len + encoded.written().len;
-        std.debug.assert(encoded_len <= budget.bytes);
-        const unit_header: UnitHeader = .{
+        var unit_header: UnitHeader = .{
             .checkpoint = state.checkpoint,
             .sequence = state.sequence,
             .rows = @intCast(rows),
             .payload_len = @intCast(encoded.written().len),
+            .authenticator = undefined,
         };
+        unit_header.authenticator = unit_header.authenticate(
+            state.secret,
+            encoded.written(),
+        );
         try unit_header.encode(destination);
         try destination.writeAll(encoded.written());
 
@@ -555,22 +608,30 @@ pub const HistoryImporter = struct {
     screen_generation: usize,
     history_generation: u64,
     import: TerminalPageList.HistoryImport,
-    expected_checkpoint: HistoryCheckpoint,
-    expected_sequence: u64 = 0,
+    expected_checkpoint: CheckpointData,
+    secret: [32]u8,
     deinitialized: bool = false,
     chunks: usize = 0,
     max_chunks: usize,
     imported_prompt: bool = false,
     active: bool = true,
 
-    pub const InitError = Allocator.Error || error{ScreenUnavailable};
+    pub const InitError = Allocator.Error || error{
+        ScreenUnavailable,
+        InvalidCheckpoint,
+    };
 
     pub fn init(
         terminal_: *Terminal,
         key: TerminalScreenKey,
         max_chunks: usize,
+        source_terminal: *Terminal,
         expected_checkpoint: HistoryCheckpoint,
     ) InitError!HistoryImporter {
+        const source_state = try resolveCheckpoint(
+            source_terminal,
+            expected_checkpoint,
+        );
         const terminal_screen = terminal_.screens.get(key) orelse
             return error.ScreenUnavailable;
         return .{
@@ -578,7 +639,8 @@ pub const HistoryImporter = struct {
             .key = key,
             .screen_generation = terminal_.screens.generation(key),
             .history_generation = terminal_screen.pages.historyGeneration(),
-            .expected_checkpoint = expected_checkpoint,
+            .expected_checkpoint = source_state.checkpoint,
+            .secret = source_state.secret,
             .import = try .init(
                 &terminal_screen.pages,
                 terminal_screen.alloc,
@@ -605,15 +667,30 @@ pub const HistoryImporter = struct {
         if (unit.len < UnitHeader.len) return error.InvalidHistoryUnit;
         var header_source: std.Io.Reader = .fixed(unit[0..UnitHeader.len]);
         const unit_header = try UnitHeader.decode(&header_source);
-        if (!unit_header.checkpoint.eql(self.expected_checkpoint) or
-            unit_header.sequence != self.expected_sequence)
+        if (!std.meta.eql(
+            unit_header.checkpoint,
+            self.expected_checkpoint,
+        ) or unit_header.sequence != self.expected_sequence)
         {
             return error.UnexpectedHistoryUnit;
         }
         const payload_len: usize = @intCast(unit_header.payload_len);
-        if (UnitHeader.len + payload_len != unit.len) {
-            return error.InvalidHistoryUnit;
-        }
+        const expected_len = std.math.add(
+            usize,
+            UnitHeader.len,
+            payload_len,
+        ) catch return error.InvalidHistoryUnit;
+        if (expected_len != unit.len) return error.InvalidHistoryUnit;
+        const payload = unit[UnitHeader.len..];
+        const expected_authenticator = unit_header.authenticate(
+            self.secret,
+            payload,
+        );
+        if (!std.crypto.timing_safe.eql(
+            [32]u8,
+            expected_authenticator,
+            unit_header.authenticator,
+        )) return error.InvalidHistoryUnit;
         const rows: usize = @intCast(unit_header.rows);
         if (unit.len > budget.bytes or rows > budget.rows) {
             return .{ .too_small = .{
@@ -1466,10 +1543,11 @@ fn testDecodedFirstCodepoint(unit: []const u8) !u21 {
     return decoded.getRowAndCell(0, 0).cell.codepoint();
 }
 
-fn testLeaseState(lease: *const HistoryLease) *LeaseState {
-    const terminal_screen = lease.token.terminal.screens.get(lease.token.key).?;
-    const raw = terminal_screen.pages.historyLease(lease.token.id).?;
-    return @ptrCast(@alignCast(raw));
+fn testLeaseState(
+    terminal_: *Terminal,
+    lease: HistoryLease,
+) *LeaseState {
+    return (resolveLease(lease.bytes, terminal_) catch unreachable).state;
 }
 test "history cursor captures rows sharing the active page" {
     const testing = std.testing;
@@ -1490,16 +1568,16 @@ test "history cursor captures rows sharing the active page" {
     );
 
     const first_lease = try HistoryLease.init(&terminal_value, .primary);
-    defer first_lease.deinit();
-    const first_cut = first_lease.checkpoint();
-    const first_cursor = try first_lease.cursor();
+    defer first_lease.deinit(&terminal_value);
+    const first_cut = testLeaseState(&terminal_value, first_lease).checkpoint;
+    const first_cursor = try first_lease.cursor(&terminal_value);
 
     terminal_screen.cursorAbsolute(0, 1);
     try terminal_screen.testWriteString("\n");
     try testing.expectEqual(@as(usize, 1), terminal_screen.pages.totalPages());
     const second_lease = try HistoryLease.init(&terminal_value, .primary);
-    defer second_lease.deinit();
-    const second_cut = second_lease.checkpoint();
+    defer second_lease.deinit(&terminal_value);
+    const second_cut = testLeaseState(&terminal_value, second_lease).checkpoint;
     try testing.expectEqual(first_cut.newest_serial, second_cut.newest_serial);
     try testing.expect(first_cut.newest_y != second_cut.newest_y);
 
@@ -1549,12 +1627,11 @@ test "history cursor pages newest first within strict budgets" {
 
     const pins_before = source_screen.pages.countTrackedPins();
     const lease = try HistoryLease.init(&source, .primary);
-    defer lease.deinit();
-    try testing.expectEqual(pins_before + 2, source_screen.pages.countTrackedPins());
+    defer lease.deinit(&source);
     const checkpoint_value = lease.checkpoint();
     try testing.expect(checkpoint_value.eql(lease.checkpoint()));
-    const cursor_value = try lease.cursor();
-    try testing.expectError(error.CursorAlreadyTaken, lease.cursor());
+    const cursor_value = try lease.cursor(&source);
+    try testing.expectError(error.CursorAlreadyTaken, lease.cursor(&source));
 
     var no_output: [1]u8 = undefined;
     var no_output_writer: std.Io.Writer = .fixed(&no_output);
@@ -1621,15 +1698,15 @@ test "history cursor pages newest first within strict budgets" {
             &end_output.writer,
         )),
     );
-    try testing.expectEqual(@as(usize, 3), lease.inspectedPages());
+    try testing.expectEqual(@as(usize, 3), lease.inspectedPages(&source));
     try testing.expectEqual(pins_before, source_screen.pages.countTrackedPins());
     try testing.expectEqual(storage[0], newest.storage());
     try testing.expectEqual(storage[1], middle.storage());
     try testing.expectEqual(storage[2], oldest.storage());
 
     const cross_lease = try HistoryLease.init(&source, .primary);
-    defer cross_lease.deinit();
-    const cross_cursor = try cross_lease.cursor();
+    defer cross_lease.deinit(&source);
+    const cross_cursor = try cross_lease.cursor(&source);
     var cross_unit: std.Io.Writer.Allocating = .init(testing.allocator);
     defer cross_unit.deinit();
     _ = try cross_cursor.next(
@@ -1651,10 +1728,28 @@ test "history cursor pages newest first within strict budgets" {
     const viewport_codepoint = destination_screen.pages
         .getTopLeft(.viewport).rowAndCell().cell.codepoint();
 
+    var forged_checkpoint = checkpoint_value;
+    forged_checkpoint.bytes[31] ^= 0x5A;
+    try testing.expectError(
+        error.InvalidCheckpoint,
+        HistoryImporter.init(
+            &destination,
+            .primary,
+            units.len,
+            &source,
+            forged_checkpoint,
+        ),
+    );
+    try testing.expectEqual(
+        pages_before_import,
+        destination_screen.pages.totalPages(),
+    );
+
     var importer = try HistoryImporter.init(
         &destination,
         .primary,
         units.len,
+        &source,
         checkpoint_value,
     );
     defer importer.deinit();
@@ -1677,6 +1772,56 @@ test "history cursor pages newest first within strict budgets" {
     );
 
     const rejected_pages = destination_screen.pages.totalPages();
+    var tampered_header_unit = try testing.allocator.dupe(u8, units[0]);
+    defer testing.allocator.free(tampered_header_unit);
+    var tampered_source: std.Io.Reader =
+        .fixed(tampered_header_unit[0..UnitHeader.len]);
+    var tampered_header = try UnitHeader.decode(&tampered_source);
+    tampered_header.rows +%= 1;
+    var tampered_writer: std.Io.Writer =
+        .fixed(tampered_header_unit[0..UnitHeader.len]);
+    try tampered_header.encode(&tampered_writer);
+    try testing.expectError(
+        error.InvalidHistoryUnit,
+        importer.prepend(
+            &destination,
+            tampered_header_unit,
+            .{ .bytes = tampered_header_unit.len, .rows = 2 },
+        ),
+    );
+
+    var oversized_header_unit: [UnitHeader.len]u8 = undefined;
+    var oversized_source: std.Io.Reader =
+        .fixed(units[0][0..UnitHeader.len]);
+    var oversized_header = try UnitHeader.decode(&oversized_source);
+    oversized_header.payload_len = std.math.maxInt(u32);
+    var oversized_writer: std.Io.Writer = .fixed(&oversized_header_unit);
+    try oversized_header.encode(&oversized_writer);
+    try testing.expectError(
+        error.InvalidHistoryUnit,
+        importer.prepend(
+            &destination,
+            &oversized_header_unit,
+            .{ .bytes = std.math.maxInt(usize), .rows = 1 },
+        ),
+    );
+    var spliced_successor = try testing.allocator.dupe(u8, units[1]);
+    defer testing.allocator.free(spliced_successor);
+    var spliced_source: std.Io.Reader =
+        .fixed(spliced_successor[0..UnitHeader.len]);
+    var spliced_header = try UnitHeader.decode(&spliced_source);
+    spliced_header.sequence = 0;
+    var spliced_writer: std.Io.Writer =
+        .fixed(spliced_successor[0..UnitHeader.len]);
+    try spliced_header.encode(&spliced_writer);
+    try testing.expectError(
+        error.InvalidHistoryUnit,
+        importer.prepend(
+            &destination,
+            spliced_successor,
+            .{ .bytes = spliced_successor.len, .rows = 1 },
+        ),
+    );
     try testing.expectError(
         error.UnexpectedHistoryUnit,
         importer.prepend(
@@ -1695,9 +1840,9 @@ test "history cursor pages newest first within strict budgets" {
     );
     var corrupt = try testing.allocator.dupe(u8, units[0]);
     defer testing.allocator.free(corrupt);
-    corrupt[50] ^= 1;
+    corrupt[corrupt.len - 1] ^= 1;
     try testing.expectError(
-        error.UnexpectedHistoryUnit,
+        error.InvalidHistoryUnit,
         importer.prepend(
             &destination,
             corrupt,
@@ -1780,8 +1925,8 @@ test "history cursor invalidation and transactional abort outcomes" {
 
     {
         const lease = try HistoryLease.init(&source, .primary);
-        defer lease.deinit();
-        const cursor_value = try lease.cursor();
+        defer lease.deinit(&source);
+        const cursor_value = try lease.cursor(&source);
         var output: std.Io.Writer.Allocating = .init(testing.allocator);
         defer output.deinit();
         try testing.expectError(
@@ -1791,6 +1936,34 @@ test "history cursor invalidation and transactional abort outcomes" {
                 .{ .bytes = 4096, .rows = 2 },
                 &output.writer,
             ),
+        );
+        const source_pins =
+            source.screens.get(.primary).?.pages.countTrackedPins();
+        lease.deinit(&other);
+        try testing.expectEqual(
+            source_pins,
+            source.screens.get(.primary).?.pages.countTrackedPins(),
+        );
+        var forged_lease = lease;
+        forged_lease.bytes[31] ^= 0x5A;
+        forged_lease.deinit(&source);
+        try testing.expectEqual(
+            source_pins,
+            source.screens.get(.primary).?.pages.countTrackedPins(),
+        );
+        var forged_cursor = cursor_value;
+        forged_cursor.bytes[31] ^= 0xA5;
+        try testing.expectError(
+            error.InvalidHandle,
+            forged_cursor.next(
+                &source,
+                .{ .bytes = 4096, .rows = 1 },
+                &output.writer,
+            ),
+        );
+        try testing.expectEqual(
+            source_pins,
+            source.screens.get(.primary).?.pages.countTrackedPins(),
         );
     }
     var prune_source = try Terminal.init(testing.io, testing.allocator, .{
@@ -1809,9 +1982,9 @@ test "history cursor invalidation and transactional abort outcomes" {
     }
 
     const prune_lease = try HistoryLease.init(&prune_source, .primary);
-    defer prune_lease.deinit();
-    const prune_cursor = try prune_lease.cursor();
-    const prune_state = testLeaseState(&prune_lease);
+    defer prune_lease.deinit(&prune_source);
+    const prune_cursor = try prune_lease.cursor(&prune_source);
+    const prune_state = testLeaseState(&prune_source, prune_lease);
     const captured_boundary = prune_state.boundary.?.node;
 
     // Prepend an older page after capture. Pruning that page applies real
@@ -1858,8 +2031,8 @@ test "history cursor invalidation and transactional abort outcomes" {
     defer reset_source.deinit(testing.allocator);
     {
         const lease = try HistoryLease.init(&reset_source, .primary);
-        defer lease.deinit();
-        const cursor_value = try lease.cursor();
+        defer lease.deinit(&reset_source);
+        const cursor_value = try lease.cursor(&reset_source);
         reset_source.screens.get(.primary).?.pages.reset();
         var output: std.Io.Writer.Allocating = .init(testing.allocator);
         defer output.deinit();
@@ -1877,8 +2050,8 @@ test "history cursor invalidation and transactional abort outcomes" {
     defer resize_source.deinit(testing.allocator);
     {
         const lease = try HistoryLease.init(&resize_source, .primary);
-        defer lease.deinit();
-        const cursor_value = try lease.cursor();
+        defer lease.deinit(&resize_source);
+        const cursor_value = try lease.cursor(&resize_source);
         try resize_source.screens.get(.primary).?.pages.resize(.{ .cols = 3 });
         var output: std.Io.Writer.Allocating = .init(testing.allocator);
         defer output.deinit();
@@ -1896,8 +2069,8 @@ test "history cursor invalidation and transactional abort outcomes" {
     defer stale_source.deinit(testing.allocator);
     {
         const lease = try HistoryLease.init(&stale_source, .primary);
-        defer lease.deinit();
-        const cursor_value = try lease.cursor();
+        defer lease.deinit(&stale_source);
+        const cursor_value = try lease.cursor(&stale_source);
         stale_source.screens.get(.primary).?.pages.eraseHistory(null);
         var output: std.Io.Writer.Allocating = .init(testing.allocator);
         defer output.deinit();
@@ -1915,8 +2088,8 @@ test "history cursor invalidation and transactional abort outcomes" {
     defer generation_source.deinit(testing.allocator);
     _ = try generation_source.switchScreen(.alternate);
     const generation_lease = try HistoryLease.init(&generation_source, .alternate);
-    defer generation_lease.deinit();
-    const generation_cursor = try generation_lease.cursor();
+    defer generation_lease.deinit(&generation_source);
+    const generation_cursor = try generation_lease.cursor(&generation_source);
     _ = try generation_source.switchScreen(.primary);
     generation_source.screens.remove(testing.allocator, .alternate);
     _ = try generation_source.switchScreen(.alternate);
@@ -1934,8 +2107,8 @@ test "history cursor invalidation and transactional abort outcomes" {
     var abort_source = try testCursorTerminal(testing.allocator, 1, 'A');
     defer abort_source.deinit(testing.allocator);
     const abort_lease = try HistoryLease.init(&abort_source, .primary);
-    defer abort_lease.deinit();
-    const abort_cursor = try abort_lease.cursor();
+    defer abort_lease.deinit(&abort_source);
+    const abort_cursor = try abort_lease.cursor(&abort_source);
     var unit: std.Io.Writer.Allocating = .init(testing.allocator);
     defer unit.deinit();
     _ = try abort_cursor.next(
@@ -1956,6 +2129,7 @@ test "history cursor invalidation and transactional abort outcomes" {
         &abort_destination,
         .primary,
         1,
+        &abort_source,
         abort_lease.checkpoint(),
     );
     defer abort_import.deinit();
@@ -1981,9 +2155,9 @@ test "history cursor invalidation and transactional abort outcomes" {
     const ownership_pins = ownership_screen.pages.countTrackedPins();
     const ownership_lease = try HistoryLease.init(&ownership_source, .primary);
     const ownership_alias = ownership_lease;
-    const ownership_cursor = try ownership_alias.cursor();
+    const ownership_cursor = try ownership_alias.cursor(&ownership_source);
     const moved_cursor = ownership_cursor;
-    ownership_lease.abort();
+    ownership_lease.abort(&ownership_source);
     try testing.expectEqual(
         ownership_pins,
         ownership_screen.pages.countTrackedPins(),
@@ -1998,7 +2172,7 @@ test "history cursor invalidation and transactional abort outcomes" {
             &stale_output.writer,
         ),
     );
-    ownership_alias.deinit();
+    ownership_alias.deinit(&ownership_source);
 }
 
 test "history lease and cursor OOM release bounded state without advancing" {
@@ -2022,9 +2196,9 @@ test "history lease and cursor OOM release bounded state without advancing" {
     try tw.end(.reset);
 
     const lease = try HistoryLease.init(&source, .primary);
-    defer lease.deinit();
-    const cursor_value = try lease.cursor();
-    const lease_state = testLeaseState(&lease);
+    defer lease.deinit(&source);
+    const cursor_value = try lease.cursor(&source);
+    const lease_state = testLeaseState(&source, lease);
     const y_before = lease_state.current.?.y;
     const serial_before = lease_state.current_serial;
     const codepoint_before = lease_state.current.?.node.page()
@@ -2053,7 +2227,10 @@ test "history lease and cursor OOM release bounded state without advancing" {
         lease_state.current.?.node.page()
             .getRowAndCell(0, y_before).cell.codepoint(),
     );
-    try testing.expectEqual(pins_with_lease, source_screen.pages.countTrackedPins());
+    try testing.expectEqual(
+        pins_with_lease,
+        source_screen.pages.countTrackedPins(),
+    );
     try testing.expectEqual(@as(usize, 0), output.written().len);
     try tw.end(.reset);
 
@@ -2066,6 +2243,37 @@ test "history lease and cursor OOM release bounded state without advancing" {
         @as(std.meta.Tag(NextResult), .chunk),
         std.meta.activeTag(result),
     );
-    lease.abort();
+    lease.abort(&source);
     try testing.expectEqual(initial_pins, source_screen.pages.countTrackedPins());
+}
+
+test "history lease slots recycle while stale aliases remain invalid" {
+    const testing = std.testing;
+    var terminal_value = try testCursorTerminal(testing.allocator, 1, 'A');
+    defer terminal_value.deinit(testing.allocator);
+    const screen = terminal_value.screens.get(.primary).?;
+    const initial_pins = screen.pages.countTrackedPins();
+
+    var stale: ?HistoryLease = null;
+    for (0..1024) |index| {
+        const lease = try HistoryLease.init(&terminal_value, .primary);
+        if (index == 0) stale = lease;
+        lease.deinit(&terminal_value);
+    }
+    try testing.expectEqual(initial_pins, screen.pages.countTrackedPins());
+    try testing.expectError(
+        error.Stale,
+        stale.?.cursor(&terminal_value),
+    );
+
+    var active: [TerminalPageList.max_history_leases]HistoryLease = undefined;
+    for (&active) |*lease| {
+        lease.* = try HistoryLease.init(&terminal_value, .primary);
+    }
+    try testing.expectError(
+        error.LeaseLimitExceeded,
+        HistoryLease.init(&terminal_value, .primary),
+    );
+    for (&active) |*lease| lease.deinit(&terminal_value);
+    try testing.expectEqual(initial_pins, screen.pages.countTrackedPins());
 }
