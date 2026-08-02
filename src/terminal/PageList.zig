@@ -8117,7 +8117,6 @@ test "PageList PageAllocation allocation failure leaves list unchanged" {
     const initial_total_rows = result.total_rows;
     const initial_page_size = result.page_size;
 
-
     // Existing pool capacity is deliberately an implementation detail. Allow
     // preheated slots to succeed until allocation reaches node-pool growth.
     failing.fail_index = failing.alloc_index;
