@@ -241,7 +241,7 @@ class Runtime {
   gridText(terminal, tag, y, length) {
     const point = this.rawStruct("GhosttyPoint");
     const ref = this.struct("GhosttyGridRef");
-    const codepoint = this.alloc(4);
+    const codepoints = this.alloc(64 * 4);
     const written = this.alloc(4);
     const coordinate = point.ptr + this.field(point.name, "value");
     this.view().setInt32(point.ptr + this.field(point.name, "tag"), tag, true);
@@ -263,14 +263,21 @@ class Runtime {
       );
       this.view().setUint32(written, 0, true);
       assert.equal(
-        this.e.ghostty_grid_ref_graphemes(ref.ptr, codepoint, 1, written),
+        this.e.ghostty_grid_ref_graphemes(ref.ptr, codepoints, 64, written),
         SUCCESS,
       );
-      assert.equal(this.view().getUint32(written, true), 1);
-      result += String.fromCodePoint(this.view().getUint32(codepoint, true));
+      const count = this.view().getUint32(written, true);
+      if (count === 0) {
+        result += " ";
+      } else {
+        for (let index = 0; index < count; ++index) {
+          result += String.fromCodePoint(
+            this.view().getUint32(codepoints + index * 4, true));
+        }
+      }
     }
     this.free(written, 4);
-    this.free(codepoint, 4);
+    this.free(codepoints, 64 * 4);
     this.dispose(ref);
     this.dispose(point);
     return result;
@@ -1399,18 +1406,6 @@ rt.dispose(capabilities);
 
 const source = rt.terminal();
 rt.unlimitedScrollback(source);
-const alternateOn = "\x1b[?47h";
-const alternateOff = "\x1b[?47l";
-rt.write(source, alternateOn);
-rt.write(
-  source,
-  "\x1b[?2027h\x1b]133;A\x07\x1b[1;31m" +
-    "\x1b]8;;https://example.test/checkpoint\x1b\\" +
-    "ALT-e\u0301-界-" +
-    "wrapped-".repeat(12) +
-    "\x1b]8;;\x1b\\\x1b[0m\x1b]133;B\x07",
-);
-rt.write(source, alternateOff);
 let sourceText = "";
 for (let index = 0; index < 2000; ++index) {
   sourceText += `row-${String(index).padStart(4, "0")}\r\n`;
@@ -1454,6 +1449,24 @@ assert.equal(trackingAllocator.state.invalidFree, false);
 trackingAllocator.dispose();
 rt.free(oomSlot, 4);
 rt.dispose(oomOptions);
+const seededHistoryRows = rt.terminalUsize(source, 15);
+assert.equal(rt.gridText(source, 3, 0, 8), "row-0000");
+assert.equal(
+  rt.gridText(source, 3, seededHistoryRows - 1, 8), "row-1992");
+const alternateOn = "\x1b[?47h";
+const alternateOff = "\x1b[?47l";
+rt.write(source, alternateOn);
+rt.write(
+  source,
+  "\x1b[?2027h\x1b]133;A\x07\x1b[1;31m" +
+    "\x1b]8;;https://example.test/checkpoint\x1b\\" +
+    "ALT-e\u0301-界-" + "wrapped-".repeat(12) +
+    "\x1b]8;;\x1b\\\x1b[0m\x1b]133;B\x07",
+);
+rt.write(source, alternateOff);
+assert.equal(rt.gridText(source, 3, 0, 8), "row-0000");
+assert.equal(
+  rt.gridText(source, 3, seededHistoryRows - 1, 8), "row-1992");
 rt.write(source, "\x1b[31");
 
 const captured = captureAll(rt, source);
