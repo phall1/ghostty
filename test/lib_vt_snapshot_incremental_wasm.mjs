@@ -94,6 +94,8 @@ const CAPTURE_HISTORY_BEGIN = 2;
 const CAPTURE_HISTORY_PAGE = 3;
 const CAPTURE_FINISH = 4;
 const DECODE_READY = 2;
+const DECODE_HISTORY_BEGIN = 3;
+const DECODE_HISTORY_PAGE = 4;
 const DECODE_FINISH = 5;
 const HISTORY_UNIT = 0;
 const HISTORY_END = 1;
@@ -838,6 +840,7 @@ while (!sawReady) {
     decodedTerminal = rt.view().getUint32(
       take.ptr + rt.field(take.name, "terminal"), true);
     assert.notEqual(decodedTerminal, 0);
+    rt.unlimitedScrollback(decodedTerminal);
     const secondTake = rt.struct("GhosttyTerminalSnapshotTakeTerminalResult");
     assert.equal(rt.e.ghostty_terminal_snapshot_decoder_take_terminal(
       decoder, secondTake.ptr), INVALID_STATE);
@@ -873,6 +876,8 @@ const checkpointOwner = { value: null };
 historyTransfer(rt, source, historyDestination, checkpointOwner);
 assert.ok(checkpointOwner.value.some((byte) => byte !== 0));
 
+let decodedHistoryCount = null;
+let decodedHistoryPages = 0;
 while (!sawFinish) {
   const event = rt.struct("GhosttyTerminalSnapshotDecodeEvent");
   const offered = Math.min(
@@ -883,10 +888,26 @@ while (!sawFinish) {
   const consumed = rt.getUsize(event, "consumed");
   assert.ok(consumed > 0 && consumed <= offered);
   offset += consumed;
-  sawFinish = rt.getI32(event, "kind") === DECODE_FINISH;
+  const kind = rt.getI32(event, "kind");
+  const screenKey = rt.view().getUint16(
+    event.ptr + rt.field(event.name, "screen_key"), true);
+  if (kind === DECODE_HISTORY_BEGIN && screenKey === historyBegin.screenKey) {
+    decodedHistoryCount = rt.getUsize(event, "count");
+    assert.equal(decodedHistoryCount, historyBegin.count);
+  } else if (kind === DECODE_HISTORY_PAGE &&
+      screenKey === historyBegin.screenKey) {
+    assert.notEqual(decodedHistoryCount, null);
+    assert.equal(rt.getUsize(event, "index"), decodedHistoryPages);
+    assert.equal(rt.getUsize(event, "count"), decodedHistoryCount);
+    assert.equal(rt.view().getUint8(
+      event.ptr + rt.field(event.name, "retained")), 1);
+    ++decodedHistoryPages;
+  }
+  sawFinish = kind === DECODE_FINISH;
   rt.dispose(event);
 }
 assert.equal(offset, captured.encoded.length);
+assert.equal(decodedHistoryPages, decodedHistoryCount);
 rt.e.ghostty_terminal_snapshot_decoder_free(decoder);
 
 const sourceAfterReplay = captureAll(rt, source).encoded;
