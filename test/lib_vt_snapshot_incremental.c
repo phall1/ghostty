@@ -213,6 +213,14 @@ static Decoded decode_fragmented(const uint8_t* data, size_t len) {
         }
 
         if (event.kind == GHOSTTY_TERMINAL_SNAPSHOT_DECODE_READY) {
+            GhosttyTerminalSnapshotDecodeEvent blocked = {
+                .size = sizeof(blocked),
+                .version = GHOSTTY_TERMINAL_SNAPSHOT_ABI_VERSION,
+            };
+            assert(ghostty_terminal_snapshot_decoder_push(
+                decoder, data + offset, 1, &blocked) ==
+                GHOSTTY_TERMINAL_SNAPSHOT_STATUS_INVALID_STATE);
+            assert(blocked.consumed == 0);
             GhosttyTerminalSnapshotTakeTerminalResult ready = {
                 .size = sizeof(ready),
                 .version = GHOSTTY_TERMINAL_SNAPSHOT_ABI_VERSION,
@@ -316,6 +324,7 @@ static void exercise_history_units(
     assert(ghostty_terminal_history_lease_new(
         &cursor_allocator, source, 0, &lease) ==
         GHOSTTY_TERMINAL_SNAPSHOT_STATUS_SUCCESS);
+    assert(cursor_alloc.active == 1);
     GhosttyTerminalHistoryLeaseResult unavailable = {
         .size = sizeof(unavailable),
         .version = GHOSTTY_TERMINAL_SNAPSHOT_ABI_VERSION,
@@ -333,10 +342,12 @@ static void exercise_history_units(
         lease.lease, source, &cursor) ==
         GHOSTTY_TERMINAL_SNAPSHOT_STATUS_OUT_OF_MEMORY);
     assert(cursor.cursor == NULL);
+    assert(cursor_alloc.active == 1);
     cursor_alloc.fail_after = SIZE_MAX;
     assert(ghostty_terminal_history_lease_cursor(
         lease.lease, source, &cursor) ==
         GHOSTTY_TERMINAL_SNAPSHOT_STATUS_SUCCESS);
+    assert(cursor_alloc.active == 2);
     GhosttyTerminalHistoryCursorResult second = {
         .size = sizeof(second),
         .version = GHOSTTY_TERMINAL_SNAPSHOT_ABI_VERSION,
@@ -475,6 +486,7 @@ static void exercise_history_units(
         GHOSTTY_TERMINAL_SNAPSHOT_STATUS_SUCCESS);
     ghostty_terminal_history_importer_free(abort_importer.importer);
     ghostty_terminal_history_cursor_free(cursor.cursor);
+    assert(cursor_alloc.active == 1);
     ghostty_terminal_history_lease_free(lease.lease);
     assert(cursor_alloc.active == 0);
 }

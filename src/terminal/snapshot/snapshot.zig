@@ -588,6 +588,7 @@ pub const Decoder = struct {
         self: *Decoder,
         input: []const u8,
     ) DecodeError!PushResult {
+        self.last_consumed = 0;
         switch (self.state) {
             .done => return .{ .consumed = 0, .event = .finish },
             .failed, .aborted => return error.DecoderTerminal,
@@ -596,7 +597,6 @@ pub const Decoder = struct {
             },
             else => {},
         }
-        self.last_consumed = 0;
 
         // The fixed envelope validates version dispatch before the decoder
         // performs its first allocation. Record staging begins only afterward.
@@ -2421,6 +2421,14 @@ test "incremental decoder authenticates READY with every-byte fragmentation" {
         switch (pushed.event) {
             .ready => |version| {
                 try testing.expectEqual(Version.v2, version);
+                try testing.expectError(
+                    error.ReadyNotTaken,
+                    decoder.push("not consumed"),
+                );
+                try testing.expectEqual(
+                    @as(usize, 0),
+                    decoder.consumedOnError(),
+                );
                 ready = try decoder.takeReady(&restored);
                 restored_owned = true;
 
