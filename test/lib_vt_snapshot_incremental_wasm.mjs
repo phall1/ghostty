@@ -489,6 +489,14 @@ function assertGridEqual(rt, left, right) {
   const rightWritten = rt.alloc(4);
   const leftStyle = rt.struct("GhosttyStyle");
   const rightStyle = rt.struct("GhosttyStyle");
+  const stats = {
+    styledCells: 0,
+    hyperlinkCells: 0,
+    multiCodepointCells: 0,
+    wideCells: 0,
+    softWrappedRows: 0,
+    semanticRows: 0,
+  };
 
   const compareRegion = (tag, regionRows, regionName) => {
     for (let y = 0; y < regionRows; ++y) {
@@ -517,12 +525,16 @@ function assertGridEqual(rt, left, right) {
           assert.deepEqual(rightData, leftData, `${label} cell data ${kind}`);
           if (kind === 5) hasStyling = leftData.value[0] !== 0;
           if (kind === 7) hasHyperlink = leftData.value[0] !== 0;
+          if (kind === 3 && leftData.value[0] !== 0) ++stats.wideCells;
         }
-        assert.deepEqual(
-          graphemes(rt, rightRef, rightGraphemes, rightWritten),
-          graphemes(rt, leftRef, leftGraphemes, leftWritten),
-          `${label} graphemes`,
-        );
+        if (hasStyling) ++stats.styledCells;
+        if (hasHyperlink) ++stats.hyperlinkCells;
+        const leftCluster = graphemes(
+          rt, leftRef, leftGraphemes, leftWritten);
+        const rightCluster = graphemes(
+          rt, rightRef, rightGraphemes, rightWritten);
+        assert.deepEqual(rightCluster, leftCluster, `${label} graphemes`);
+        if (leftCluster.length > 4) ++stats.multiCodepointCells;
         if (hasStyling) {
           resetSized(rt, leftStyle);
           resetSized(rt, rightStyle);
@@ -559,13 +571,22 @@ function assertGridEqual(rt, left, right) {
           );
           const leftRowValue = rt.view().getBigUint64(leftRow, true);
           const rightRowValue = rt.view().getBigUint64(rightRow, true);
+          let softWrapped = false;
+          let semantic = false;
           for (let kind = 1; kind <= 7; ++kind) {
+            const leftData = rowData(
+              rt, leftRowValue, kind, leftOutput);
+            const rightData = rowData(
+              rt, rightRowValue, kind, rightOutput);
             assert.deepEqual(
-              rowData(rt, rightRowValue, kind, rightOutput),
-              rowData(rt, leftRowValue, kind, leftOutput),
-              `${regionName}[${y}] row data ${kind}`,
-            );
+              rightData, leftData, `${regionName}[${y}] row data ${kind}`);
+            if ((kind === 1 || kind === 2) && leftData.value[0] !== 0) {
+              softWrapped = true;
+            }
+            if (kind === 6 && leftData.value[0] !== 0) semantic = true;
           }
+          if (softWrapped) ++stats.softWrappedRows;
+          if (semantic) ++stats.semanticRows;
         }
       }
     }
@@ -590,6 +611,7 @@ function assertGridEqual(rt, left, right) {
   rt.dispose(leftRef);
   rt.dispose(rightPoint);
   rt.dispose(leftPoint);
+  return stats;
 }
 
 function captureOptions(rt, maxRecordBytes = 4 * 1024 * 1024) {
@@ -1373,6 +1395,17 @@ rt.dispose(capabilities);
 
 const source = rt.terminal();
 rt.unlimitedScrollback(source);
+const alternateOn = "\x1b[?47h";
+const alternateOff = "\x1b[?47l";
+rt.write(source, alternateOn);
+rt.write(
+  source,
+  "\x1b[?2027h\x1b]133;A\x07\x1b[1;31m" +
+    "\x1b]8;;https://example.test/checkpoint\x1b\\" +
+    "ALT-e\u0301-界-" + "wrapped-".repeat(12) +
+    "\x1b]8;;\x1b\\\x1b[0m\x1b]133;B\x07",
+);
+rt.write(source, alternateOff);
 let sourceText = "";
 for (let index = 0; index < 2000; ++index) {
   sourceText += `row-${String(index).padStart(4, "0")}\r\n`;
@@ -1620,6 +1653,34 @@ assert.equal(
 );
 assertTerminalMetadataEqual(rt, source, decodedTerminal);
 assertGridEqual(rt, source, decodedTerminal);
+
+// The snapshot also owns the inactive alternate screen. Switch with DEC 47
+// (which preserves its contents), prove the non-default branches are real,
+// and then return both terminals to primary.
+rt.write(source, alternateOn);
+rt.write(decodedTerminal, alternateOn);
+assert.equal(rt.gridText(source, 0, 0, 4), "ALT-");
+assert.equal(rt.gridText(decodedTerminal, 0, 0, 4), "ALT-");
+assertTerminalMetadataEqual(rt, source, decodedTerminal);
+const alternateStats = assertGridEqual(rt, source, decodedTerminal);
+for (const feature of [
+  "styledCells",
+  "hyperlinkCells",
+  "multiCodepointCells",
+  "wideCells",
+  "softWrappedRows",
+  "semanticRows",
+]) {
+  assert.ok(alternateStats[feature] > 0, `alternate ${feature}`);
+}
+rt.write(source, alternateOff);
+rt.write(decodedTerminal, alternateOff);
+assert.equal(
+  rt.gridText(source, 0, 6, continuationText.length), continuationText);
+assert.equal(
+  rt.gridText(decodedTerminal, 0, 6, continuationText.length),
+  continuationText,
+);
 
 const unknownVersion = Uint8Array.from(captured.encoded);
 unknownVersion[8] = 0xff;
