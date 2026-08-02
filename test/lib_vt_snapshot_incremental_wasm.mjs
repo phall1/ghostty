@@ -529,10 +529,13 @@ function assertGridEqual(rt, left, right) {
         }
         if (hasStyling) ++stats.styledCells;
         if (hasHyperlink) ++stats.hyperlinkCells;
-        const leftCluster = graphemes(
-          rt, leftRef, leftGraphemes, leftWritten);
+        const leftCluster = graphemes(rt, leftRef, leftGraphemes, leftWritten);
         const rightCluster = graphemes(
-          rt, rightRef, rightGraphemes, rightWritten);
+          rt,
+          rightRef,
+          rightGraphemes,
+          rightWritten,
+        );
         assert.deepEqual(rightCluster, leftCluster, `${label} graphemes`);
         if (leftCluster.length > 4) ++stats.multiCodepointCells;
         if (hasStyling) {
@@ -574,12 +577,13 @@ function assertGridEqual(rt, left, right) {
           let softWrapped = false;
           let semantic = false;
           for (let kind = 1; kind <= 7; ++kind) {
-            const leftData = rowData(
-              rt, leftRowValue, kind, leftOutput);
-            const rightData = rowData(
-              rt, rightRowValue, kind, rightOutput);
+            const leftData = rowData(rt, leftRowValue, kind, leftOutput);
+            const rightData = rowData(rt, rightRowValue, kind, rightOutput);
             assert.deepEqual(
-              rightData, leftData, `${regionName}[${y}] row data ${kind}`);
+              rightData,
+              leftData,
+              `${regionName}[${y}] row data ${kind}`,
+            );
             if ((kind === 1 || kind === 2) && leftData.value[0] !== 0) {
               softWrapped = true;
             }
@@ -1402,7 +1406,8 @@ rt.write(
   source,
   "\x1b[?2027h\x1b]133;A\x07\x1b[1;31m" +
     "\x1b]8;;https://example.test/checkpoint\x1b\\" +
-    "ALT-e\u0301-界-" + "wrapped-".repeat(12) +
+    "ALT-e\u0301-界-" +
+    "wrapped-".repeat(12) +
     "\x1b]8;;\x1b\\\x1b[0m\x1b]133;B\x07",
 );
 rt.write(source, alternateOff);
@@ -1676,7 +1681,9 @@ for (const feature of [
 rt.write(source, alternateOff);
 rt.write(decodedTerminal, alternateOff);
 assert.equal(
-  rt.gridText(source, 0, 6, continuationText.length), continuationText);
+  rt.gridText(source, 0, 6, continuationText.length),
+  continuationText,
+);
 assert.equal(
   rt.gridText(decodedTerminal, 0, 6, continuationText.length),
   continuationText,
