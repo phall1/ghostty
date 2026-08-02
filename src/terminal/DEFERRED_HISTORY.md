@@ -505,13 +505,13 @@ outside this container absent a future separate specification.
 
 ## Memory/disk budgets, pins, and eviction
 
-| Budget           | Charge                                   | Hard-limit response                                |
-| ---------------- | ---------------------------------------- | -------------------------------------------------- |
+| Budget           | Charge                                   | Hard-limit response                                 |
+| ---------------- | ---------------------------------------- | --------------------------------------------------- |
 | logical resident | backing, indexes, tail, write reserve    | evict/prune before admission or return backpressure |
-| projection       | rows/indexes for all generations         | evict eligible entries or fail                     |
-| scratch          | decode/reflow/compress/repair candidates | do not start an over-budget unit                   |
-| durable          | live records plus reclaimable tail       | prune/compact or reject durable append             |
-| pin               | bytes protected from eviction/prune      | reject a pin above cap                             |
+| projection       | rows/indexes for all generations         | evict eligible entries or fail                      |
+| scratch          | decode/reflow/compress/repair candidates | do not start an over-budget unit                    |
+| durable          | live records plus reclaimable tail       | prune/compact or reject durable append              |
+| pin              | bytes protected from eviction/prune      | reject a pin above cap                              |
 
 Active screen, recovery metadata, and a VT-write admission reserve are inside
 hard budgets. Accounting uses allocated capacity and overhead, not text length.
@@ -658,14 +658,14 @@ The additive libghostty-vt API follows existing conventions:
 
 Handle concurrency and lifetime are part of the ABI:
 
-| Handle | Callers and concurrency | Parent and closing behavior |
-| --- | --- | --- |
-| terminal | mutation/write/resize calls are single-owner-thread and never concurrent | free marks closing; child references defer allocation release; new calls return `terminal_closing` |
-| history | create, append, prune, and destroy are owner-thread serialized | holds terminal reference; destroy requires no concurrent history call |
-| view | immutable map/read calls may run concurrently after publication | holds history/generation pins; release must follow all reads and is not a use-versus-release synchronization primitive |
-| work | exactly one `work_step` caller; `work_cancel` may race from any thread | holds history/store references; destroy follows step; cancel-before-publish wins, cancel-after-publish returns `already_complete` |
-| pin | status may be read concurrently; renew/release are owner-thread serialized | holds history reference; release follows read subleases |
-| store | one thread pumps `next_request`; unique request completions may arrive concurrently | closing stops new requests; outstanding request refs remain until completion/cancel |
+| Handle   | Callers and concurrency                                                             | Parent and closing behavior                                                                                                       |
+| -------- | ----------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| terminal | mutation/write/resize calls are single-owner-thread and never concurrent            | free marks closing; child references defer allocation release; new calls return `terminal_closing`                                |
+| history  | create, append, prune, and destroy are owner-thread serialized                      | holds terminal reference; destroy requires no concurrent history call                                                             |
+| view     | immutable map/read calls may run concurrently after publication                     | holds history/generation pins; release must follow all reads and is not a use-versus-release synchronization primitive            |
+| work     | exactly one `work_step` caller; `work_cancel` may race from any thread              | holds history/store references; destroy follows step; cancel-before-publish wins, cancel-after-publish returns `already_complete` |
+| pin      | status may be read concurrently; renew/release are owner-thread serialized          | holds history reference; release follows read subleases                                                                           |
+| store    | one thread pumps `next_request`; unique request completions may arrive concurrently | closing stops new requests; outstanding request refs remain until completion/cancel                                               |
 
 The library uses acquire/release synchronization at candidate publication,
 cancel flags, request completion, and handle closing. Concurrent release with
@@ -682,19 +682,19 @@ to an addressable `size_t` buffer.
 
 Computation and host storage are pull-based. The exact v1 request operations are:
 
-| Operation | Required fields and acknowledged effect |
-| --- | --- |
-| `create_exclusive` | new object key; fail if it exists, otherwise return generation and length zero |
-| `stat_object` | object key; return existence, generation, and exact length |
-| `read_exact` | object, generation, offset, length; return exactly that range or `short_read` |
-| `append_compare_size` | object, generation, expected length, bytes; append only if both match |
-| `write_exact` | object, generation, offset, bytes; replace exactly that range and return the new generation |
-| `truncate_compare_size` | object, generation, expected length, new shorter length; change only if both match |
-| `flush_data` | all prior object data writes are on durable media |
-| `flush_metadata` | prior object length and metadata changes are durable |
+| Operation                    | Required fields and acknowledged effect                                                            |
+| ---------------------------- | -------------------------------------------------------------------------------------------------- |
+| `create_exclusive`           | new object key; fail if it exists, otherwise return generation and length zero                     |
+| `stat_object`                | object key; return existence, generation, and exact length                                         |
+| `read_exact`                 | object, generation, offset, length; return exactly that range or `short_read`                      |
+| `append_compare_size`        | object, generation, expected length, bytes; append only if both match                              |
+| `write_exact`                | object, generation, offset, bytes; replace exactly that range and return the new generation        |
+| `truncate_compare_size`      | object, generation, expected length, new shorter length; change only if both match                 |
+| `flush_data`                 | all prior object data writes are on durable media                                                  |
+| `flush_metadata`             | prior object length and metadata changes are durable                                               |
 | `compare_exchange_reference` | reference key, expected generation/digest, new object/digest; atomic switch or `reference_changed` |
-| `flush_namespace` | the preceding reference create/replace/delete is durable across crash |
-| `delete_unreferenced` | best-effort garbage removal; never a commit prerequisite |
+| `flush_namespace`            | the preceding reference create/replace/delete is durable across crash                              |
+| `delete_unreferenced`        | best-effort garbage removal; never a commit prerequisite                                           |
 
 Every request carries an opaque authenticated ID, object generation, and the
 IDs of prerequisite requests. The engine does not issue a dependent commit step
@@ -764,19 +764,19 @@ incompatible transition returns `stale`.
 
 The logical cursor transition matrix is:
 
-| Mutation | Relation to captured cut | Token/result |
-| --- | --- | --- |
-| projection reflow/eviction | any | preserved; view token alone becomes stale |
-| append newer than captured newest | outside | registry generation refreshes; append is excluded |
-| committed prepend import older than captured oldest | outside | refreshes; imported rows are excluded |
-| mutable-tail rewrite | outside, because cursor creation seals its boundary | refreshes; a cursor is never opened over ephemeral tail IDs |
-| exact-digest repair | outside or inside cut | refreshes; inside range changes `corrupt` reads to available without changing IDs |
-| repair with different digest/IDs | any overlap | prohibited; require full resync, token returns `stale` |
-| prune wholly older than captured oldest | outside | refreshes and remains usable |
-| prune crossing cut with active pin | overlap | prune returns `pinned`; cursor is preserved |
-| prune crossing unpinned cut | overlap | token enters permanent `pruned` |
-| compaction/recompression/index rebuild | any | preserved; no logical generation change |
-| reset/history discard | any | permanent `wrong_stream` |
+| Mutation                                            | Relation to captured cut                            | Token/result                                                                      |
+| --------------------------------------------------- | --------------------------------------------------- | --------------------------------------------------------------------------------- |
+| projection reflow/eviction                          | any                                                 | preserved; view token alone becomes stale                                         |
+| append newer than captured newest                   | outside                                             | registry generation refreshes; append is excluded                                 |
+| committed prepend import older than captured oldest | outside                                             | refreshes; imported rows are excluded                                             |
+| mutable-tail rewrite                                | outside, because cursor creation seals its boundary | refreshes; a cursor is never opened over ephemeral tail IDs                       |
+| exact-digest repair                                 | outside or inside cut                               | refreshes; inside range changes `corrupt` reads to available without changing IDs |
+| repair with different digest/IDs                    | any overlap                                         | prohibited; require full resync, token returns `stale`                            |
+| prune wholly older than captured oldest             | outside                                             | refreshes and remains usable                                                      |
+| prune crossing cut with active pin                  | overlap                                             | prune returns `pinned`; cursor is preserved                                       |
+| prune crossing unpinned cut                         | overlap                                             | token enters permanent `pruned`                                                   |
+| compaction/recompression/index rebuild              | any                                                 | preserved; no logical generation change                                           |
+| reset/history discard                               | any                                                 | permanent `wrong_stream`                                                          |
 
 Projection-only resize therefore preserves negotiated logical cursors. The
 transition matrix applies to the new logical cursor kind; the legacy token and
@@ -833,19 +833,19 @@ subject to the 2 MiB cap) and hard maximum overscan (512 rows/16 MiB). Report
 p50/p95/p99, codec, cache state, charged bytes, and host I/O separately. Every
 corpus must pass; an aggregate cannot hide a failure.
 
-| Operation | Target |
-| --- | --- |
-| active column resize, default overscan | p95 <= 8 ms, p99 <= 16 ms, zero cold decode |
-| active column resize, hard-max overscan | p95 <= 32 ms, p99 <= 50 ms, zero work outside declared hot bytes |
-| row-only active resize | p95 <= 2 ms |
-| VT write during cold reflow | <= 5% throughput loss; p99 owner stall <= 1 ms |
-| one cooperative step | p95 CPU <= 1 ms; cancel within 64 KiB consumed and produced or 256 rows |
-| 240 cold rows, resident backing | p95 engine CPU <= 8 ms |
-| 240 cold rows, durable backing | p95 engine CPU <= 12 ms plus host I/O |
-| warm anchor map | p95 <= 50 microseconds, no allocation |
-| open clean 10-million-row store | p95 <= 50 ms CPU, at most 64 delta records/8 MiB delta bytes |
-| recover 1 GiB torn-tail container | p95 <= 100 ms CPU plus reclaim I/O |
-| index rebuild | >= 1 GiB segment headers/s, no payload decompression |
+| Operation                               | Target                                                                  |
+| --------------------------------------- | ----------------------------------------------------------------------- |
+| active column resize, default overscan  | p95 <= 8 ms, p99 <= 16 ms, zero cold decode                             |
+| active column resize, hard-max overscan | p95 <= 32 ms, p99 <= 50 ms, zero work outside declared hot bytes        |
+| row-only active resize                  | p95 <= 2 ms                                                             |
+| VT write during cold reflow             | <= 5% throughput loss; p99 owner stall <= 1 ms                          |
+| one cooperative step                    | p95 CPU <= 1 ms; cancel within 64 KiB consumed and produced or 256 rows |
+| 240 cold rows, resident backing         | p95 engine CPU <= 8 ms                                                  |
+| 240 cold rows, durable backing          | p95 engine CPU <= 12 ms plus host I/O                                   |
+| warm anchor map                         | p95 <= 50 microseconds, no allocation                                   |
+| open clean 10-million-row store         | p95 <= 50 ms CPU, at most 64 delta records/8 MiB delta bytes            |
+| recover 1 GiB torn-tail container       | p95 <= 100 ms CPU plus reclaim I/O                                      |
+| index rebuild                           | >= 1 GiB segment headers/s, no payload decompression                    |
 
 Memory targets: resize scratch <= twice encoded hot-set bytes plus 1 MiB; sparse
 logical indexes <= 24 bytes per row averaged at 10 million rows; disk index <=
@@ -856,25 +856,25 @@ resize waiting for compression. A miss blocks default enablement.
 
 ## Test, fuzz, and benchmark matrix
 
-| Area | Tests and properties | Benchmark |
-| --- | --- | --- |
-| identity | survive compression/move/compact/reopen/width; line spans and sliced pages never alias | index overhead 1K..10M rows |
-| anchors | round trips for affinity; frozen segmentation keeps anchors across Unicode upgrades | warm/cold lookup |
-| Unicode | combining/ZWJ/VS/zero/wide edge/width one; malformed cells; span fences | grapheme/reflow throughput |
-| semantics | prompt/style/hyperlink/protection/blank runs survive split/merge | projected run memory |
-| Kitty/glyph | placeholders atomic; missing/live unsupported state rejects before output | placeholder-heavy reflow |
-| resize | cold backing untouched; exact default/max hot bounds; failed transaction keeps dimensions | both overscan gates |
-| budgets | zero/exact/one-less; bounded-write admission is atomic; checkpoint cap backpressures | step/write overhead |
-| cancellation | cancel at every block boundary; <=64 KiB consumed/produced; no late publish | cancellation latency |
-| cache/pins | eviction caps; pin expiration/status/renewal/sublease reclaim schedules | hit rate at fixed bytes |
-| concurrency | deterministic owner/handle use-cancel-close-completion and mutation schedules | VT throughput during work |
-| container | golden digest domains/zeroing; mutate every reserved byte/length/offset/frame | encode/decode/ratio |
-| crashes | fail/tear/reorder every host op; CAS/reference and each flush old-or-new only | recovery/tail size |
-| recovery | durable quarantine reopen/cap/removal, index rebuild, fallback, segment graphs | open/header scan |
-| repair | exact authenticated replacement only; slice gaps/overlap/replay/wrong stream rejected | repair/headroom |
-| ABI | size/null/buffer/ownership; per-handle thread races; fuzz wasm32 offsets/native pointers | boundary copy overhead |
-| compatibility | v1/v2 and `GHUNIT2` goldens unchanged; mixed units reject | snapshot regression |
-| security | token/request forgery, bombs, arithmetic edges, hostile completions | auth/checksum cost |
+| Area          | Tests and properties                                                                      | Benchmark                   |
+| ------------- | ----------------------------------------------------------------------------------------- | --------------------------- |
+| identity      | survive compression/move/compact/reopen/width; line spans and sliced pages never alias    | index overhead 1K..10M rows |
+| anchors       | round trips for affinity; frozen segmentation keeps anchors across Unicode upgrades       | warm/cold lookup            |
+| Unicode       | combining/ZWJ/VS/zero/wide edge/width one; malformed cells; span fences                   | grapheme/reflow throughput  |
+| semantics     | prompt/style/hyperlink/protection/blank runs survive split/merge                          | projected run memory        |
+| Kitty/glyph   | placeholders atomic; missing/live unsupported state rejects before output                 | placeholder-heavy reflow    |
+| resize        | cold backing untouched; exact default/max hot bounds; failed transaction keeps dimensions | both overscan gates         |
+| budgets       | zero/exact/one-less; bounded-write admission is atomic; checkpoint cap backpressures      | step/write overhead         |
+| cancellation  | cancel at every block boundary; <=64 KiB consumed/produced; no late publish               | cancellation latency        |
+| cache/pins    | eviction caps; pin expiration/status/renewal/sublease reclaim schedules                   | hit rate at fixed bytes     |
+| concurrency   | deterministic owner/handle use-cancel-close-completion and mutation schedules             | VT throughput during work   |
+| container     | golden digest domains/zeroing; mutate every reserved byte/length/offset/frame             | encode/decode/ratio         |
+| crashes       | fail/tear/reorder every host op; CAS/reference and each flush old-or-new only             | recovery/tail size          |
+| recovery      | durable quarantine reopen/cap/removal, index rebuild, fallback, segment graphs            | open/header scan            |
+| repair        | exact authenticated replacement only; slice gaps/overlap/replay/wrong stream rejected     | repair/headroom             |
+| ABI           | size/null/buffer/ownership; per-handle thread races; fuzz wasm32 offsets/native pointers  | boundary copy overhead      |
+| compatibility | v1/v2 and `GHUNIT2` goldens unchanged; mixed units reject                                 | snapshot regression         |
+| security      | token/request forgery, bombs, arithmetic edges, hostile completions                       | auth/checksum cost          |
 
 Every persistent version has checked-in golden bytes and an independent parser
 fixture. Crash tests use a fake transport that records and tears operations.
