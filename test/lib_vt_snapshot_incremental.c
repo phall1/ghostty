@@ -348,6 +348,7 @@ static void exercise_history_units(
         lease.lease, source, &cursor) ==
         GHOSTTY_TERMINAL_SNAPSHOT_STATUS_SUCCESS);
     assert(cursor_alloc.active == 2);
+    GhosttyTerminalHistoryCursor cursor_handle = cursor.cursor;
     GhosttyTerminalHistoryCursorResult second = {
         .size = sizeof(second),
         .version = GHOSTTY_TERMINAL_SNAPSHOT_ABI_VERSION,
@@ -485,6 +486,7 @@ static void exercise_history_units(
         abort_importer.importer, destination) ==
         GHOSTTY_TERMINAL_SNAPSHOT_STATUS_SUCCESS);
     ghostty_terminal_history_importer_free(abort_importer.importer);
+    assert(cursor.cursor == cursor_handle);
     ghostty_terminal_history_cursor_free(cursor.cursor);
     assert(cursor_alloc.active == 1);
     ghostty_terminal_history_lease_free(lease.lease);
@@ -522,7 +524,7 @@ int main(void) {
     GhosttyTerminal allocation_terminal = NULL;
     assert(ghostty_terminal_new(
         NULL, &allocation_terminal, 20, 4) == GHOSTTY_SUCCESS);
-    FailAllocator fail_state = { .fail_after = 0 };
+    FailAllocator fail_state = { .fail_after = 1 };
     GhosttyAllocator fail_allocator = {
         .ctx = &fail_state,
         .vtable = &fail_vtable,
@@ -552,6 +554,16 @@ int main(void) {
         allocation_capture, NULL, 0, &aborted_event) ==
         GHOSTTY_TERMINAL_SNAPSHOT_STATUS_INVALID_STATE);
     ghostty_terminal_snapshot_capture_free(allocation_capture);
+    assert(fail_state.active == 0);
+    fail_state.calls = 0;
+    fail_state.fail_after = 1;
+    GhosttyTerminalSnapshotDecoder allocation_decoder = NULL;
+    GhosttyTerminalSnapshotDecoderOptions allocation_decoder_options =
+        decoder_options();
+    assert(ghostty_terminal_snapshot_decoder_new(
+        &fail_allocator, &allocation_decoder_options, &allocation_decoder) ==
+        GHOSTTY_TERMINAL_SNAPSHOT_STATUS_OUT_OF_MEMORY);
+    assert(allocation_decoder == NULL);
     assert(fail_state.active == 0);
     GhosttyTerminalSnapshotCaptureOptions bounded_options =
         capture_options();

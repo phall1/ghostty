@@ -312,10 +312,10 @@ pub fn captureNew(
 
     const alloc = lib.alloc.default(alloc_);
     const state = alloc.create(CaptureState) catch return .out_of_memory;
-    errdefer alloc.destroy(state);
+    defer if (out.* == null) alloc.destroy(state);
     const output_buffer = alloc.alloc(u8, options.max_record_bytes) catch
         return .out_of_memory;
-    errdefer alloc.free(output_buffer);
+    defer if (out.* == null) alloc.free(output_buffer);
 
     var continuation_writer: std.Io.Writer = .fixed(output_buffer);
     terminal_c.writeSnapshotContinuation(
@@ -334,7 +334,7 @@ pub fn captureNew(
         u8,
         continuation_writer.buffered(),
     ) catch return .out_of_memory;
-    errdefer alloc.free(continuation);
+    defer if (out.* == null) alloc.free(continuation);
 
     state.* = undefined;
     state.alloc = alloc;
@@ -519,10 +519,11 @@ pub fn decoderNew(
     }
     const alloc = lib.alloc.default(alloc_);
     const state = alloc.create(DecoderState) catch return .out_of_memory;
-    errdefer alloc.destroy(state);
     state.alloc = alloc;
-    state.context = terminal_c.SnapshotDecodeContext.init(alloc) catch
+    state.context = terminal_c.SnapshotDecodeContext.init(alloc) catch {
+        alloc.destroy(state);
         return .out_of_memory;
+    };
     state.decoder = .init(alloc, state.context.io(), .{
         .max_continuation_bytes = options.max_continuation_bytes,
         .max_record_bytes = options.max_record_bytes,
@@ -708,9 +709,10 @@ pub fn historyLeaseCursor(
         return .wrong_terminal;
     const cursor_state = state.alloc.create(HistoryCursorState) catch
         return .out_of_memory;
-    errdefer state.alloc.destroy(cursor_state);
-    const cursor = state.lease.cursor(zig_terminal) catch |err|
+    const cursor = state.lease.cursor(zig_terminal) catch |err| {
+        state.alloc.destroy(cursor_state);
         return mapError(err);
+    };
     cursor_state.* = .{
         .alloc = state.alloc,
         .terminal = state.terminal,
