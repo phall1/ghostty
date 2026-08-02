@@ -428,6 +428,7 @@ history_invalidation: HistoryInvalidation = .none,
 history_leases: std.AutoHashMapUnmanaged(u8, HistoryLeaseEntry) = .empty,
 history_lease_key: ?[32]u8 = null,
 history_lease_generation: u64 = 0,
+history_import_active: bool = false,
 
 /// Byte size of the raw backing mappings owned by active page nodes. This is
 /// logical scrollback accounting and does not change while a mapping is
@@ -4557,15 +4558,20 @@ pub const HistoryImport = struct {
     viewport_was_top: bool = false,
     viewport_converted: bool = false,
 
+    pub const InitError = Allocator.Error || error{ImportBusy};
+
     pub fn init(
         destination: *PageList,
         alloc: Allocator,
         max_pages: usize,
-    ) Allocator.Error!HistoryImport {
+    ) InitError!HistoryImport {
+        if (destination.history_import_active) return error.ImportBusy;
+        const serials = try alloc.alloc(u64, max_pages);
+        destination.history_import_active = true;
         return .{
             .destination = destination,
             .alloc = alloc,
-            .serials = try alloc.alloc(u64, max_pages),
+            .serials = serials,
         };
     }
 
@@ -4635,12 +4641,15 @@ pub const HistoryImport = struct {
                 !self.contains(current.serial)) break;
             current.snapshot_history_import = false;
         }
+        self.destination.history_import_active = false;
         self.active = false;
     }
 
     /// Stop rollback without touching the destination. This is only valid when
     /// the owning ScreenSet generation proves the destination was destroyed.
     pub fn abandon(self: *HistoryImport) void {
+        // The destination was destroyed, so its transaction flag no longer
+        // exists to clear.
         self.active = false;
     }
 
@@ -4655,6 +4664,7 @@ pub const HistoryImport = struct {
     /// Remove surviving imported history without disturbing later live writes.
     pub fn rollback(self: *HistoryImport) void {
         if (!self.active) return;
+        self.destination.history_import_active = false;
         self.active = false;
 
         while (self.destination.pages.first) |node| {
@@ -8163,6 +8173,48 @@ test "PageList PageAllocation rejects limits before modifying the destination" {
     try testing.expectEqual(before_total_rows, result.total_rows);
     try testing.expectEqual(before_page_size, result.page_size);
     result.assertIntegrity();
+}
+
+test "PageList permits exactly one active HistoryImport" {
+    const testing = std.testing;
+    var result = try init(testing.allocator, .{
+        .cols = 1,
+        .rows = 1,
+        .max_size = null,
+        .max_lines = null,
+    });
+    defer result.deinit();
+    const original_first = result.pages.first.?;
+
+    var first = try HistoryImport.init(&result, testing.allocator, 1);
+    try testing.expect(result.history_import_active);
+    try testing.expectError(
+        error.ImportBusy,
+        HistoryImport.init(&result, testing.allocator, 1),
+    );
+    var rolled_back = try result.allocatePage(.{ .cols = 1, .rows = 1 });
+    defer rolled_back.deinit();
+    rolled_back.page().size.rows = 1;
+    try testing.expect(try first.prepend(&rolled_back));
+    first.rollback();
+    try testing.expect(!result.history_import_active);
+    try testing.expectEqual(original_first, result.pages.first.?);
+    first.deinit();
+
+    var committed = try HistoryImport.init(&result, testing.allocator, 1);
+    var retained = try result.allocatePage(.{ .cols = 1, .rows = 1 });
+    defer retained.deinit();
+    retained.page().size.rows = 1;
+    try testing.expect(try committed.prepend(&retained));
+    const committed_first = result.pages.first.?;
+    committed.commit();
+    try testing.expect(!result.history_import_active);
+    try testing.expect(!committed_first.snapshot_history_import);
+    committed.deinit();
+
+    var clean = try HistoryImport.init(&result, testing.allocator, 0);
+    clean.deinit();
+    try testing.expect(!result.history_import_active);
 }
 
 test "PageList HistoryImport latches discard after a bounded rejection" {
