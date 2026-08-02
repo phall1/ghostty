@@ -449,6 +449,8 @@ pub const Decoder = struct {
     io_: std.Io,
     options: DecodeOptions,
     state: State = .envelope,
+    envelope_buffer: [envelope.encoded_len]u8 = undefined,
+    envelope_len: usize = 0,
     buffer: std.ArrayListUnmanaged(u8) = .empty,
     expected_len: usize = envelope.encoded_len,
     hasher: Blake3 = Blake3.init(.{}),
@@ -488,6 +490,9 @@ pub const Decoder = struct {
         {
             return 0;
         }
+        if (self.state == .envelope) {
+            return envelope.encoded_len - self.envelope_len;
+        }
         return self.expected_len - self.buffer.items.len;
     }
 
@@ -503,6 +508,28 @@ pub const Decoder = struct {
                 if (!self.ready_taken) return error.ReadyNotTaken;
             },
             else => {},
+        }
+
+        // The fixed envelope validates version dispatch before the decoder
+        // performs its first allocation. Record staging begins only afterward.
+        if (self.state == .envelope) {
+            const wanted = envelope.encoded_len - self.envelope_len;
+            const consumed = @min(wanted, input.len);
+            @memcpy(
+                self.envelope_buffer[self.envelope_len..][0..consumed],
+                input[0..consumed],
+            );
+            self.envelope_len += consumed;
+            if (self.envelope_len < envelope.encoded_len) {
+                return .{ .consumed = consumed, .event = .need_input };
+            }
+
+            const event = self.process(&self.envelope_buffer) catch |err| {
+                self.fail();
+                return err;
+            };
+            self.expected_len = record.Header.len;
+            return .{ .consumed = consumed, .event = event };
         }
 
         const wanted = self.expected_len - self.buffer.items.len;

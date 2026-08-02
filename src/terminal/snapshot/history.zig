@@ -312,6 +312,7 @@ pub fn decode(
         alloc,
         @as(usize, decoder.header.page_count),
     );
+    defer import.deinit();
     var contains_prompt = false;
     while (decoder.needsPage()) {
         const result = try decoder.decodePage(
