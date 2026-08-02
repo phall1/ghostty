@@ -2442,7 +2442,7 @@ test "malformed and truncated post-READY history are isolated" {
                         try testing.expect(event.retained);
                         try restored.resize(
                             testing.allocator,
-                            .{ .rows = 5 },
+                            .{ .cols = restored.cols, .rows = 5 },
                         );
                         resized_page_count =
                             restored.screens.get(.primary).?.pages.totalPages();
