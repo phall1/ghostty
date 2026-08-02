@@ -1,6 +1,9 @@
 //! Maintains a linked list of pages to make up a terminal screen
 //! and provides higher level operations on top of those pages to
 //! make it slightly easier to work with.
+//!
+//! Deferred logical history and reflow design:
+//! [DEFERRED_HISTORY.md](DEFERRED_HISTORY.md).
 const PageList = @This();
 
 const std = @import("std");
