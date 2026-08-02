@@ -638,8 +638,8 @@ for (let index = 0; index < 200; ++index) {
   sourceText += `row-${String(index).padStart(3, "0")}\r\n`;
 }
 rt.write(source, sourceText);
-rt.write(source, "\x1b[31");
 exerciseCaptureLimit(rt, source);
+rt.write(source, "\x1b[31");
 
 const failAllocator = await makeFailAllocator(rt);
 const oomOptions = captureOptions(rt);
