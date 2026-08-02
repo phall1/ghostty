@@ -89,14 +89,20 @@ that ID, an absolute `fragment_ordinal`, and continuation flags.
 
 A reflow span contains at most 4096 grapheme atoms, 256 KiB of canonical bytes,
 or eight fragments, whichever limit is reached first. Crossing a limit inserts
-a non-rendering reflow fence: copy and search still join the continued hard
-line, but projection restarts at column zero. Thus no projection depends on an
-unbounded predecessor. A demand request expands backward to its span start and
-forward through the requested fragment. Pruning aligns to a span boundary or
-persists an explicit gap that makes the first retained fragment a new reflow
-fence at column zero; anchors before it return `pruned`. The engine computes the
-complete expanded charge before work starts and returns `too_small` without work
-when it exceeds the budget.
+an explicit canonical `layout_gap` record. It preserves the original no-newline
+text continuation for copy/search only, but it is a semantic projection break:
+the preceding projected row ends, the next span starts at column zero, render
+rows expose `layout_gap_before`, and a request for physically contiguous mapping
+across it returns `layout_gap` rather than silently claiming exact wrapping.
+Anchors on either side remain exact; no anchor denotes an interpolated position
+inside the gap.
+
+Thus bounded projection deliberately reports the fidelity boundary instead of
+changing wrapping invisibly. Demand expands backward to the current span start
+and forward through the requested fragment. Pruning aligns to a span boundary
+or persists the same explicit gap; anchors before it return `pruned`. The engine
+computes the complete expanded charge before work starts and returns `too_small`
+without work when it exceeds the budget.
 
 ```text
 Terminal / ScreenSet mutation owner
@@ -209,15 +215,28 @@ segmentation migration must allocate new logical IDs and return an explicit
 old-anchor-to-new-anchor map with `unmappable`; container v1 performs no such
 migration.
 
-A column resize is a mutation-owner transaction:
+A column resize is one mutation-owner transaction:
 
-1. capture cursor, viewport, selection, and semantic positions as anchors;
-2. seal only mutable fragments needed to stabilize the hot boundary;
-3. reflow active rows plus bounded hot overscan into a candidate generation;
-4. expand a continued fragment only to its bounded reflow-span start;
-5. map required anchors into the candidate;
-6. validate screen invariants and memory limits; and
-7. atomically publish dimensions, hot projection, and generation.
+1. begin a rollback journal containing old dimensions, tail allocation state,
+   parser/screen coordinates, and the current `next_page_sequence`;
+2. record required positions only as transaction-local ephemeral tail
+   coordinates, not public anchors;
+3. build a provisional seal for every mutable tail fragment those coordinates
+   can reference, reserving page sequences without publishing pages;
+4. translate the ephemeral coordinates through the provisional seal map into
+   stable logical anchors;
+5. reflow active rows plus bounded hot overscan into a candidate generation and
+   expand continued fragments only to their span start;
+6. map the stable anchors, then validate screen invariants and memory limits;
+7. atomically publish the sealed pages, stable-anchor state, dimensions, hot
+   projection, and generation as one owner sequence.
+
+Any failure before step 7 discards the candidate and provisional sealed pages,
+restores the mutable tail and all ephemeral coordinates from the journal, and
+leaves old dimensions/generation published. Reserved page sequences are burned
+and never reused, so rollback cannot alias a previously observed identity.
+Cursor/snapshot creation cannot interleave on the owner; it observes either the
+complete state before this transaction or the complete publication after it.
 
 Default overscan is two viewport heights, capped at 256 projected rows and
 2 MiB of canonical input. Configuration may reduce it to zero but may not exceed
@@ -389,32 +408,206 @@ when written and handled only by explicit compatibility rules.
 +-----------------------------+
 ```
 
-A superblock has magic, container major/minor, checksum algorithm, required
-features, `stream_id`, sequence, committed manifest offset/length/digest, prune
-frontier, and its checksum. Slots alternate. Recovery chooses the highest valid
-sequence whose manifest also validates. Fixed size reserves versioned space
-without C or Zig padding.
+### Normative container v1 grammar
 
-A segment record contains:
+This subsection, not an in-memory declaration, defines v1. All integers are
+unsigned little-endian, all offsets are absolute from the beginning of the
+containing object or record as stated, and all records begin at an 8-byte object
+offset. There are no varints, implicit padding, native enums, or byte-order
+marks. A `[N]byte` field is exactly N uninterpreted bytes. Every reserved byte
+must be zero. V1 readers reject a wrong fixed header length, nonzero reserved
+field, unknown required flag, misalignment, overflow, overlap, hole in a
+canonical section sequence, or nonzero trailing alignment byte.
 
-- magic, version, header length, and total length;
-- monotonic segment ID and previous committed segment ID;
-- first/last logical page sequences, page count, and row count;
-- codec, compressed length, and uncompressed length;
-- a bounded page directory of offsets, lengths, rows, and BLAKE3-256 page
-  digests; and
-- BLAKE3-256 canonical-payload and complete-record digests.
+Superblocks A and B begin at object offsets 0 and 4096 and are exactly 4096
+bytes:
 
-Canonical payload is explicit logical-page records, never `Page`. Proposed hard
-limits are 4 MiB compressed, 16 MiB uncompressed, 4096 pages, 1,048,576 rows,
-and 64:1 expansion per segment. Readers reject overflow, overlap, out-of-file
-offsets, nonmonotonic/duplicate IDs, and limits before allocation.
+| Offset | Width | Field |
+| ---: | ---: | --- |
+| 0 | 8 | ASCII magic `GHHSB001` |
+| 8 | 2 | major = 1 |
+| 10 | 2 | minor = 0 |
+| 12 | 2 | header length = 144 |
+| 14 | 2 | checksum algorithm = 1 (BLAKE3-256) |
+| 16 | 8 | required feature bits |
+| 24 | 16 | stream ID |
+| 40 | 8 | superblock sequence |
+| 48 | 8 | manifest object offset |
+| 56 | 8 | manifest byte length |
+| 64 | 32 | manifest digest |
+| 96 | 8 | prune page sequence |
+| 104 | 4 | prune row ordinal |
+| 108 | 4 | flags |
+| 112 | 32 | superblock checksum |
+| 144 | 3952 | zero reserved bytes |
+
+The five record magics are `GHSEG001`, `GHIDX001`, `GHCKP001`, `GHQUA001`, and
+`GHMAN001`. Each starts with this 96-byte common header:
+
+| Offset | Width | Field |
+| ---: | ---: | --- |
+| 0 | 8 | type-specific magic |
+| 8 | 2 | major = 1 |
+| 10 | 2 | minor = 0 |
+| 12 | 2 | type: segment=1, index=2, checkpoint=3, quarantine=4, manifest=5 |
+| 14 | 2 | flags; v1 writes zero |
+| 16 | 4 | header length |
+| 20 | 4 | zero reserved |
+| 24 | 8 | total record length, including final zero alignment |
+| 32 | 8 | record sequence |
+| 40 | 32 | record digest |
+| 72 | 8 | body length excluding header and final alignment |
+| 80 | 8 | required feature bits |
+| 88 | 8 | zero reserved |
+
+Except for a segment, `header_length` is 96, the body begins at offset 96, and
+`total_record_length = align8(96 + body_length)`. The bytes between the body end
+and total length are zero. Record sequence is strictly increasing in append
+order. An optional future record is skippable only when its type and every
+required feature are known to be optional; unknown v1 types are rejected.
+
+A segment has `header_length = 256`. Its extension is:
+
+| Offset | Width | Field |
+| ---: | ---: | --- |
+| 96 | 8 | segment ID |
+| 104 | 8 | previous committed segment ID, or zero |
+| 112 | 8 | first page sequence |
+| 120 | 8 | last page sequence, inclusive |
+| 128 | 4 | page count |
+| 132 | 4 | logical row count |
+| 136 | 2 | codec: none=0, independent LZ4 block=1 |
+| 138 | 2 | block digest algorithm = 1 (BLAKE3-256) |
+| 140 | 4 | block count |
+| 144 | 8 | page directory offset, exactly 256 |
+| 152 | 8 | page directory byte length, exactly page_count * 64 |
+| 160 | 8 | block directory offset |
+| 168 | 8 | block directory byte length, exactly block_count * 48 |
+| 176 | 8 | compressed payload offset |
+| 184 | 8 | compressed payload length |
+| 192 | 8 | canonical uncompressed payload length |
+| 200 | 32 | canonical payload digest |
+| 232 | 24 | zero reserved |
+
+For a segment, `block_directory_offset = 256 + page_directory_byte_length`,
+`compressed_payload_offset = align8(block_directory_offset +
+block_directory_byte_length)`, and `body_length` is the bytes from offset 256
+through the last compressed payload byte, including the intervening zero
+alignment. `total_record_length = align8(compressed_payload_offset +
+compressed_payload_length)`. Its final alignment is zero and is excluded from
+`body_length`.
+
+The page directory immediately follows the segment header. Each 64-byte entry is
+ordered by increasing page sequence:
+
+| Entry offset | Width | Field |
+| ---: | ---: | --- |
+| 0 | 8 | page sequence |
+| 8 | 4 | row count |
+| 12 | 2 | canonical segmentation version |
+| 14 | 2 | page flags |
+| 16 | 8 | offset in uncompressed canonical payload |
+| 24 | 8 | canonical page byte length |
+| 32 | 32 | canonical page digest |
+
+The block directory follows immediately, then zero padding to the next 8-byte
+boundary, then the compressed payload. Each 48-byte block entry is:
+
+| Entry offset | Width | Field |
+| ---: | ---: | --- |
+| 0 | 8 | offset relative to compressed payload |
+| 8 | 4 | compressed length, 1..65536 |
+| 12 | 4 | produced length, 1..65536 |
+| 16 | 32 | digest of the exact compressed block bytes |
+
+Block offsets start at zero, are contiguous with no padding, and end exactly at
+compressed payload length. Codec 0 requires compressed length equal produced
+length for every block. Codec 1 is raw LZ4 Block Format 1.0: independent blocks,
+no dictionary, frame header, content-size field, or carried state. Its last
+sequence is literal-only, the final five produced bytes are literals, and the
+last match starts at least 12 produced bytes before the end; payloads shorter
+than 13 bytes use codec 0. A decoder consumes the entire compressed block and
+produces exactly the declared length. Trailing input, short/long output, an
+offset before block output, or invalid final sequence is corruption.
+
+Multiple valid LZ4 encodings may represent the same canonical payload;
+compressed bytes are not logical identity. The engine writer may replace them
+only through an atomic recompression transaction, while page and payload digests
+authenticate the unique uncompressed bytes. Golden fixtures fix representative
+writer output but readers accept every structurally valid v1 block.
+
+The uncompressed payload is a contiguous sequence of canonical logical pages.
+Each starts with an 80-byte header:
+
+| Page offset | Width | Field |
+| ---: | ---: | --- |
+| 0 | 8 | ASCII magic `GHLPAG01` |
+| 8 | 2 | logical page version = 1 |
+| 10 | 2 | header length = 80 |
+| 12 | 4 | page flags |
+| 16 | 16 | stream ID |
+| 32 | 8 | page sequence |
+| 40 | 4 | row count |
+| 44 | 2 | segmentation version |
+| 46 | 2 | zero reserved |
+| 48 | 8 | row directory offset, exactly 80 |
+| 56 | 8 | row data offset |
+| 64 | 8 | total page length |
+| 72 | 8 | zero reserved |
+
+Its `row_count` 64-byte entries follow the header. An entry stores, in order:
+`row_ordinal:u32`, `row_flags:u16`, `reserved:u16`,
+`logical_line_first_page_sequence:u64`,
+`logical_line_first_row_ordinal:u32`, `fragment_ordinal:u32`,
+`row_record_offset:u64`, `row_record_length:u64`,
+`grapheme_directory_offset:u64`, `grapheme_directory_count:u32`,
+`reserved:u32`, and `reserved_tail:[8]byte`. Row flags assign bits 0, 1, and 2
+to hard break, continuation, and `layout_gap_before`; all other bits are zero.
+Ordinals equal the directory index. Row ranges are ordered, nonoverlapping, and
+contained in the page.
+
+Each row record is an 8-byte-aligned sequence of TLVs
+`kind:u16, flags:u16, length:u32, payload:[length]byte, zero-pad-to-8`, ordered
+by kind. V1 kinds are atoms=1, styles=2, hyperlinks=3, semantics=4,
+protection=5, and Kitty textual placeholder metadata=6; a duplicate kind is
+invalid. The grapheme directory is an array of little-endian `u32` byte offsets
+into the atoms payload, has `grapheme_count + 1` entries, starts at zero, is
+nondecreasing, and ends at the atoms payload length. The individual v1 TLV
+payload grammars receive checked-in golden fixtures with the container grammar;
+an independent container parser may bounds-check and digest opaque TLV payloads
+without mapping a native cell.
+
+Index bodies are arrays of 32-byte entries
+`first_page:u64, last_page:u64, segment_id:u64, cumulative_rows:u64`.
+A checkpoint body starts with
+`first_page:u64, last_page:u64, entry_count:u32, reserved:u32,
+total_rows:u64` followed by exactly `entry_count` index entries. A quarantine
+body is exactly 104 bytes:
+`segment_id:u64, first_page:u64, last_page:u64, failure_stage:u16,
+reserved:u16, retry_count:u32, observation_sequence:u64,
+expected_digest:[32]byte, observed_digest:[32]byte`.
+
+A manifest body begins with
+`previous_manifest_offset:u64, checkpoint_offset:u64, checkpoint_length:u64,
+segment_ref_count:u32, quarantine_ref_count:u32, prune_page:u64,
+prune_row:u32, delta_record_count:u32, delta_encoded_bytes:u64,
+newest_page:u64`. It is followed by `segment_ref_count` 72-byte entries
+`segment_id:u64, object_offset:u64, byte_length:u64, first_page:u64,
+last_page:u64, digest:[32]byte`, then `quarantine_ref_count` 48-byte entries
+`object_offset:u64, byte_length:u64, digest:[32]byte`. Counts and multiplication
+are validated before allocation. No other v1 body bytes are permitted.
+
+Canonical payload is never a native `Page`. Segment hard limits are 4 MiB
+compressed, 16 MiB uncompressed, 4096 pages, 1,048,576 rows, and 64:1 expansion.
+Readers reject overflow, overlap, out-of-file offsets, nonmonotonic or duplicate
+IDs, and every limit violation before allocation.
 
 BLAKE3-256 detects accidental damage and compares content; it does not
 authenticate an attacker-controlled store. Container v1 fixes all digest domains
 byte-for-byte:
 
 - every input is `ASCII-domain-tag || 0x00 || le64(content_length) || content`;
+- `GHOSTTY-HISTORY-V1-BLOCK` covers the exact compressed bytes of one block;
 - `GHOSTTY-HISTORY-V1-PAGE` covers one complete uncompressed canonical page
   record, whose digest is stored only in the page directory;
 - `GHOSTTY-HISTORY-V1-PAYLOAD` covers the exact concatenation of uncompressed
@@ -580,15 +773,38 @@ level publishes later data.
 - Isolated segment damage quarantines that identity range while unaffected later
   segments remain available.
 - Chain or manifest damage falls back to the previous valid superblock.
-- No complete manifest yields read-only recovery mode or `needs_full_resync`,
-  never partial published history.
+- If neither superblock references a complete valid manifest, open
+  deterministically returns `needs_full_resync` and leaves the store handle in
+  `failed_closed`. It publishes no history and permits only bounded diagnostics,
+  destroy, or explicit discard-and-create-new-stream; reads, repair, migration,
+  and writes return `needs_full_resync`.
 
 Quarantine state is durable. A versioned `QUARANTINE` record contains the
 segment/range, failure stage, safe expected and observed digest, observation
 sequence, and retry count. The record uses the exact digest domain above and is
-referenced by the manifest; discovery is committed with the normal
-segment/index/manifest/superblock ordering before the open completes writable.
-Until that commit succeeds the store remains read-only recovery mode.
+referenced by the manifest; discovery during open is committed with normal
+record/manifest/superblock ordering before open reports a writable handle. Until
+that commit succeeds, open returns `quarantine_commit_failed` in
+`recovery_read_only`, never an ambiguous partially writable state.
+
+Corruption first discovered by a writable demand read uses the same transaction.
+The first failing validator atomically installs one in-memory
+`quarantine_pending` entry keyed by segment; concurrent readers coalesce on it,
+publish no payload, and return `corrupt_pending_quarantine`. The owner serializes
+one append of the quarantine record, data/metadata flushes, a manifest containing
+the old live set plus the new reference, the alternate superblock write, and its
+flush. No later durable append may publish a competing manifest while that owner
+transaction is pending.
+
+If repair or prune wins the owner sequence before the quarantine record append,
+it may replace/remove the segment and cancel the pending record atomically. If
+the quarantine manifest wins, later repair/prune removes its reference in a new
+manifest. If any quarantine write or flush fails, the store enters
+`recovery_read_only`, all waiters receive `quarantine_commit_failed`, the
+in-process pending entry prevents another payload decode, and no further write
+is admitted. Reopen starts from the prior valid manifest and may rediscover and
+retry the quarantine transaction. Destruction cancels only unissued requests;
+acknowledged durable bytes remain unreachable unless a manifest committed them.
 
 The live quarantine table is capped at 1024 records and 256 KiB encoded,
 including manifest references. One newest record per segment supersedes earlier
@@ -652,7 +868,7 @@ The additive libghostty-vt API follows existing conventions:
 - variable output uses a caller buffer with required/written lengths or an
   explicit `GhosttyAllocator` result freed with that allocator and exact length;
 - byte slices are borrowed only for the call;
-- owned handles have idempotent destroy/release; and
+- owned handles use bounded registry generations with ordered-release behavior;
 - no `Page`, Zig slice, native enum/padding, compression state, callback, or file
   descriptor crosses the ABI.
 
@@ -669,11 +885,31 @@ Handle concurrency and lifetime are part of the ABI:
 
 The library uses acquire/release synchronization at candidate publication,
 cancel flags, request completion, and handle closing. Concurrent release with
-any non-status call is caller error, so idempotent release means repeated
-ordered release, not safe use-after-free. Terminal closing cancels work; a late
-I/O completion validates its request, discards bytes, releases the request ref,
-and returns `store_closing`. If completion won before cancel, its private result
-still cannot publish after the owner observes cancel.
+any non-status call is caller error; ordered repeated release uses a bounded
+registry rather than retaining freed allocations.
+
+Each handle kind has a budgeted slot registry: 4096 slots by default and 65,535
+at the hard maximum, counting active entries and one tombstone per reusable
+slot. An opaque handle token authenticates kind, slot, parent registry,
+`generation:u64`, and random registry nonce. First release changes `active` to
+`released_tombstone` and frees all owned resources. A repeated matching release
+while that tombstone remains returns success with `already_released`. Allocation
+may reuse the oldest tombstone, increments its generation, and makes every older
+token for the slot return `stale_handle` without touching the new object. Thus
+idempotency is explicit and bounded to the parent registry lifetime and the
+slot's most recent generation, not an unbounded promise for arbitrary old bytes.
+
+No free active slot or reusable tombstone returns `handle_limit_exceeded` without
+allocation. Generation never wraps: a slot at `maxInt(u64)` is permanently
+retired, and a registry with no nonretired slot returns
+`handle_generation_exhausted`. Tombstones and retired slots remain within the
+fixed registry charge. Parent closing keeps the registry until active children
+and outstanding requests reach zero, then invalidates all tokens.
+
+Terminal closing cancels work; a late I/O completion validates its request,
+discards bytes, releases the request reference, and returns `store_closing`. If
+completion won before cancel, its private result still cannot publish after the
+owner observes cancel.
 
 The same C declarations compile native and wasm32. WASM pointers are checked
 linear-memory offsets. No retained pointer crosses a call and no JavaScript-only
@@ -863,16 +1099,16 @@ resize waiting for compression. A miss blocks default enablement.
 | Unicode       | combining/ZWJ/VS/zero/wide edge/width one; malformed cells; span fences                   | grapheme/reflow throughput  |
 | semantics     | prompt/style/hyperlink/protection/blank runs survive split/merge                          | projected run memory        |
 | Kitty/glyph   | placeholders atomic; missing/live unsupported state rejects before output                 | placeholder-heavy reflow    |
-| resize        | cold backing untouched; exact default/max hot bounds; failed transaction keeps dimensions | both overscan gates         |
-| budgets       | zero/exact/one-less; bounded-write admission is atomic; checkpoint cap backpressures      | step/write overhead         |
-| cancellation  | cancel at every block boundary; <=64 KiB consumed/produced; no late publish               | cancellation latency        |
-| cache/pins    | eviction caps; pin expiration/status/renewal/sublease reclaim schedules                   | hit rate at fixed bytes     |
-| concurrency   | deterministic owner/handle use-cancel-close-completion and mutation schedules             | VT throughput during work   |
-| container     | golden digest domains/zeroing; mutate every reserved byte/length/offset/frame             | encode/decode/ratio         |
-| crashes       | fail/tear/reorder every host op; CAS/reference and each flush old-or-new only             | recovery/tail size          |
-| recovery      | durable quarantine reopen/cap/removal, index rebuild, fallback, segment graphs            | open/header scan            |
-| repair        | exact authenticated replacement only; slice gaps/overlap/replay/wrong stream rejected     | repair/headroom             |
-| ABI           | size/null/buffer/ownership; per-handle thread races; fuzz wasm32 offsets/native pointers  | boundary copy overhead      |
+| resize        | provisional tail seal/anchor rollback; layout-gap visibility; exact hot bounds          | both overscan gates         |
+| budgets       | zero/exact/one-less; bounded-write admission is atomic; checkpoint cap backpressures    | step/write overhead         |
+| cancellation  | cancel at every block boundary; <=64 KiB consumed/produced; no late publish             | cancellation latency        |
+| cache/pins    | eviction caps; pin expiration/status/renewal/sublease reclaim schedules                 | hit rate at fixed bytes     |
+| concurrency   | deterministic owner/handle use-cancel-close-completion and mutation schedules           | VT throughput during work   |
+| container     | independent golden parser; exact offsets/digests/LZ4; mutate reserved/length/frame bytes | encode/decode/ratio         |
+| crashes       | fail/tear/reorder every host op; CAS/reference and each flush old-or-new only           | recovery/tail size          |
+| recovery      | no-manifest failed-closed; demand quarantine races/failure/reopen/cap/removal            | open/header scan            |
+| repair        | exact authenticated replacement only; slice gaps/overlap/replay/wrong stream rejected   | repair/headroom             |
+| ABI           | handle tombstone reuse/limits/exhaustion and thread races; fuzz wasm/native pointers     | boundary copy overhead      |
 | compatibility | v1/v2 and `GHUNIT2` goldens unchanged; mixed units reject                                 | snapshot regression         |
 | security      | token/request forgery, bombs, arithmetic edges, hostile completions                       | auth/checksum cost          |
 
