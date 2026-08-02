@@ -566,16 +566,88 @@ to hard break, continuation, and `layout_gap_before`; all other bits are zero.
 Ordinals equal the directory index. Row ranges are ordered, nonoverlapping, and
 contained in the page.
 
-Each row record is an 8-byte-aligned sequence of TLVs
-`kind:u16, flags:u16, length:u32, payload:[length]byte, zero-pad-to-8`, ordered
-by kind. V1 kinds are atoms=1, styles=2, hyperlinks=3, semantics=4,
-protection=5, and Kitty textual placeholder metadata=6; a duplicate kind is
-invalid. The grapheme directory is an array of little-endian `u32` byte offsets
-into the atoms payload, has `grapheme_count + 1` entries, starts at zero, is
-nondecreasing, and ends at the atoms payload length. The individual v1 TLV
-payload grammars receive checked-in golden fixtures with the container grammar;
-an independent container parser may bounds-check and digest opaque TLV payloads
-without mapping a native cell.
+`row_record_offset` and `grapheme_directory_offset` are absolute from the first
+byte of the logical page. `row_data_offset = align8(80 + row_count * 64)`.
+Row records appear contiguously in row-ordinal order from `row_data_offset`, with
+no inter-row bytes. All grapheme directories follow, in row order, as contiguous
+`u32` arrays; final page padding to `total_page_length` is zero. A row record is
+an 8-byte-aligned sequence of TLVs
+`kind:u16, flags:u16, length:u32, payload:[length]byte, zero-pad-to-8`.
+`length` excludes the TLV header and padding. V1 TLV flags are zero, kinds are
+strictly increasing, and every present kind occurs once. Atoms kind 1 is
+required. Styles=2, hyperlinks=3, semantics=4, protection=5, and Kitty textual
+placeholder metadata=6 are omitted exactly when they have no nondefault entry.
+Unknown kinds, flags, enum values, nonzero reserved fields, duplicate table
+entries, and offsets into headers or padding are invalid in logical page v1; an
+extension requires a new logical page version and required container feature.
+
+The atoms payload begins `atom_count:u32, reserved:u32`. It is followed by
+`atom_count` variable records. Each record begins
+`record_length:u32, atom_flags:u16, cell_width:u8, reserved:u8,
+scalar_count:u16, source_cell_count:u16, kitty_metadata_index:u32`, followed by
+`scalar_count` Unicode scalar values as `u32` and zero padding included in
+`record_length` to a multiple of eight. `record_length` is at least 16 and
+exactly `align8(16 + scalar_count * 4)`. Atom flag bit 0 is `explicit_blank` and
+bit 1 is `kitty_text_placeholder`; other bits are zero. `cell_width` and
+`source_cell_count` are each 1 or 2. Scalar count is zero exactly for an
+explicit blank; otherwise every scalar is valid and the stored sequence is not
+normalized. `kitty_metadata_index` is `0xffffffff` unless bit 1 is set.
+
+The row's grapheme directory has `atom_count + 1` entries. Its values are byte
+offsets relative to the first atom record, immediately after the atoms payload's
+8-byte header. Entry zero is zero, each next entry equals the sum of preceding
+atom `record_length` values, and the final entry is the complete atom-record byte
+length. Consequently one atom is exactly one persisted grapheme and anchor
+ordinals do not depend on TLV/header bytes.
+
+The styles payload is
+`style_count:u32, run_count:u32`, then `style_count` 48-byte style entries, then
+`run_count` 16-byte runs. A color occupies eight bytes:
+`kind:u8, reserved:[3]byte, value:u32`; kind 0=default requires value zero,
+kind 1=palette requires only value bits 0..7, and kind 2=RGB requires only bits
+0..23 in `0x00RRGGBB`. A style entry is foreground, background, and underline
+color (24 bytes), `attribute_flags:u32`, `underline_style:u8`,
+`font_index:u8`, `reserved:u16`, and `reserved_tail:[16]byte`.
+Attribute bits 0..7 are bold, faint, italic, blink, inverse, invisible,
+strikethrough, and overline; other bits are zero. Underline style is 0=none,
+1=single, 2=double, 3=curly, 4=dotted, or 5=dashed. A run is
+`start_atom:u32, end_atom:u32, style_index:u32, reserved:u32`. Runs are sorted,
+maximal, nonempty, and exactly cover `[0, atom_count)` without overlap or gaps.
+Style entries are deduplicated and ordered by first run use. The TLV is omitted
+only when one implicit default style covers all atoms.
+
+The hyperlinks payload header is
+`link_count:u32, run_count:u32, string_bytes:u32, reserved:u32`, followed by
+`link_count` 24-byte link entries, `run_count` 16-byte runs, then the byte-string
+blob. A link entry is three `(offset:u32, length:u32)` pairs for URI, ID, and
+parameters. Offsets are relative to the blob start. The canonical blob is the
+exact unnormalized bytes for URI, then ID, then parameters for each link in
+first-use order, with no gap, overlap, terminator, or padding. Identical triples
+are deduplicated. A run is
+`start_atom:u32, end_atom:u32, link_index:u32, reserved:u32`; runs are sorted,
+nonempty, nonoverlapping, and maximal. Unlinked gaps are implicit.
+
+The semantics payload is `run_count:u32, reserved:u32`, then 16-byte entries
+`start_atom:u32, end_atom:u32, semantic_kind:u16, flags:u16,
+semantic_id:u32`. Kinds are 1=prompt, 2=command input, and 3=command output;
+flags are zero. Runs are sorted, nonempty, nonoverlapping, and coalesced when
+kind and ID match. The protection payload has the same 8-byte header followed by
+8-byte `start_atom:u32, end_atom:u32` protected ranges, sorted, nonempty,
+nonoverlapping, and nonadjacent; unlisted atoms are unprotected.
+
+The Kitty textual-placeholder payload is
+`placeholder_count:u32, reserved:u32`, then 32-byte entries
+`atom_index:u32, image_id:u32, placement_id:u32, placement_row:u32,
+placement_column:u32, placement_rows:u16, placement_columns:u16, flags:u32,
+reserved:u32`. Entries are ordered by atom index; rows and columns are nonzero;
+v1 flags are zero. Each entry corresponds bijectively to an atom whose
+`kitty_text_placeholder` bit is set and whose metadata index equals this entry's
+zero-based ordinal. Its original placeholder scalars remain in the atom.
+
+All run endpoints are absolute half-open atom ordinals in this row. Table counts,
+fixed-size products, offsets, and endpoints are checked before allocation. These
+ordering and omission rules are canonical; an independent implementation can
+parse and reproduce every v1 logical payload without native cell knowledge.
 
 Index bodies are arrays of 32-byte entries
 `first_page:u64, last_page:u64, segment_id:u64, cumulative_rows:u64`.
@@ -591,11 +663,33 @@ A manifest body begins with
 `previous_manifest_offset:u64, checkpoint_offset:u64, checkpoint_length:u64,
 segment_ref_count:u32, quarantine_ref_count:u32, prune_page:u64,
 prune_row:u32, delta_record_count:u32, delta_encoded_bytes:u64,
-newest_page:u64`. It is followed by `segment_ref_count` 72-byte entries
-`segment_id:u64, object_offset:u64, byte_length:u64, first_page:u64,
-last_page:u64, digest:[32]byte`, then `quarantine_ref_count` 48-byte entries
-`object_offset:u64, byte_length:u64, digest:[32]byte`. Counts and multiplication
-are validated before allocation. No other v1 body bytes are permitted.
+newest_page:u64`. It is followed in this exact order by:
+
+1. `segment_ref_count` 72-byte entries
+   `segment_id:u64, object_offset:u64, byte_length:u64, first_page:u64,
+   last_page:u64, digest:[32]byte`;
+2. `quarantine_ref_count` 48-byte entries
+   `object_offset:u64, byte_length:u64, digest:[32]byte`; and
+3. `delta_record_count` 56-byte entries
+   `record_sequence:u64, object_offset:u64, byte_length:u64, digest:[32]byte`.
+
+Delta references are ordered by strictly increasing record sequence and object
+offset. Their lengths sum exactly to `delta_encoded_bytes`; each length is the
+referenced INDEX record's `total_record_length`. A referenced range must be
+after the checkpoint record, within the committed object length, disjoint from
+every other referenced record, and before this manifest. Counts, products, and
+the delta-byte cap validate before allocation or referenced I/O. No other v1
+manifest body bytes are permitted.
+
+Clean open reads only the manifest-listed delta ranges, never scans across
+interleaved segment payloads. Every reference must resolve to `GHIDX001` with the
+same common-header sequence, byte length, and digest; its record digest and index
+ordering must validate before replay. Replay order is the manifest order and
+each page range must reference a live segment in the same manifest without
+overlap or regression. A missing, duplicate, reordered, overlapping, or
+digest-mismatched delta invalidates the complete manifest, causing deterministic
+fallback to the other valid superblock/manifest or `needs_full_resync` if none
+exists.
 
 Canonical payload is never a native `Page`. Segment hard limits are 4 MiB
 compressed, 16 MiB uncompressed, 4096 pages, 1,048,576 rows, and 64:1 expansion.
@@ -631,10 +725,12 @@ and domains; an old identifier is never reinterpreted.
 ### Index and checkpoints
 
 A manifest lists ordered live segments, prune frontier, newest logical page,
-latest checkpoint, and the bounded live quarantine-record set. Its digest covers
-its fields and referenced segment/quarantine digests. A checkpoint has a
-complete sorted page-range-to-segment index and sparse row counts. Incremental
-index records after it replay in commit order.
+latest checkpoint, bounded quarantine references, and the complete ordered list
+of post-checkpoint index-delta references. Its digest covers every reference and
+referenced digest value. A checkpoint has a complete sorted
+page-range-to-segment index and sparse row counts. Open replays only the
+manifest-listed deltas in their validated sequence; it never discovers them by
+scanning interleaved records.
 
 Normal checkpoint cadence is 64 committed segments or 64 MiB of new segment
 payload. Independently, the hard post-checkpoint delta cap is 64 incremental
@@ -1104,7 +1200,7 @@ resize waiting for compression. A miss blocks default enablement.
 | cancellation  | cancel at every block boundary; <=64 KiB consumed/produced; no late publish              | cancellation latency        |
 | cache/pins    | eviction caps; pin expiration/status/renewal/sublease reclaim schedules                  | hit rate at fixed bytes     |
 | concurrency   | deterministic owner/handle use-cancel-close-completion and mutation schedules            | VT throughput during work   |
-| container     | independent golden parser; exact offsets/digests/LZ4; mutate reserved/length/frame bytes | encode/decode/ratio         |
+| container     | independent TLV/golden parser; manifest delta refs; exact offsets/digests/LZ4 mutations  | encode/decode/ratio         |
 | crashes       | fail/tear/reorder every host op; CAS/reference and each flush old-or-new only            | recovery/tail size          |
 | recovery      | no-manifest failed-closed; demand quarantine races/failure/reopen/cap/removal            | open/header scan            |
 | repair        | exact authenticated replacement only; slice gaps/overlap/replay/wrong stream rejected    | repair/headroom             |
