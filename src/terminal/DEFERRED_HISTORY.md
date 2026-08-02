@@ -844,13 +844,13 @@ outside this container absent a future separate specification.
 
 ## Memory/disk budgets, pins, and eviction
 
-| Budget           | Charge                                   | Hard-limit response                                 |
-| ---------------- | ---------------------------------------- | --------------------------------------------------- |
-| logical resident | backing, indexes, tail, write reserve    | evict/prune before admission or return backpressure |
-| projection       | rows/indexes for all generations         | evict eligible entries or fail                      |
-| scratch          | decode/reflow/compress/repair candidates | do not start an over-budget unit                    |
-| durable          | active, staging, retiring, tail, compaction reserve | admit COW compaction or reject durable append        |
-| pin              | bytes protected from eviction/prune      | reject a pin above cap                              |
+| Budget           | Charge                                              | Hard-limit response                                 |
+| ---------------- | --------------------------------------------------- | --------------------------------------------------- |
+| logical resident | backing, indexes, tail, write reserve               | evict/prune before admission or return backpressure |
+| projection       | rows/indexes for all generations                    | evict eligible entries or fail                      |
+| scratch          | decode/reflow/compress/repair candidates            | do not start an over-budget unit                    |
+| durable          | active, staging, retiring, tail, compaction reserve | admit COW compaction or reject durable append       |
+| pin              | bytes protected from eviction/prune                 | reject a pin above cap                              |
 
 Active screen, recovery metadata, and a VT-write admission reserve are inside
 hard budgets. Accounting uses allocated capacity and overhead, not text length.
@@ -1072,19 +1072,19 @@ to an addressable `size_t` buffer.
 
 Computation and host storage are pull-based. The exact v1 request operations are:
 
-| Operation                    | Required fields and acknowledged effect                                                            |
-| ---------------------------- | -------------------------------------------------------------------------------------------------- |
-| `create_exclusive`           | new object key; fail if it exists, otherwise return generation and length zero                     |
-| `stat_object`                | object key; return existence, generation, and exact length                                         |
-| `read_exact`                 | object, generation, offset, length; return exactly that range or `short_read`                      |
-| `append_compare_size`        | object, generation, expected length, bytes; append only if both match                              |
-| `write_exact`                | object, generation, offset, bytes; replace exactly that range and return the new generation        |
-| `truncate_compare_size`      | object, generation, expected length, new shorter length; change only if both match                 |
-| `flush_data`                 | all prior object data writes are on durable media                                                  |
-| `flush_metadata`             | prior object length and metadata changes are durable                                               |
+| Operation                    | Required fields and acknowledged effect                                                                   |
+| ---------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `create_exclusive`           | new object key; fail if it exists, otherwise return generation and length zero                            |
+| `stat_object`                | object key; return existence, generation, and exact length                                                |
+| `read_exact`                 | object, generation, offset, length; return exactly that range or `short_read`                             |
+| `append_compare_size`        | object, generation, expected length, bytes; append only if both match                                     |
+| `write_exact`                | object, generation, offset, bytes; replace exactly that range and return the new generation               |
+| `truncate_compare_size`      | object, generation, expected length, new shorter length; change only if both match                        |
+| `flush_data`                 | all prior object data writes are on durable media                                                         |
+| `flush_metadata`             | prior object length and metadata changes are durable                                                      |
 | `compare_exchange_reference` | reference key, expected complete v1 body, replacement complete v1 body; atomic CAS or `reference_changed` |
-| `flush_namespace`            | the preceding reference create/replace/delete is durable across crash                              |
-| `delete_unreferenced`        | best-effort garbage removal; never a commit prerequisite                                           |
+| `flush_namespace`            | the preceding reference create/replace/delete is durable across crash                                     |
+| `delete_unreferenced`        | best-effort garbage removal; never a commit prerequisite                                                  |
 
 Every request carries an opaque authenticated ID, object generation, and the
 IDs of prerequisite requests. The engine does not issue a dependent commit step
@@ -1234,7 +1234,7 @@ corpus must pass; an aggregate cannot hide a failure.
 | 240 cold rows, resident backing         | p95 engine CPU <= 8 ms                                                  |
 | 240 cold rows, durable backing          | p95 engine CPU <= 12 ms plus host I/O                                   |
 | warm anchor map                         | p95 <= 50 microseconds, no allocation                                   |
-| open clean 10-million-row store         | p95 <= 50 ms CPU; <=2 MiB/16,384 refs plus <=8 MiB/64 deltas             |
+| open clean 10-million-row store         | p95 <= 50 ms CPU; <=2 MiB/16,384 refs plus <=8 MiB/64 deltas            |
 | recover 1 GiB torn-tail container       | p95 <= 100 ms CPU plus reclaim I/O                                      |
 | index rebuild                           | >= 1 GiB segment headers/s, no payload decompression                    |
 
@@ -1247,25 +1247,25 @@ resize waiting for compression. A miss blocks default enablement.
 
 ## Test, fuzz, and benchmark matrix
 
-| Area          | Tests and properties                                                                    | Benchmark                   |
-| ------------- | --------------------------------------------------------------------------------------- | --------------------------- |
-| identity      | survive compression/move/compact/reopen/width; line spans and sliced pages never alias  | index overhead 1K..10M rows |
-| anchors       | round trips for affinity; frozen segmentation keeps anchors across Unicode upgrades     | warm/cold lookup            |
-| Unicode       | combining/ZWJ/VS/zero/wide edge/width one; malformed cells; span fences                 | grapheme/reflow throughput  |
-| semantics     | prompt/style/hyperlink/protection/blank runs survive split/merge                        | projected run memory        |
-| Kitty/glyph   | placeholders atomic; missing/live unsupported state rejects before output               | placeholder-heavy reflow    |
-| resize        | provisional tail seal/anchor rollback; layout-gap visibility; exact hot bounds          | both overscan gates         |
-| budgets       | zero/exact/one-less; bounded-write admission is atomic; checkpoint cap backpressures    | step/write overhead         |
-| cancellation  | cancel at every block boundary; <=64 KiB consumed/produced; no late publish             | cancellation latency        |
-| cache/pins    | eviction caps; pin expiration/status/renewal/sublease reclaim schedules                 | hit rate at fixed bytes     |
-| concurrency   | deterministic owner/handle use-cancel-close-completion and mutation schedules           | VT throughput during work   |
-| container     | TLV/golden parser; manifest/delta/ref hard caps; exact offsets/digests/LZ4 mutations    | encode/decode/ratio         |
-| crashes       | COW compaction create/CAS/flush/delete at every cut; host ops remain old-or-new         | recovery/tail size          |
-| recovery      | no-manifest failed-closed; staging/retiring cleanup; quarantine races/reopen/cap        | open/header scan            |
-| repair        | exact authenticated replacement only; slice gaps/overlap/replay/wrong stream rejected   | repair/headroom             |
-| ABI           | handle tombstone reuse/limits/exhaustion and thread races; fuzz wasm/native pointers    | boundary copy overhead      |
-| compatibility | v1/v2 and `GHUNIT2` goldens unchanged; mixed units reject                               | snapshot regression         |
-| security      | token/request forgery, bombs, arithmetic edges, hostile completions                     | auth/checksum cost          |
+| Area          | Tests and properties                                                                   | Benchmark                   |
+| ------------- | -------------------------------------------------------------------------------------- | --------------------------- |
+| identity      | survive compression/move/compact/reopen/width; line spans and sliced pages never alias | index overhead 1K..10M rows |
+| anchors       | round trips for affinity; frozen segmentation keeps anchors across Unicode upgrades    | warm/cold lookup            |
+| Unicode       | combining/ZWJ/VS/zero/wide edge/width one; malformed cells; span fences                | grapheme/reflow throughput  |
+| semantics     | prompt/style/hyperlink/protection/blank runs survive split/merge                       | projected run memory        |
+| Kitty/glyph   | placeholders atomic; missing/live unsupported state rejects before output              | placeholder-heavy reflow    |
+| resize        | provisional tail seal/anchor rollback; layout-gap visibility; exact hot bounds         | both overscan gates         |
+| budgets       | zero/exact/one-less; bounded-write admission is atomic; checkpoint cap backpressures   | step/write overhead         |
+| cancellation  | cancel at every block boundary; <=64 KiB consumed/produced; no late publish            | cancellation latency        |
+| cache/pins    | eviction caps; pin expiration/status/renewal/sublease reclaim schedules                | hit rate at fixed bytes     |
+| concurrency   | deterministic owner/handle use-cancel-close-completion and mutation schedules          | VT throughput during work   |
+| container     | TLV/golden parser; manifest/delta/ref hard caps; exact offsets/digests/LZ4 mutations   | encode/decode/ratio         |
+| crashes       | COW compaction create/CAS/flush/delete at every cut; host ops remain old-or-new        | recovery/tail size          |
+| recovery      | no-manifest failed-closed; staging/retiring cleanup; quarantine races/reopen/cap       | open/header scan            |
+| repair        | exact authenticated replacement only; slice gaps/overlap/replay/wrong stream rejected  | repair/headroom             |
+| ABI           | handle tombstone reuse/limits/exhaustion and thread races; fuzz wasm/native pointers   | boundary copy overhead      |
+| compatibility | v1/v2 and `GHUNIT2` goldens unchanged; mixed units reject                              | snapshot regression         |
+| security      | token/request forgery, bombs, arithmetic edges, hostile completions                    | auth/checksum cost          |
 
 Every persistent version has checked-in golden bytes and an independent parser
 fixture. Crash tests use a fake transport that records and tears operations.
