@@ -114,8 +114,10 @@ typedef struct {
  * `sizeof(GhosttyTerminalSnapshot)`.
  *
  * Returns `GHOSTTY_SUCCESS` on success, `GHOSTTY_OUT_OF_MEMORY` if allocation
- * fails, or `GHOSTTY_INVALID_VALUE` if the terminal cannot provide a complete
- * canonical continuation or an argument is invalid.
+ * fails, `GHOSTTY_UNSUPPORTED_FEATURE` if version 2 cannot represent
+ * terminal-owned semantic state (currently Kitty graphics or glyph glossary
+ * entries), or `GHOSTTY_INVALID_VALUE` if the terminal cannot provide a
+ * complete canonical continuation or an argument is invalid.
  */
 GHOSTTY_API GhosttyResult ghostty_terminal_snapshot_encode(
     const GhosttyAllocator* allocator,

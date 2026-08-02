@@ -109,9 +109,11 @@
 //! CRC32C; completed records stream immediately and BLAKE3 checkpoint coverage
 //! is updated incrementally.
 //!
-//! A failure may leave prior complete records, or a partial record if the
-//! destination itself fails. Such a prefix has no valid FINISH checkpoint and
-//! cannot be restored as a complete snapshot.
+//! Unsupported Kitty graphics or glyph glossary state is rejected before the
+//! envelope and leaves the destination unchanged. A later failure may leave
+//! prior complete records, or a partial record if the destination itself fails.
+//! Such a prefix has no valid FINISH checkpoint and cannot be restored as a
+//! complete snapshot.
 //!
 //! Each record type usually exposes an `encode` function that encodes
 //! a complete record, such as `screen.encode`.
@@ -152,6 +154,8 @@ pub const terminal = @import("terminal.zig");
 
 const codec = @import("snapshot.zig");
 pub const EncodeError = codec.EncodeError;
+pub const UnsupportedStateError = codec.UnsupportedStateError;
+pub const validateSupportedState = codec.validateSupportedState;
 pub const DecodeError = codec.DecodeError;
 pub const DecodeExactError = codec.DecodeExactError;
 pub const Version = codec.Version;

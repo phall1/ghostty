@@ -70,6 +70,8 @@ const GenerationCounter = if (@bitSizeOf(usize) >= 64) struct {
 pub const ImageStorage = struct {
     const ImageMap = std.AutoHashMapUnmanaged(u32, Image);
     const PlacementMap = std.AutoHashMapUnmanaged(PlacementKey, Placement);
+    const initial_image_id: u32 = 2147483647;
+    const initial_internal_placement_id: u32 = 0;
 
     /// Dirty is set to true if placements or images change. This is
     /// purely informational for the renderer and doesn't affect the
@@ -106,13 +108,13 @@ pub const ImageStorage = struct {
     /// TODO: This isn't good enough, it's perfectly legal for programs
     ///       to use IDs in the latter half of the range and collisions
     ///       are not gracefully handled.
-    next_image_id: u32 = 2147483647,
+    next_image_id: u32 = initial_image_id,
 
     /// This is the next automatically assigned placement ID. This is never
     /// user-facing so we can start at 0. This is 32-bits because we use
     /// the same space for external placement IDs. We can start at zero
     /// because any number is valid.
-    next_internal_placement_id: u32 = 0,
+    next_internal_placement_id: u32 = initial_internal_placement_id,
 
     /// The set of images that are currently known.
     images: ImageMap = .{},
@@ -150,6 +152,17 @@ pub const ImageStorage = struct {
     /// Kitty image protocol is enabled if we have a non-zero limit.
     pub fn enabled(self: *const ImageStorage) bool {
         return self.total_limit != 0;
+    }
+
+    /// True when this storage has no Kitty graphics semantics that a
+    /// terminal snapshot would need to preserve. Renderer-only mutation
+    /// stamps, dirty state, and caller resource policy do not affect this.
+    pub fn isSemanticallyEmpty(self: *const ImageStorage) bool {
+        return self.images.count() == 0 and
+            self.placements.count() == 0 and
+            self.loading == null and
+            self.next_image_id == initial_image_id and
+            self.next_internal_placement_id == initial_internal_placement_id;
     }
 
     /// Record a content mutation: marks the storage dirty and assigns a

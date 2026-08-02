@@ -235,11 +235,11 @@
 //! state and reset during restore.
 //!
 //! Kitty image state and glyph glossary registrations are unsupported by this
-//! snapshot version and are ignored during capture. Unicode virtual placeholder
-//! cells are preserved as grid content, but their image and placement state is
-//! not restored. Build-time terminal behavior, Unicode width policy, parser
-//! continuation, and external callbacks are version-level or caller-local
-//! requirements.
+//! snapshot version. Complete capture rejects either before emitting an
+//! envelope. Asset-free Unicode virtual placeholder cells remain ordinary grid
+//! content and round-trip without an image or placement registry. Build-time
+//! terminal behavior, Unicode width policy, parser continuation, and external
+//! callbacks are version-level or caller-local requirements.
 //!
 //! Native enum declaration indices and mode bit positions used by this format
 //! are snapshot-version registries. Changing any of them requires a snapshot
@@ -470,7 +470,7 @@ pub const Header = struct {
         try writer.writeByte(@intCast(@intFromEnum(self.mouse_shape)));
         try writer.writeByte(@intFromBool(self.password_input));
 
-        // Runtime, saved, and reset mode sets. ModePacked occupies 41 bits;
+        // Runtime, saved, and reset mode sets. ModePacked occupies 42 bits;
         // its eight-byte wire slots zero-extend the native packed value.
         const mode_values = [_]terminal_modes.ModePacked{
             self.current_modes,
@@ -909,8 +909,9 @@ pub const EncodeError = HeaderInitError ||
 
 /// Encode terminal-wide native state as one framed TERMINAL record.
 ///
-/// State not represented by this snapshot version is ignored. Payload failures
-/// emit no part of the TERMINAL record.
+/// This record writes only terminal fields represented by the version. The
+/// complete encoder validates unsupported terminal-owned state before creating
+/// its record writer. Payload failures emit no part of the TERMINAL record.
 pub fn encode(
     terminal: *const Terminal,
     destination: *record.Writer,
@@ -1201,38 +1202,24 @@ const test_header_fixture = test_fixture.parse(
     @embedFile("testdata/terminal-header-v1.hex"),
 );
 
-test "TERMINAL mode bit layout" {
+test "TERMINAL exhaustive native mode one-hot registry" {
+    const fields = @typeInfo(terminal_modes.ModePacked).@"struct".fields;
+    try std.testing.expectEqual(@as(usize, 42), fields.len);
     try std.testing.expectEqual(
         @as(usize, 42),
         @bitSizeOf(terminal_modes.ModePacked),
     );
 
-    var first: terminal_modes.ModePacked = std.mem.zeroes(
-        terminal_modes.ModePacked,
-    );
-    first.disable_keyboard = true;
-    try std.testing.expectEqual(
-        @as(u42, 1) << 0,
-        @as(u42, @bitCast(first)),
-    );
-
-    var visibility: terminal_modes.ModePacked = std.mem.zeroes(
-        terminal_modes.ModePacked,
-    );
-    visibility.report_visibility = true;
-    try std.testing.expectEqual(
-        @as(u42, 1) << 40,
-        @as(u42, @bitCast(visibility)),
-    );
-
-    var last: terminal_modes.ModePacked = std.mem.zeroes(
-        terminal_modes.ModePacked,
-    );
-    last.in_band_size_reports = true;
-    try std.testing.expectEqual(
-        @as(u42, 1) << 41,
-        @as(u42, @bitCast(last)),
-    );
+    inline for (fields, 0..) |field, bit| {
+        var one_hot: terminal_modes.ModePacked = std.mem.zeroes(
+            terminal_modes.ModePacked,
+        );
+        @field(one_hot, field.name) = true;
+        try std.testing.expectEqual(
+            @as(ModeBits, 1) << bit,
+            @as(ModeBits, @bitCast(one_hot)),
+        );
+    }
 }
 
 test "TERMINAL header golden encoding and decoding" {

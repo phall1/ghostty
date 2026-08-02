@@ -5,4 +5,5 @@ pub const Result = enum(c_int) {
     invalid_value = -2,
     out_of_space = -3,
     no_value = -4,
+    unsupported_feature = -5,
 };

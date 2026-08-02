@@ -82,6 +82,8 @@ typedef enum GHOSTTY_ENUM_TYPED {
     GHOSTTY_OUT_OF_SPACE = -3,
     /** The requested value has no value */
     GHOSTTY_NO_VALUE = -4,
+    /** Operation requires semantic state unsupported by this representation */
+    GHOSTTY_UNSUPPORTED_FEATURE = -5,
     GHOSTTY_RESULT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyResult;
 
