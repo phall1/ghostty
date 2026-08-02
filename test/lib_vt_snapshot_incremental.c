@@ -13,6 +13,7 @@ typedef struct {
     size_t len;
     size_t cap;
     size_t history_pages;
+    size_t history_pages_declared;
     size_t finish_offset;
 } Bytes;
 
@@ -163,6 +164,9 @@ static Bytes capture_all(GhosttyTerminal terminal) {
             bytes.finish_offset = bytes.len;
         if (exact.kind == GHOSTTY_TERMINAL_SNAPSHOT_CAPTURE_HISTORY_PAGE)
             ++bytes.history_pages;
+        if (exact.kind == GHOSTTY_TERMINAL_SNAPSHOT_CAPTURE_HISTORY_BEGIN &&
+            exact.count > bytes.history_pages_declared)
+            bytes.history_pages_declared = exact.count;
         append(&bytes, record, exact.written);
         free(record);
         if (exact.kind == GHOSTTY_TERMINAL_SNAPSHOT_CAPTURE_FINISH) break;
@@ -521,8 +525,8 @@ static const CorpusCase corpus_cases[] = {
         .name = "history-multipage",
         .path =
             "src/terminal/snapshot/testdata/corpus/history-multipage-v2.hex",
-        .length = 771100,
-        .checksum = UINT64_C(0x963accc40a87c60d),
+        .length = 2469736,
+        .checksum = UINT64_C(0x557529ed7661a40b),
     },
 };
 
@@ -574,7 +578,7 @@ static GhosttyTerminal corpus_terminal(size_t index) {
     }
 
     assert(index == 2);
-    assert(ghostty_terminal_new(NULL, &terminal, 80, 24) == GHOSTTY_SUCCESS);
+    assert(ghostty_terminal_new(NULL, &terminal, 512, 4) == GHOSTTY_SUCCESS);
     assert(ghostty_terminal_set(
         terminal, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_BYTES, NULL) ==
         GHOSTTY_SUCCESS);
@@ -584,14 +588,23 @@ static GhosttyTerminal corpus_terminal(size_t index) {
     corpus_write(terminal,
         "\x1b]7;file:///var/tmp/corpus-history\x1b\\"
         "\x1b]2;corpus-history\x1b\\");
-    for (unsigned row = 0; row < 600; ++row) {
-        char line[80];
-        int prefix = snprintf(line, sizeof(line), "history-%04u ", row);
-        assert(prefix > 0 && prefix < 78);
-        memset(line + prefix, 'a' + (row % 26), 78 - (size_t)prefix);
-        line[78] = '\r';
-        line[79] = '\n';
-        ghostty_terminal_vt_write(terminal, (const uint8_t*)line, sizeof(line));
+    uint8_t grapheme_row[510 * 3];
+    for (size_t column = 0; column < 510; ++column) {
+        grapheme_row[column * 3] = 'x';
+        grapheme_row[column * 3 + 1] = 0xcc;
+        grapheme_row[column * 3 + 2] = 0x81;
+    }
+    for (unsigned row = 0; row < 240; ++row) {
+        char style[64];
+        int style_len = snprintf(style, sizeof(style),
+            "\x1b[38;2;%u;%u;%um",
+            row, (row * 17) % 256, (row * 29) % 256);
+        assert(style_len > 0 && (size_t)style_len < sizeof(style));
+        ghostty_terminal_vt_write(
+            terminal, (const uint8_t*)style, (size_t)style_len);
+        ghostty_terminal_vt_write(
+            terminal, grapheme_row, sizeof(grapheme_row));
+        corpus_write(terminal, "\x1b[0m\r\n");
     }
     return terminal;
 }
@@ -667,7 +680,11 @@ static void exercise_snapshot_corpus(bool update) {
         GhosttyTerminal terminal = corpus_terminal(index);
         Bytes captured = capture_all(terminal);
         assert(captured.len > captured.finish_offset);
-        if (index == 2) assert(captured.history_pages > 1);
+        if (index == 2) {
+            assert(captured.history_pages_declared > 1);
+            assert(captured.history_pages ==
+                captured.history_pages_declared);
+        }
 
         if (update) {
             corpus_store(corpus, &captured);
