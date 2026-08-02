@@ -3,6 +3,7 @@
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -11,6 +12,7 @@ typedef struct {
     uint8_t* data;
     size_t len;
     size_t cap;
+    size_t history_pages;
     size_t finish_offset;
 } Bytes;
 
@@ -159,6 +161,8 @@ static Bytes capture_all(GhosttyTerminal terminal) {
         assert(exact.kind == event.kind);
         if (exact.kind == GHOSTTY_TERMINAL_SNAPSHOT_CAPTURE_FINISH)
             bytes.finish_offset = bytes.len;
+        if (exact.kind == GHOSTTY_TERMINAL_SNAPSHOT_CAPTURE_HISTORY_PAGE)
+            ++bytes.history_pages;
         append(&bytes, record, exact.written);
         free(record);
         if (exact.kind == GHOSTTY_TERMINAL_SNAPSHOT_CAPTURE_FINISH) break;
@@ -493,6 +497,227 @@ static void exercise_history_units(
     assert(cursor_alloc.active == 0);
 }
 
+typedef struct {
+    const char* name;
+    const char* path;
+    size_t length;
+    uint64_t checksum;
+} CorpusCase;
+
+static const CorpusCase corpus_cases[] = {
+    {
+        .name = "shell-80x24",
+        .path = "src/terminal/snapshot/testdata/corpus/shell-80x24-v2.hex",
+        .length = 31920,
+        .checksum = UINT64_C(0x794094e8f39f40d8),
+    },
+    {
+        .name = "rich-200x60",
+        .path = "src/terminal/snapshot/testdata/corpus/rich-200x60-v2.hex",
+        .length = 385539,
+        .checksum = UINT64_C(0x9b746bfb359a5eeb),
+    },
+    {
+        .name = "history-multipage",
+        .path =
+            "src/terminal/snapshot/testdata/corpus/history-multipage-v2.hex",
+        .length = 771100,
+        .checksum = UINT64_C(0x963accc40a87c60d),
+    },
+};
+
+static uint64_t corpus_checksum(const uint8_t* data, size_t len) {
+    uint64_t result = UINT64_C(14695981039346656037);
+    for (size_t i = 0; i < len; ++i) {
+        result ^= data[i];
+        result *= UINT64_C(1099511628211);
+    }
+    return result;
+}
+
+static void corpus_write(GhosttyTerminal terminal, const char* value) {
+    ghostty_terminal_vt_write(
+        terminal, (const uint8_t*)value, strlen(value));
+}
+
+static GhosttyTerminal corpus_terminal(size_t index) {
+    GhosttyTerminal terminal = NULL;
+    if (index == 0) {
+        assert(ghostty_terminal_new(NULL, &terminal, 80, 24) == GHOSTTY_SUCCESS);
+        corpus_write(terminal,
+            "\x1b]7;file:///home/corpus\x1b\\"
+            "\x1b]2;corpus-shell\x1b\\"
+            "\x1b]133;A\x1b\\corpus@host$ "
+            "\x1b]133;B\x1b\\printf checkpoint"
+            "\x1b]133;C\x1b\\\r\ncheckpoint ready\r\n"
+            "\x1b]133;D;0\x1b\\");
+        return terminal;
+    }
+
+    if (index == 1) {
+        assert(ghostty_terminal_new(NULL, &terminal, 200, 60) ==
+            GHOSTTY_SUCCESS);
+        corpus_write(terminal,
+            "\x1b]7;file:///workspace/corpus\x1b\\"
+            "\x1b]2;corpus-rich\x1b\\"
+            "\x1b]133;A\x1b\\rich$ \x1b]133;B\x1b\\"
+            "\x1b[1;4;38;2;12;34;56;48;2;78;90;123mstyled\x1b[0m "
+            "\xe7\x95\x8c \xf0\x9f\x98\x80 e\xcc\x81\r\n"
+            "\x1b]8;id=corpus;https://example.invalid/corpus\x1b\\link"
+            "\x1b]8;;\x1b\\\r\n"
+            "\x1b]133;C\x1b\\output\x1b]133;D;0\x1b\\"
+            "\x1b[?1049h"
+            "\x1b[3;38;5;201malt-screen\x1b[0m "
+            "\xe7\x95\x8c e\xcc\x81\r\n"
+            "\x1b]133;A\x1b\\alt$ \x1b]133;B\x1b\\");
+        return terminal;
+    }
+
+    assert(index == 2);
+    assert(ghostty_terminal_new(NULL, &terminal, 80, 24) == GHOSTTY_SUCCESS);
+    assert(ghostty_terminal_set(
+        terminal, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_BYTES, NULL) ==
+        GHOSTTY_SUCCESS);
+    assert(ghostty_terminal_set(
+        terminal, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_LINES, NULL) ==
+        GHOSTTY_SUCCESS);
+    corpus_write(terminal,
+        "\x1b]7;file:///var/tmp/corpus-history\x1b\\"
+        "\x1b]2;corpus-history\x1b\\");
+    for (unsigned row = 0; row < 600; ++row) {
+        char line[80];
+        int prefix = snprintf(line, sizeof(line), "history-%04u ", row);
+        assert(prefix > 0 && prefix < 78);
+        memset(line + prefix, 'a' + (row % 26), 78 - (size_t)prefix);
+        line[78] = '\r';
+        line[79] = '\n';
+        ghostty_terminal_vt_write(terminal, (const uint8_t*)line, sizeof(line));
+    }
+    return terminal;
+}
+
+static Bytes corpus_load(const char* path) {
+    FILE* file = fopen(path, "rb");
+    assert(file != NULL);
+    Bytes result = {0};
+    int high = -1;
+    bool comment = false;
+    for (;;) {
+        int c = fgetc(file);
+        if (c == EOF) break;
+        if (comment) {
+            if (c == '\n') comment = false;
+            continue;
+        }
+        if (c == '#') {
+            assert(high == -1);
+            comment = true;
+            continue;
+        }
+        int nibble = -1;
+        if (c >= '0' && c <= '9') nibble = c - '0';
+        else if (c >= 'a' && c <= 'f') nibble = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') nibble = c - 'A' + 10;
+        else {
+            assert(high == -1);
+            continue;
+        }
+        if (high == -1) {
+            high = nibble;
+        } else {
+            uint8_t byte = (uint8_t)((high << 4) | nibble);
+            append(&result, &byte, 1);
+            high = -1;
+        }
+    }
+    assert(high == -1);
+    assert(fclose(file) == 0);
+    return result;
+}
+
+static void corpus_store(const CorpusCase* corpus, const Bytes* bytes) {
+    FILE* file = fopen(corpus->path, "wb");
+    assert(file != NULL);
+    assert(fprintf(file,
+        "# Ghostty snapshot fixture\n"
+        "# Kaitai type: ghostty_snapshot\n"
+        "# Kaitai params:\n"
+        "# Kaitai offset: 0\n"
+        "# Wire version: 2\n"
+        "# Corpus case: %s\n"
+        "# FNV-1a-64: %016" PRIx64 "\n\n",
+        corpus->name, corpus_checksum(bytes->data, bytes->len)) > 0);
+    for (size_t offset = 0; offset < bytes->len; offset += 16) {
+        size_t count = bytes->len - offset;
+        if (count > 16) count = 16;
+        for (size_t i = 0; i < count; ++i) {
+            assert(fprintf(file, "%02x%s", bytes->data[offset + i],
+                i + 1 == count ? "" : " ") > 0);
+        }
+        assert(fprintf(file, " # 0x%08zx\n", offset) > 0);
+    }
+    assert(fclose(file) == 0);
+}
+
+static void exercise_snapshot_corpus(bool update) {
+    for (size_t index = 0;
+        index < sizeof(corpus_cases) / sizeof(corpus_cases[0]);
+        ++index) {
+        const CorpusCase* corpus = &corpus_cases[index];
+        GhosttyTerminal terminal = corpus_terminal(index);
+        Bytes captured = capture_all(terminal);
+        assert(captured.len > captured.finish_offset);
+        if (index == 2) assert(captured.history_pages > 1);
+
+        if (update) {
+            corpus_store(corpus, &captured);
+        } else {
+            Bytes fixture = corpus_load(corpus->path);
+            assert(fixture.len == corpus->length);
+            assert(corpus_checksum(fixture.data, fixture.len) ==
+                corpus->checksum);
+            assert(fixture.len == captured.len);
+            assert(memcmp(fixture.data, captured.data, fixture.len) == 0);
+
+            Decoded decoded = decode_fragmented(fixture.data, fixture.len);
+            assert(decoded.saw_ready);
+            assert(decoded.consumed == fixture.len);
+            ghostty_terminal_free(decoded.terminal);
+
+            uint8_t* future = (uint8_t*)malloc(fixture.len);
+            assert(future != NULL);
+            memcpy(future, fixture.data, fixture.len);
+            future[8] = 3;
+            future[9] = 0;
+            expect_decode_error(future, fixture.len, decoder_options(),
+                GHOSTTY_TERMINAL_SNAPSHOT_STATUS_UNKNOWN_VERSION);
+
+            memcpy(future, fixture.data, fixture.len);
+            future[fixture.len - 1] ^= 0x80;
+            expect_decode_error(future, fixture.len, decoder_options(),
+                GHOSTTY_TERMINAL_SNAPSHOT_STATUS_CORRUPTION);
+            expect_decode_error(fixture.data, fixture.len - 1,
+                decoder_options(), GHOSTTY_TERMINAL_SNAPSHOT_STATUS_TRUNCATED);
+            free(future);
+            free(fixture.data);
+        }
+
+        free(captured.data);
+        ghostty_terminal_free(terminal);
+    }
+
+    if (!update) {
+        Bytes v1 = corpus_load(
+            "src/terminal/snapshot/testdata/complete-v1.hex");
+        Decoded decoded = decode_fragmented(v1.data, v1.len);
+        assert(decoded.saw_ready);
+        assert(decoded.consumed == v1.len);
+        ghostty_terminal_free(decoded.terminal);
+        free(v1.data);
+    }
+}
+
+
 int main(void) {
     GhosttyTerminalSnapshotIncrementalCapabilities capabilities = {
         .size = sizeof(capabilities),
@@ -505,6 +730,11 @@ int main(void) {
         capabilities.bounded_records && capabilities.bounded_pages &&
         capabilities.bounded_units);
     assert(capabilities.default_encode_version == 2);
+
+    const bool update_corpus =
+        getenv("GHOSTTY_UPDATE_SNAPSHOT_CORPUS") != NULL;
+    exercise_snapshot_corpus(update_corpus);
+    if (update_corpus) return 0;
 
     GhosttyTerminal unsupported = NULL;
     assert(ghostty_terminal_new(NULL, &unsupported, 20, 4) == GHOSTTY_SUCCESS);
