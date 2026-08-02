@@ -676,6 +676,7 @@ fn resolveImporter(
     if (terminal_screen.pages.historyGeneration() !=
         state.history_generation)
     {
+        state.import.rollback();
         return switch (terminal_screen.pages.historyInvalidation()) {
             .reset => error.Reset,
             .resize => error.Resize,
@@ -692,6 +693,7 @@ pub const HistoryImporter = struct {
         ScreenUnavailable,
         InvalidCheckpoint,
         LeaseLimitExceeded,
+        ImportBusy,
         LeaseGenerationExhausted,
         EntropyUnavailable,
     };
@@ -714,6 +716,12 @@ pub const HistoryImporter = struct {
         io_.random(&entropy);
         terminal_screen.pages.initializeHistoryLeaseKey(entropy);
 
+        var import = try TerminalPageList.HistoryImport.init(
+            &terminal_screen.pages,
+            terminal_screen.alloc,
+            max_chunks,
+        );
+        errdefer import.deinit();
         const state = try terminal_screen.alloc.create(HistoryImporterState);
         errdefer terminal_screen.alloc.destroy(state);
         state.* = .{
@@ -724,14 +732,9 @@ pub const HistoryImporter = struct {
             .history_generation = terminal_screen.pages.historyGeneration(),
             .expected_checkpoint = source_state.checkpoint,
             .secret = source_state.secret,
-            .import = try .init(
-                &terminal_screen.pages,
-                terminal_screen.alloc,
-                max_chunks,
-            ),
+            .import = import,
             .max_chunks = max_chunks,
         };
-        errdefer state.import.deinit();
         const token = try terminal_screen.pages.registerHistoryLease(
             @intCast(@intFromPtr(terminal_)),
             @intCast(@intFromEnum(key)),
@@ -1014,6 +1017,7 @@ pub fn encode(
 pub const DecodeError = Decoder.InitError ||
     Decoder.RestoreError ||
     error{
+        ImportBusy,
         /// The HISTORY key does not match the caller-selected screen.
         UnexpectedScreenKey,
     };
@@ -1843,6 +1847,17 @@ test "history cursor pages newest first within strict budgets" {
         checkpoint_value,
     );
     defer importer.deinit(&destination);
+    try testing.expectError(
+        error.ImportBusy,
+        HistoryImporter.init(
+            testing.io,
+            &destination,
+            .primary,
+            units.len,
+            &source,
+            checkpoint_value,
+        ),
+    );
     var forged_importer = importer;
     forged_importer.bytes[31] ^= 0x7E;
     try testing.expectError(
@@ -1989,6 +2004,15 @@ test "history cursor pages newest first within strict budgets" {
         importer.inspectedPrefixNodes(&destination),
     );
     try importer.commit(&destination);
+    const clean_importer = try HistoryImporter.init(
+        testing.io,
+        &destination,
+        .primary,
+        0,
+        &source,
+        checkpoint_value,
+    );
+    clean_importer.deinit(&destination);
 
     try testing.expectEqualStrings("live destination", destination.getTitle().?);
     try testing.expect(destination.modes.values.bracketed_paste);
