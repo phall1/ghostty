@@ -50,6 +50,8 @@ const Node = struct {
     next: ?*Node = null,
     data: Data,
     serial: u64,
+    /// True while this page belongs to an uncommitted snapshot history import.
+    snapshot_history_import: bool = false,
 
     /// How the backing memory of the embedded Page was allocated. Pool-owned
     /// memory is always a full standard-size item from the memory
@@ -1258,6 +1260,17 @@ pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
         if (opts.rows) |v| assert(v > 0);
     }
 
+    // A column resize can split, merge, or rebuild every page. Remove any
+    // uncommitted snapshot prefix while its page identity is still intact,
+    // then invalidate the remainder so its decoder authenticates and discards
+    // it instead of publishing history across the live resize.
+    if (opts.cols) |cols| {
+        if (cols != self.cols) {
+            self.discardSnapshotHistoryImport();
+            self.history_generation +%= 1;
+        }
+    }
+
     // Resizing (especially with reflow) can cause our row offset to
     // become invalid. Rather than do something fancy like we do other
     // places and try to update it in place, we just invalidate it because
@@ -1321,6 +1334,44 @@ pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
     // resize can move the active boundary. Both may expose whole old pages
     // that are now eligible for line-limit pruning.
     self.limits.enforce(self, .lines);
+}
+
+/// Remove the contiguous prefix owned by an in-progress snapshot import.
+fn discardSnapshotHistoryImport(self: *PageList) void {
+    while (self.pages.first) |node| {
+        if (!node.snapshot_history_import) break;
+        self.removeSnapshotHistoryNode(node);
+    }
+}
+
+/// Remove one imported history node while preserving live pins and accounting.
+fn removeSnapshotHistoryNode(self: *PageList, node: *List.Node) void {
+    const replacement = node.next.?;
+    const removed_rows = node.rows();
+
+    if (self.viewport == .pin) {
+        if (self.viewport_pin.node == node) {
+            self.viewport = .top;
+            self.viewport_pin_row_offset = null;
+        } else if (self.viewport_pin_row_offset) |*offset| {
+            offset.* -= removed_rows;
+        }
+    }
+
+    const pin_keys = self.tracked_pins.keys();
+    for (pin_keys) |tracked_pin| {
+        if (tracked_pin.node != node) continue;
+        tracked_pin.node = replacement;
+        tracked_pin.x = 0;
+        tracked_pin.y = 0;
+        tracked_pin.garbage = true;
+    }
+    self.viewport_pin.garbage = false;
+
+    self.pages.remove(node);
+    self.total_rows -= removed_rows;
+    self.destroyNode(node);
+    self.page_compression.markActivity();
 }
 
 /// Resize the pagelist with reflow by adding or removing columns.
@@ -4025,6 +4076,7 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
         // advances when reset invalidates the entire list.
         first.serial = self.page_serial;
         self.page_serial += 1;
+        first.snapshot_history_import = false;
 
         // In this case we do NOT need to update page_size because
         // we're reusing an existing page so nothing has changed.
@@ -4383,16 +4435,25 @@ pub const HistoryImport = struct {
     ) PageAllocation.FinalizeError!bool {
         assert(self.active);
         if (self.discarding) return false;
+        if (!self.retainedPrefixIntact()) {
+            self.discarding = true;
+            return false;
+        }
         assert(self.count < self.serials.len);
-        const serial = allocation.node.?.serial;
-        allocation.finalize(.prepend) catch |err| switch (err) {
-            error.MaxSizeExceeded,
-            error.MaxLinesExceeded,
-            => {
-                self.discarding = true;
-                return false;
-            },
-            else => return err,
+        const node = allocation.node.?;
+        const serial = node.serial;
+        node.snapshot_history_import = true;
+        allocation.finalize(.prepend) catch |err| {
+            node.snapshot_history_import = false;
+            switch (err) {
+                error.MaxSizeExceeded,
+                error.MaxLinesExceeded,
+                => {
+                    self.discarding = true;
+                    return false;
+                },
+                else => return err,
+            }
         };
         self.serials[self.count] = serial;
         self.count += 1;
@@ -4402,6 +4463,12 @@ pub const HistoryImport = struct {
     /// Keep all successfully imported history.
     pub fn commit(self: *HistoryImport) void {
         assert(self.active);
+        var node = self.destination.pages.first;
+        while (node) |current| : (node = current.next) {
+            if (!current.snapshot_history_import or
+                !self.contains(current.serial)) break;
+            current.snapshot_history_import = false;
+        }
         self.active = false;
     }
 
@@ -4421,8 +4488,9 @@ pub const HistoryImport = struct {
         self.active = false;
 
         while (self.destination.pages.first) |node| {
-            if (!self.contains(node.serial)) break;
-            self.remove(node);
+            if (!node.snapshot_history_import or
+                !self.contains(node.serial)) break;
+            self.destination.removeSnapshotHistoryNode(node);
         }
         self.destination.assertIntegrity();
     }
@@ -4431,6 +4499,20 @@ pub const HistoryImport = struct {
         self.rollback();
         self.alloc.free(self.serials);
         self.* = undefined;
+    }
+
+    /// Every retained import must still form the complete oldest prefix.
+    /// Live limit enforcement may evict one between incremental PAGE records;
+    /// once that happens accepting any older page would create a gap.
+    fn retainedPrefixIntact(self: *const HistoryImport) bool {
+        var retained: usize = 0;
+        var node = self.destination.pages.first;
+        while (node) |current| : (node = current.next) {
+            if (!current.snapshot_history_import) break;
+            if (!self.contains(current.serial)) return false;
+            retained += 1;
+        }
+        return retained == self.count;
     }
 
     fn contains(self: *const HistoryImport, serial: u64) bool {
@@ -4448,36 +4530,6 @@ pub const HistoryImport = struct {
             }
         }
         return false;
-    }
-
-    fn remove(self: *HistoryImport, node: *List.Node) void {
-        const destination = self.destination;
-        const replacement = node.next.?;
-        const removed_rows = node.rows();
-
-        if (destination.viewport == .pin) {
-            if (destination.viewport_pin.node == node) {
-                destination.viewport = .top;
-                destination.viewport_pin_row_offset = null;
-            } else if (destination.viewport_pin_row_offset) |*offset| {
-                offset.* -= removed_rows;
-            }
-        }
-
-        const pin_keys = destination.tracked_pins.keys();
-        for (pin_keys) |tracked_pin| {
-            if (tracked_pin.node != node) continue;
-            tracked_pin.node = replacement;
-            tracked_pin.x = 0;
-            tracked_pin.y = 0;
-            tracked_pin.garbage = true;
-        }
-        destination.viewport_pin.garbage = false;
-
-        destination.pages.remove(node);
-        destination.total_rows -= removed_rows;
-        destination.destroyNode(node);
-        destination.page_compression.markActivity();
     }
 };
 
@@ -7979,6 +8031,76 @@ test "PageList HistoryImport latches discard after a bounded rejection" {
     try testing.expect(older.node != null);
 }
 
+test "PageList HistoryImport rejects older pages after live eviction" {
+    const testing = std.testing;
+    var result = try init(testing.allocator, .{
+        .cols = 1,
+        .rows = 1,
+        .max_size = null,
+        .max_lines = null,
+    });
+    defer result.deinit();
+
+    var import = try HistoryImport.init(&result, testing.allocator, 2);
+    defer import.deinit();
+    var newest = try result.allocatePage(.{ .cols = 1, .rows = 2 });
+    defer newest.deinit();
+    newest.page().size.rows = 2;
+    try testing.expect(try import.prepend(&newest));
+
+    // Preserve exactly the current allocation. Live row growth eventually
+    // needs another page and recycles the imported oldest page to satisfy it.
+    result.setMaxBytes(result.page_size);
+    var growth: usize = 0;
+    while (result.pages.first.?.snapshot_history_import) {
+        if (growth == 10_000) return error.TestUnexpectedResult;
+        _ = try result.grow();
+        growth += 1;
+    }
+
+    // A smaller older page would fit once the byte policy is relaxed, but the
+    // lost newer import makes publishing it a forbidden history gap.
+    result.setMaxBytes(null);
+    var older = try result.allocatePage(.{ .cols = 1, .rows = 1 });
+    defer older.deinit();
+    older.page().size.rows = 1;
+    try testing.expect(!try import.prepend(&older));
+    try testing.expect(import.discarding);
+    try testing.expect(older.node != null);
+}
+
+test "PageList column resize invalidates every HistoryImport mode" {
+    const testing = std.testing;
+    const S = struct {
+        fn exercise(cols: size.CellCountInt, reflow: bool) !void {
+            var result = try init(testing.allocator, .{
+                .cols = 2,
+                .rows = 1,
+                .max_size = null,
+                .max_lines = null,
+            });
+            defer result.deinit();
+            var import = try HistoryImport.init(&result, testing.allocator, 1);
+            defer import.deinit();
+
+            var page = try result.allocatePage(.{ .cols = 2, .rows = 1 });
+            defer page.deinit();
+            page.page().size.rows = 1;
+            try testing.expect(try import.prepend(&page));
+            const generation = result.historyGeneration();
+
+            try result.resize(.{ .cols = cols, .reflow = reflow });
+            try testing.expectEqual(generation +% 1, result.historyGeneration());
+            try testing.expect(!result.pages.first.?.snapshot_history_import);
+        }
+    };
+
+    try S.exercise(1, false);
+    try S.exercise(3, false);
+    try S.exercise(1, true);
+    try S.exercise(3, true);
+}
+
 test "PageList PageAllocation allocation failure leaves list unchanged" {
     const testing = std.testing;
 
@@ -7994,6 +8116,7 @@ test "PageList PageAllocation allocation failure leaves list unchanged" {
     const initial_first = result.pages.first.?;
     const initial_total_rows = result.total_rows;
     const initial_page_size = result.page_size;
+
 
     // Existing pool capacity is deliberately an implementation detail. Allow
     // preheated slots to succeed until allocation reaches node-pool growth.

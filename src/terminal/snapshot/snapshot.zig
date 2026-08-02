@@ -2421,7 +2421,8 @@ test "malformed and truncated post-READY history are isolated" {
         defer if (restored_owned) restored.deinit(testing.allocator);
         var ready: ?Ready = null;
         defer if (ready) |*value| value.deinit();
-        var ready_page_count: usize = 0;
+        var resized_page_count: usize = 0;
+        var resized = false;
         var offset: usize = 0;
         var saw_error = false;
         while (offset < invalid.len) {
@@ -2431,16 +2432,31 @@ test "malformed and truncated post-READY history are isolated" {
                 break;
             };
             offset += pushed.consumed;
-            if (std.meta.activeTag(pushed.event) == .ready) {
-                ready = try decoder.takeReady(&restored);
-                restored_owned = true;
-                ready_page_count =
-                    restored.screens.get(.primary).?.pages.totalPages();
+            switch (pushed.event) {
+                .ready => {
+                    ready = try decoder.takeReady(&restored);
+                    restored_owned = true;
+                },
+                .history_page => |event| {
+                    if (event.key == .primary and !resized) {
+                        try testing.expect(event.retained);
+                        try restored.resize(
+                            testing.allocator,
+                            .{ .cols = 4, .rows = 2 },
+                        );
+                        resized_page_count =
+                            restored.screens.get(.primary).?.pages.totalPages();
+                        resized = true;
+                    }
+                },
+                else => {},
             }
         }
         try testing.expect(saw_error);
+        try testing.expect(resized);
+        try testing.expectEqual(@as(@TypeOf(restored.cols), 4), restored.cols);
         try testing.expectEqual(
-            ready_page_count,
+            resized_page_count,
             restored.screens.get(.primary).?.pages.totalPages(),
         );
     }
