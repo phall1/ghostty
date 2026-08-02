@@ -85,6 +85,7 @@ const RESULT_OUT_OF_SPACE = -3;
 const UNSUPPORTED_FEATURE = -1;
 const UNKNOWN_VERSION = -2;
 const CORRUPTION = -3;
+const TRUNCATED = -4;
 const LIMIT_EXCEEDED = -5;
 const WRONG_GENERATION = -8;
 const WRONG_TERMINAL = -9;
@@ -961,6 +962,16 @@ function expectDecodeError(
     }
     rt.dispose(event);
   }
+  if (status === SUCCESS && expected === TRUNCATED) {
+    const eof = rt.struct("GhosttyTerminalSnapshotDecodeEvent");
+    status = rt.e.ghostty_terminal_snapshot_decoder_push(
+      decoder,
+      0,
+      0,
+      eof.ptr,
+    );
+    rt.dispose(eof);
+  }
   assert.equal(status, expected);
   assert.equal(rt.e.ghostty_terminal_snapshot_decoder_abort(decoder), SUCCESS);
   rt.e.ghostty_terminal_snapshot_decoder_free(decoder);
@@ -968,6 +979,122 @@ function expectDecodeError(
   rt.free(input, bytes.length);
   rt.free(slot, 4);
   rt.dispose(options);
+}
+
+function parseHexFixture(text) {
+  const bytes = [];
+  for (const line of text.split(/\r?\n/u)) {
+    const data = line.split("#", 1)[0].trim();
+    if (data === "") continue;
+    for (const byte of data.split(/\s+/u)) {
+      assert.match(byte, /^[0-9a-f]{2}$/u);
+      bytes.push(Number.parseInt(byte, 16));
+    }
+  }
+  return Uint8Array.from(bytes);
+}
+
+function corpusChecksum(bytes) {
+  let hash = 0xcbf29ce484222325n;
+  for (const byte of bytes) {
+    hash ^= BigInt(byte);
+    hash = BigInt.asUintN(64, hash * 0x100000001b3n);
+  }
+  return hash;
+}
+
+async function loadCorpusFixture(name) {
+  const path = new URL(`../testdata/snapshot-corpus/${name}`, import.meta.url);
+  return parseHexFixture(await readFile(path, "utf8"));
+}
+
+function consumeSnapshot(rt, bytes) {
+  const options = decoderOptions(rt);
+  const slot = rt.alloc(4);
+  rt.view().setUint32(slot, 0, true);
+  assert.equal(
+    rt.e.ghostty_terminal_snapshot_decoder_new(0, options.ptr, slot),
+    SUCCESS,
+  );
+  const decoder = rt.view().getUint32(slot, true);
+  const input = rt.alloc(bytes.length);
+  rt.u8().set(bytes, input);
+  let offset = 0;
+  let terminal = 0;
+  let finished = false;
+  while (!finished) {
+    assert.ok(offset < bytes.length, "snapshot did not reach FINISH");
+    const event = rt.struct("GhosttyTerminalSnapshotDecodeEvent");
+    const status = rt.e.ghostty_terminal_snapshot_decoder_push(
+      decoder,
+      input + offset,
+      bytes.length - offset,
+      event.ptr,
+    );
+    assert.equal(status, SUCCESS);
+    const consumed = rt.getUsize(event, "consumed");
+    const kind = rt.getI32(event, "kind");
+    offset += consumed;
+    if (kind === DECODE_READY) {
+      const take = rt.struct("GhosttyTerminalSnapshotTakeTerminalResult");
+      assert.equal(
+        rt.e.ghostty_terminal_snapshot_decoder_take_terminal(decoder, take.ptr),
+        SUCCESS,
+      );
+      terminal = rt
+        .view()
+        .getUint32(take.ptr + rt.field(take.name, "terminal"), true);
+      assert.notEqual(terminal, 0);
+      assert.equal(
+        rt.e.ghostty_terminal_snapshot_decoder_replay_continuation(
+          decoder,
+          terminal,
+        ),
+        SUCCESS,
+      );
+      rt.dispose(take);
+    } else if (kind === DECODE_FINISH) {
+      finished = true;
+    } else {
+      assert.ok(consumed > 0);
+    }
+    rt.dispose(event);
+  }
+  assert.equal(offset, bytes.length);
+  assert.notEqual(terminal, 0);
+  rt.e.ghostty_terminal_snapshot_decoder_free(decoder);
+  rt.e.ghostty_terminal_free(terminal);
+  rt.free(input, bytes.length);
+  rt.free(slot, 4);
+  rt.dispose(options);
+}
+
+async function exerciseSharedCodecCorpus(rt) {
+  const cases = [
+    ["shell-80x24-v2.hex", 31920, 0x794094e8f39f40d8n],
+    ["rich-200x60-v2.hex", 385539, 0x9b746bfb359a5eebn],
+    ["history-multipage-v2.hex", 771100, 0x963accc40a87c60dn],
+  ];
+  for (const [name, length, checksum] of cases) {
+    const bytes = await loadCorpusFixture(name);
+    assert.equal(bytes.length, length, `${name} byte length`);
+    assert.equal(corpusChecksum(bytes), checksum, `${name} byte checksum`);
+    consumeSnapshot(rt, bytes);
+  }
+
+  const v1 = await loadCorpusFixture("compat-v1.hex");
+  consumeSnapshot(rt, v1);
+
+  const control = await loadCorpusFixture("shell-80x24-v2.hex");
+  const future = Uint8Array.from(control);
+  future[8] = 3;
+  future[9] = 0;
+  expectDecodeError(rt, future, UNKNOWN_VERSION);
+
+  const corrupt = Uint8Array.from(control);
+  corrupt[20] ^= 0x80;
+  expectDecodeError(rt, corrupt, CORRUPTION);
+  expectDecodeError(rt, control.subarray(0, 20), TRUNCATED);
 }
 
 function historyTransfer(rt, source, destination, checkpointOwner) {
@@ -1404,6 +1531,7 @@ const queriedBuildIdentity = new TextDecoder().decode(
 assert.equal(buildIdentity, queriedBuildIdentity);
 rt.dispose(buildInfo);
 rt.dispose(capabilities);
+await exerciseSharedCodecCorpus(rt);
 
 const source = rt.terminal();
 rt.unlimitedScrollback(source);
