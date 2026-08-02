@@ -344,12 +344,15 @@ blank cells are explicit; incidental right padding is not.
   represent this exactly is rejected before persistence or history output.
 
 Horizontal tab is resolved by the VT mutation owner against the then-current
-cursor column and tab stops before a row can enter logical backing. Every
-traversed grid cell is persisted as the same ordinary explicit blank atom that
-copy and selection observe; no dynamic tab atom, tab byte, or tab-stop reference
-is stored. Logical source identity begins at these post-parser cells, so changing
-tab stops later cannot affect an old identity or projection. Reflow treats the
-materialized cells exactly like other width-one atoms.
+cursor column and tab stops before a row can enter logical backing. HT moves the
+cursor; it does not write, clear, or restyle traversed cells. Sealing serializes
+the actual post-parser grid cells unchanged, so preexisting text and style runs
+under the skipped columns retain their ordinary atoms and metadata. A gap cell
+that is actually blank becomes an explicit blank atom only under the same
+significance rules as any other blank, not because HT traversed it. No dynamic
+tab atom, tab event, source byte, or tab-stop reference is retained. Logical
+source identity begins at these post-parser cells, so later tab-stop changes
+cannot affect an old identity or projection.
 
 A width-two atom in the last cell wraps as a whole. At a one-column width the
 projection emits a one-cell `wide_unplaceable` render marker referencing the
@@ -1216,8 +1219,9 @@ Collection does not allocate on VT write or active resize.
 Targets use optimized builds on at least four 2024-era laptop performance cores,
 NVMe-class storage, a 200x60 viewport, and 10 million history rows. The fixed
 gate corpus is 60% ASCII logs, 20% Unicode prose/emoji, 10% style-dense shell
-prompts, 5% hard lines containing parser-materialized tab-fill blanks at the
-4096-atom reflow-span cap, and 5% valid Kitty textual placeholders. Each corpus
+prompts, 5% populated hard lines where HT moves across existing styled text and
+real blank gaps at the 4096-atom span cap, and 5% valid Kitty textual
+placeholders. Each corpus
 runs 20 unmeasured warmups followed by 200 measured resizes at both default
 overscan (120 rows for this viewport, subject to the 2 MiB cap) and hard maximum
 overscan (512 rows/16 MiB). Report
