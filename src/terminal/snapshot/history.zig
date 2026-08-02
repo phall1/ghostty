@@ -589,6 +589,32 @@ fn encodePageSlice(
     return output;
 }
 
+const PageSliceEncodeLimitedError = page.EncodeAllocLimitedError ||
+    TerminalPage.CloneFromError;
+
+fn encodePageSliceLimited(
+    alloc: Allocator,
+    source: *const TerminalPage,
+    row_start: usize,
+    row_end: usize,
+    max_record_bytes: usize,
+) PageSliceEncodeLimitedError![]u8 {
+    std.debug.assert(row_start < row_end);
+    std.debug.assert(row_end <= source.size.rows);
+
+    if (row_start == 0 and row_end == source.size.rows) {
+        return page.encodeAllocLimited(alloc, source, max_record_bytes);
+    }
+
+    var sliced = TerminalPage.init(
+        source.exactRowCapacity(row_start, row_end),
+    ) catch return error.OutOfMemory;
+    defer sliced.deinit();
+    sliced.size.rows = @intCast(row_end - row_start);
+    try sliced.cloneFrom(source, row_start, row_end);
+    return page.encodeAllocLimited(alloc, &sliced, max_record_bytes);
+}
+
 pub const ImportResult = union(enum) {
     zero_budget,
     too_small: struct {
@@ -1026,6 +1052,7 @@ pub const DetachedHistories = struct {
 
     pub const InitError = Allocator.Error ||
         PageSliceEncodeError ||
+        PageSliceEncodeLimitedError ||
         record.Writer.FinishError ||
         error{
             InvalidLimit,
@@ -1138,24 +1165,32 @@ pub const DetachedHistories = struct {
                 while (row_end > 0) {
                     const rows = @min(row_end, max_rows);
                     const row_start = row_end - rows;
-                    var output = try encodePageSlice(
+                    const remaining_bytes = max_total_bytes - retained_bytes;
+                    const total_limit_tighter =
+                        remaining_bytes < max_record_bytes;
+                    const effective_record_limit = @min(
+                        max_record_bytes,
+                        remaining_bytes,
+                    );
+                    const owned = encodePageSliceLimited(
                         alloc,
                         source,
                         row_start,
                         row_end,
-                    );
-                    errdefer output.deinit();
-                    const encoded = output.written();
-                    if (encoded.len > max_record_bytes)
-                        return error.RecordLimitExceeded;
+                        effective_record_limit,
+                    ) catch |err| switch (err) {
+                        error.RecordLimitExceeded => return if (total_limit_tighter)
+                            error.TotalBytesLimitExceeded
+                        else
+                            error.RecordLimitExceeded,
+                        else => return err,
+                    };
+                    errdefer alloc.free(owned);
                     retained_bytes = std.math.add(
                         usize,
                         retained_bytes,
-                        encoded.len,
+                        owned.len,
                     ) catch return error.TotalBytesLimitExceeded;
-                    if (retained_bytes > max_total_bytes)
-                        return error.TotalBytesLimitExceeded;
-                    const owned = try output.toOwnedSlice();
                     records.appendAssumeCapacity(.{
                         .bytes = owned,
                         .rows = rows,

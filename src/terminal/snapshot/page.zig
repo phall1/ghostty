@@ -147,6 +147,69 @@ pub fn encode(
     try destination.finish();
 }
 
+/// Errors possible while encoding one allocator-owned PAGE record under an
+/// exact record-size limit.
+pub const EncodeAllocLimitedError = Allocator.Error ||
+    PayloadEncodeError ||
+    error{
+        RecordLimitExceeded,
+        InconsistentEncoding,
+    };
+
+/// Encode one complete PAGE record without allowing any allocation or writer
+/// capacity to exceed `max_record_bytes`.
+///
+/// The payload is counted and checksummed without retention before allocating
+/// the exact final record. This avoids the normal record writer's growable
+/// payload scratch allocation for caller-controlled capture limits.
+pub fn encodeAllocLimited(
+    alloc: Allocator,
+    value: *const TerminalPage,
+    max_record_bytes: usize,
+) EncodeAllocLimitedError![]u8 {
+    if (max_record_bytes < record.Header.len)
+        return error.RecordLimitExceeded;
+
+    var counter: std.Io.Writer.Discarding = .init(&.{});
+    encodePayload(value, &counter.writer) catch |err| switch (err) {
+        error.WriteFailed => return error.InconsistentEncoding,
+        else => return err,
+    };
+    const payload_len = std.math.cast(u32, counter.count) orelse
+        return error.RecordLimitExceeded;
+    const encoded_len = std.math.add(
+        usize,
+        record.Header.len,
+        @as(usize, payload_len),
+    ) catch return error.RecordLimitExceeded;
+    if (encoded_len > max_record_bytes)
+        return error.RecordLimitExceeded;
+
+    var checksum: record.Checksum = .init(.page, payload_len);
+    encodePayload(value, checksum.writer()) catch |err| switch (err) {
+        error.WriteFailed => return error.InconsistentEncoding,
+        else => return err,
+    };
+
+    const encoded = try alloc.alloc(u8, encoded_len);
+    errdefer alloc.free(encoded);
+    var destination: std.Io.Writer = .fixed(encoded);
+    const header: record.Header = .{
+        .tag = .page,
+        .payload_len = payload_len,
+        .crc32c = checksum.final(),
+    };
+    header.encode(&destination) catch
+        return error.InconsistentEncoding;
+    encodePayload(value, &destination) catch |err| switch (err) {
+        error.WriteFailed => return error.InconsistentEncoding,
+        else => return err,
+    };
+    if (destination.end != encoded.len)
+        return error.InconsistentEncoding;
+    return encoded;
+}
+
 /// Errors possible while decoding and validating a complete PAGE record.
 pub const DecodeError = PayloadDecodeError ||
     record.Reader.InitError ||
@@ -527,6 +590,50 @@ test "reject every truncation" {
         var reader: std.Io.Reader = .fixed(test_header_fixture[0..len]);
         try std.testing.expectError(error.EndOfStream, Header.decode(&reader));
     }
+}
+
+test "bounded PAGE allocation rejects oversized record before allocation" {
+    const capacity: TerminalPageCapacity = .{
+        .cols = 8,
+        .rows = 4,
+        .styles = 0,
+        .hyperlink_bytes = 0,
+        .grapheme_bytes = 0,
+        .string_bytes = 0,
+    };
+    var value = try TerminalPage.init(capacity);
+    defer value.deinit();
+
+    const encoded = try encodeAllocLimited(
+        std.testing.allocator,
+        &value,
+        1024 * 1024,
+    );
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(encoded.len > record.Header.len);
+
+    var failing = std.testing.FailingAllocator.init(
+        std.testing.allocator,
+        .{ .fail_index = 0 },
+    );
+    try std.testing.expectError(
+        error.RecordLimitExceeded,
+        encodeAllocLimited(
+            failing.allocator(),
+            &value,
+            encoded.len - 1,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+
+    const exact = try encodeAllocLimited(
+        std.testing.allocator,
+        &value,
+        encoded.len,
+    );
+    defer std.testing.allocator.free(exact);
+    try std.testing.expectEqual(encoded.len, exact.len);
+    try std.testing.expectEqualSlices(u8, encoded, exact);
 }
 
 test "framed PAGE encode and decode a sparse native page" {
