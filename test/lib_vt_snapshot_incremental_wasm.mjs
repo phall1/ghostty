@@ -1456,6 +1456,7 @@ assert.equal(
 const alternateOn = "\x1b[?47h";
 const alternateOff = "\x1b[?47l";
 rt.write(source, alternateOn);
+rt.write(source, "\x1b[2J\x1b[H");
 rt.write(
   source,
   "\x1b[?2027h\x1b]133;A\x07\x1b[1;31m" +
