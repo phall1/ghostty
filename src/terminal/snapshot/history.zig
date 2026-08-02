@@ -1512,7 +1512,11 @@ test "history cursor invalidation and transactional abort outcomes" {
         var lease = try HistoryLease.init(&source, .primary);
         defer lease.deinit();
         var cursor_value = try lease.cursor();
-        source.screens.get(.primary).?.pages.setMaxLines(6);
+        // The fixture has six history rows in three complete pages. A
+        // three-row limit deterministically evicts the oldest checkpoint page
+        // (whole-page enforcement retains at most one two-row page).
+        source.screens.get(.primary).?.pages.setMaxLines(3);
+        try testing.expect(lease.boundary.?.garbage);
         var output: std.Io.Writer.Allocating = .init(testing.allocator);
         defer output.deinit();
         try testing.expectError(
