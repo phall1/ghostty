@@ -377,6 +377,14 @@ pub const HistoryInvalidation = enum {
 pub const HistoryLeaseEntry = struct {
     ptr: *anyopaque,
     release: *const fn (*anyopaque, *PageList) void,
+    generation: u64,
+};
+
+pub const HistoryLeaseToken = [32]u8;
+pub const HistoryLeaseLookup = union(enum) {
+    active: *anyopaque,
+    stale,
+    invalid,
 };
 /// The memory pool we get page nodes, pages from.
 pool: MemoryPool,
@@ -416,7 +424,9 @@ history_generation: u64 = 0,
 
 history_invalidation: HistoryInvalidation = .none,
 
-history_leases: std.AutoHashMapUnmanaged(u64, HistoryLeaseEntry) = .empty,
+history_leases: std.AutoHashMapUnmanaged(u8, HistoryLeaseEntry) = .empty,
+history_lease_key: [32]u8 = undefined,
+history_lease_generation: u64 = 0,
 
 /// Byte size of the raw backing mappings owned by active page nodes. This is
 /// logical scrollback accounting and does not change while a mapping is
@@ -656,7 +666,7 @@ pub fn init(
     try tracked_pins.putNoClobber(pool.alloc, viewport_pin, {});
 
     errdefer comptime unreachable;
-    const result: PageList = .{
+    var result: PageList = .{
         .cols = cols,
         .rows = rows,
         .pool = pool,
@@ -671,6 +681,7 @@ pub fn init(
         .viewport_pin = viewport_pin,
         .viewport_pin_row_offset = null,
     };
+    std.crypto.random.bytes(&result.history_lease_key);
     result.assertIntegrity();
     return result;
 }
@@ -938,21 +949,77 @@ pub fn historyInvalidation(self: *const PageList) HistoryInvalidation {
     return self.history_invalidation;
 }
 
+pub const max_history_leases = 64;
+
+fn historyLeaseTag(
+    self: *const PageList,
+    prefix: *const [22]u8,
+) [10]u8 {
+    var hasher = std.crypto.hash.Blake3.init(.{ .key = self.history_lease_key });
+    hasher.update(prefix);
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return digest[0..10].*;
+}
+
 pub fn registerHistoryLease(
     self: *PageList,
-    id: u64,
+    terminal_address: u64,
+    screen_key: u8,
+    screen_generation: u32,
     entry: HistoryLeaseEntry,
-) Allocator.Error!void {
-    try self.history_leases.putNoClobber(self.pool.alloc, id, entry);
+) (Allocator.Error || error{
+    LeaseLimitExceeded,
+    LeaseGenerationExhausted,
+})!HistoryLeaseToken {
+    if (self.history_leases.count() >= max_history_leases) {
+        return error.LeaseLimitExceeded;
+    }
+    var slot: u8 = 0;
+    while (self.history_leases.contains(slot)) : (slot += 1) {}
+    self.history_lease_generation = std.math.add(
+        u64,
+        self.history_lease_generation,
+        1,
+    ) catch return error.LeaseGenerationExhausted;
+    var token: HistoryLeaseToken = undefined;
+    std.mem.writeInt(u64, token[0..8], terminal_address, .little);
+    token[8] = screen_key;
+    token[9] = slot;
+    std.mem.writeInt(u64, token[10..18], self.history_lease_generation, .little);
+    std.mem.writeInt(u32, token[18..22], screen_generation, .little);
+    token[22..32].* = self.historyLeaseTag(token[0..22]);
+    var stored = entry;
+    stored.generation = self.history_lease_generation;
+    try self.history_leases.putNoClobber(self.pool.alloc, slot, stored);
+    return token;
 }
 
-pub fn historyLease(self: *PageList, id: u64) ?*anyopaque {
-    const entry = self.history_leases.getPtr(id) orelse return null;
-    return entry.ptr;
+pub fn historyLease(
+    self: *PageList,
+    token: HistoryLeaseToken,
+) HistoryLeaseLookup {
+    if (!std.crypto.timing_safe.eql(
+        [10]u8,
+        self.historyLeaseTag(token[0..22]),
+        token[22..32].*,
+    )) return .invalid;
+    const slot = token[9];
+    const generation = std.mem.readInt(u64, token[10..18], .little);
+    const entry = self.history_leases.getPtr(slot) orelse return .stale;
+    if (entry.generation != generation) return .stale;
+    return .{ .active = entry.ptr };
 }
 
-pub fn releaseHistoryLease(self: *PageList, id: u64) void {
-    const entry = self.history_leases.fetchRemove(id) orelse return;
+pub fn releaseHistoryLease(
+    self: *PageList,
+    token: HistoryLeaseToken,
+) void {
+    switch (self.historyLease(token)) {
+        .active => {},
+        .stale, .invalid => return,
+    }
+    const entry = self.history_leases.fetchRemove(token[9]) orelse return;
     entry.value.release(entry.value.ptr, self);
 }
 
