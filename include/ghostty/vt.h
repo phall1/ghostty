@@ -29,6 +29,7 @@
  *
  * The API is organized into the following groups:
  * - @ref terminal "Terminal" - Complete terminal emulator state and rendering
+ * - @ref snapshot "Terminal Snapshots" - Complete state and VT stream continuation snapshots
  * - @ref render "Render State" - Incremental render state updates for custom renderers
  * - @ref formatter "Formatter" - Format terminal content as plain text, VT sequences, or HTML
  * - @ref osc "OSC Parser" - Parse OSC (Operating System Command) sequences
@@ -153,6 +154,7 @@ extern "C" {
 #include <ghostty/vt/screen.h>
 #include <ghostty/vt/selection.h>
 #include <ghostty/vt/size_report.h>
+#include <ghostty/vt/snapshot.h>
 #include <ghostty/vt/unicode.h>
 #include <ghostty/vt/wasm.h>
 

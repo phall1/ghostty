@@ -41,6 +41,7 @@ pub const paste = @import("paste.zig");
 pub const row = @import("row.zig");
 pub const sgr = @import("sgr.zig");
 pub const size_report = @import("size_report.zig");
+pub const snapshot = @import("snapshot.zig");
 pub const style = @import("style.zig");
 pub const sys = @import("sys.zig");
 pub const terminal = @import("terminal.zig");
@@ -215,6 +216,8 @@ pub const selection_gesture_event_set = selection_gesture.event_set;
 pub const terminal_grid_ref = terminal.grid_ref;
 pub const terminal_grid_ref_track = terminal.grid_ref_track;
 pub const terminal_point_from_grid_ref = terminal.point_from_grid_ref;
+pub const terminal_snapshot_encode = snapshot.encode;
+pub const terminal_snapshot_decode = snapshot.decode;
 
 pub const type_json = types.get_json;
 
@@ -256,6 +259,7 @@ test {
     _ = paste;
     _ = sgr;
     _ = size_report;
+    _ = snapshot;
     _ = style;
     _ = sys;
     _ = terminal;

@@ -8,6 +8,7 @@ pub const ZigTerminal = @import("../Terminal.zig");
 const Action = @import("../stream.zig").Action;
 const osc = @import("../osc.zig");
 const Stream = @import("../stream_terminal.zig").Stream;
+const snapshot_codec = @import("../snapshot/main.zig");
 const Screen = @import("../Screen.zig");
 const ScreenSet = @import("../ScreenSet.zig");
 const PageList = @import("../PageList.zig");
@@ -34,6 +35,7 @@ const assert = @import("../../quirks.zig").inlineAssert;
 const Handler = @import("../stream_terminal.zig").Handler;
 
 const max_path_bytes = if (builtin.os.tag == .freestanding) 4096 else std.fs.max_path_bytes;
+const snapshot_continuation_max_bytes = std.math.maxInt(u32);
 
 const log = std.log.scoped(.terminal_c);
 
@@ -359,6 +361,24 @@ const Effects = struct {
         return null;
     }
 };
+fn streamHandler(t: *ZigTerminal) Stream.Handler {
+    var handler: Stream.Handler = t.vtHandler();
+    handler.effects = .{
+        .write_pty = &Effects.writePtyTrampoline,
+        .bell = &Effects.bellTrampoline,
+        .color_scheme = &Effects.colorSchemeTrampoline,
+        .desktop_notification = &Effects.desktopNotificationTrampoline,
+        .device_attributes = &Effects.deviceAttributesTrampoline,
+        .enquiry = &Effects.enquiryTrampoline,
+        .xtversion = &Effects.xtversionTrampoline,
+        .title_changed = &Effects.titleChangedTrampoline,
+        .pwd_changed = &Effects.pwdChangedTrampoline,
+        .progress_report = &Effects.progressReportTrampoline,
+        .size = &Effects.sizeTrampoline,
+        .clipboard_write = &Effects.clipboardWriteTrampoline,
+    };
+    return handler;
+}
 
 /// C: GhosttyTerminal
 pub const Terminal = ?*TerminalWrapper;
@@ -372,6 +392,103 @@ pub const CompressionResult = ZigTerminal.CompressionResult;
 pub fn zigTerminal(terminal_: Terminal) ?*ZigTerminal {
     return (terminal_ orelse return null).terminal;
 }
+pub fn writeSnapshotContinuation(
+    terminal_: Terminal,
+    writer: *std.Io.Writer,
+) (std.Io.Writer.Error || error{
+    InvalidValue,
+    ContinuationDisabled,
+    ContinuationUnavailable,
+})!void {
+    const wrapper = terminal_ orelse return error.InvalidValue;
+    try wrapper.stream.writeContinuation(writer);
+}
+
+/// Owns the persistent I/O implementation needed while transactionally
+/// decoding a terminal snapshot. Ownership transfers to the restored wrapper
+/// only after the terminal and its stream continuation are complete.
+pub const SnapshotDecodeContext = struct {
+    alloc: std.mem.Allocator,
+    io_impl: TerminalWrapper.IoImpl,
+    transferred: bool = false,
+
+    pub fn init(alloc: std.mem.Allocator) std.mem.Allocator.Error!SnapshotDecodeContext {
+        const io_impl: TerminalWrapper.IoImpl = if (comptime builtin.os.tag != .freestanding) io_impl: {
+            const ptr = try alloc.create(std.Io.Threaded);
+            ptr.* = .init_single_threaded;
+            break :io_impl ptr;
+        } else {};
+
+        return .{
+            .alloc = alloc,
+            .io_impl = io_impl,
+        };
+    }
+
+    pub fn deinit(self: *SnapshotDecodeContext) void {
+        if (comptime builtin.os.tag != .freestanding) {
+            if (!self.transferred) {
+                self.io_impl.deinit();
+                self.alloc.destroy(self.io_impl);
+            }
+        }
+        self.* = undefined;
+    }
+
+    pub fn io(self: *SnapshotDecodeContext) std.Io {
+        return if (comptime builtin.os.tag != .freestanding)
+            self.io_impl.io()
+        else
+            std.Io.failing;
+    }
+
+    pub fn restore(
+        self: *SnapshotDecodeContext,
+        decoded: *snapshot_codec.Decoded,
+    ) (std.mem.Allocator.Error || error{InvalidValue})!Terminal {
+        const t = try self.alloc.create(ZigTerminal);
+        errdefer self.alloc.destroy(t);
+
+        const wrapper = try self.alloc.create(TerminalWrapper);
+        errdefer self.alloc.destroy(wrapper);
+
+        const verify: ?[]u8 = switch (decoded.continuation) {
+            .ground => null,
+            .bytes => |bytes| try self.alloc.alloc(u8, bytes.len),
+        };
+        defer if (verify) |buf| self.alloc.free(buf);
+
+        t.* = decoded.toOwned();
+        errdefer t.deinit(self.alloc);
+
+        wrapper.* = .{
+            .terminal = t,
+            .io_impl = self.io_impl,
+            .tmp_dir_path = undefined,
+            .stream = Stream.init(.{
+                .allocator = self.alloc,
+                .handler = streamHandler(t),
+                .continuation_max_bytes = snapshot_continuation_max_bytes,
+            }),
+        };
+        errdefer wrapper.stream.deinit();
+
+        switch (decoded.continuation) {
+            .ground => {},
+            .bytes => |bytes| {
+                wrapper.stream.nextSlice(bytes);
+                var writer: std.Io.Writer = .fixed(verify.?);
+                wrapper.stream.writeContinuation(&writer) catch
+                    return error.InvalidValue;
+                if (!std.mem.eql(u8, bytes, writer.buffered()))
+                    return error.InvalidValue;
+            },
+        }
+
+        self.transferred = true;
+        return wrapper;
+    }
+};
 
 const NewError = error{
     InvalidValue,
@@ -437,21 +554,7 @@ fn new_(
 
     // Setup our stream with trampolines always installed so that
     // setting C callbacks at any time takes effect immediately.
-    var handler: Stream.Handler = t.vtHandler();
-    handler.effects = .{
-        .write_pty = &Effects.writePtyTrampoline,
-        .bell = &Effects.bellTrampoline,
-        .color_scheme = &Effects.colorSchemeTrampoline,
-        .desktop_notification = &Effects.desktopNotificationTrampoline,
-        .device_attributes = &Effects.deviceAttributesTrampoline,
-        .enquiry = &Effects.enquiryTrampoline,
-        .xtversion = &Effects.xtversionTrampoline,
-        .title_changed = &Effects.titleChangedTrampoline,
-        .pwd_changed = &Effects.pwdChangedTrampoline,
-        .progress_report = &Effects.progressReportTrampoline,
-        .size = &Effects.sizeTrampoline,
-        .clipboard_write = &Effects.clipboardWriteTrampoline,
-    };
+    const handler = streamHandler(t);
 
     wrapper.* = .{
         .terminal = t,
@@ -460,6 +563,7 @@ fn new_(
         .stream = Stream.init(.{
             .allocator = alloc,
             .handler = handler,
+            .continuation_max_bytes = snapshot_continuation_max_bytes,
         }),
     };
 

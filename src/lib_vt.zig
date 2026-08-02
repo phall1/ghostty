@@ -290,6 +290,8 @@ comptime {
         @export(&c.terminal_mode_set, .{ .name = "ghostty_terminal_mode_set" });
         @export(&c.terminal_get, .{ .name = "ghostty_terminal_get" });
         @export(&c.terminal_get_multi, .{ .name = "ghostty_terminal_get_multi" });
+        @export(&c.terminal_snapshot_encode, .{ .name = "ghostty_terminal_snapshot_encode" });
+        @export(&c.terminal_snapshot_decode, .{ .name = "ghostty_terminal_snapshot_decode" });
         @export(&c.terminal_select_word, .{ .name = "ghostty_terminal_select_word" });
         @export(&c.terminal_select_word_between, .{ .name = "ghostty_terminal_select_word_between" });
         @export(&c.terminal_select_line, .{ .name = "ghostty_terminal_select_line" });

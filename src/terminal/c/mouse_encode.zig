@@ -334,16 +334,24 @@ test "setopt" {
 }
 
 test "terminal_options exactly captures effective state" {
-    var terminal = try ZigTerminal.init(testing.allocator, .{ .cols = 80, .rows = 24 });
-    defer terminal.deinit(testing.allocator);
-    terminal.flags.mouse_event = .any;
-    terminal.flags.mouse_format = .sgr_pixels;
+    const terminal_c = @import("terminal.zig");
+    var terminal: Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &terminal,
+        80,
+        24,
+    ));
+    defer terminal_c.free(terminal);
+    const zig_terminal = terminal_c.zigTerminal(terminal).?;
+    zig_terminal.flags.mouse_event = .any;
+    zig_terminal.flags.mouse_format = .sgr_pixels;
 
     var out: TerminalOptions = undefined;
     out.size = @sizeOf(TerminalOptions);
-    try testing.expectEqual(Result.success, terminal_options(.{ .terminal = &terminal }, &out));
-    try testing.expectEqual(terminal.flags.mouse_event, out.event);
-    try testing.expectEqual(terminal.flags.mouse_format, out.format);
+    try testing.expectEqual(Result.success, terminal_options(terminal, &out));
+    try testing.expectEqual(zig_terminal.flags.mouse_event, out.event);
+    try testing.expectEqual(zig_terminal.flags.mouse_format, out.format);
 }
 
 test "setopt_from_terminal" {

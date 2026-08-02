@@ -16,6 +16,7 @@ const terminal = @import("terminal.zig");
 const formatter = @import("formatter.zig");
 const selection = @import("selection.zig");
 const selection_gesture = @import("selection_gesture.zig");
+const snapshot = @import("snapshot.zig");
 const render = @import("render.zig");
 const style_c = @import("style.zig");
 const mouse_encode = @import("mouse_encode.zig");
@@ -72,6 +73,8 @@ pub const structs: std.StaticStringMap(StructInfo) = structs: {
         .{ "GhosttyTerminalProgressReport", StructInfo.init(terminal.ProgressReport) },
         .{ "GhosttyTerminalScrollbar", StructInfo.init(terminal.TerminalScrollbar) },
         .{ "GhosttyTerminalScrollViewport", StructInfo.init(terminal.ScrollViewport) },
+        .{ "GhosttyTerminalSnapshot", StructInfo.init(snapshot.Encoded) },
+        .{ "GhosttyTerminalSnapshotDecodeResult", StructInfo.init(snapshot.DecodeResult) },
     });
 };
 

@@ -276,19 +276,27 @@ test "setopt macos option as alt" {
 
 test "terminal_options exactly captures fromTerminal" {
     const testing = std.testing;
-    var terminal = try ZigTerminal.init(testing.allocator, .{ .cols = 80, .rows = 24 });
-    defer terminal.deinit(testing.allocator);
-    terminal.modes.set(.cursor_keys, true);
-    terminal.modes.set(.keypad_keys, true);
-    terminal.modes.set(.ignore_keypad_with_numlock, true);
-    terminal.modes.set(.alt_esc_prefix, true);
-    terminal.flags.modify_other_keys_2 = true;
-    terminal.modes.set(.backarrow_key_mode, true);
+    const terminal_c = @import("terminal.zig");
+    var terminal: Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &terminal,
+        80,
+        24,
+    ));
+    defer terminal_c.free(terminal);
+    const zig_terminal = terminal_c.zigTerminal(terminal).?;
+    zig_terminal.modes.set(.cursor_keys, true);
+    zig_terminal.modes.set(.keypad_keys, true);
+    zig_terminal.modes.set(.ignore_keypad_with_numlock, true);
+    zig_terminal.modes.set(.alt_esc_prefix, true);
+    zig_terminal.flags.modify_other_keys_2 = true;
+    zig_terminal.modes.set(.backarrow_key_mode, true);
 
     var out: TerminalOptions = undefined;
     out.size = @sizeOf(TerminalOptions);
-    try testing.expectEqual(Result.success, terminal_options(.{ .terminal = &terminal }, &out));
-    const expected: key_encode.Options = .fromTerminal(&terminal);
+    try testing.expectEqual(Result.success, terminal_options(terminal, &out));
+    const expected: key_encode.Options = .fromTerminal(zig_terminal);
     try testing.expectEqual(expected.cursor_key_application, out.cursor_key_application);
     try testing.expectEqual(expected.keypad_key_application, out.keypad_key_application);
     try testing.expectEqual(expected.ignore_keypad_with_numlock, out.ignore_keypad_with_numlock);
