@@ -16,6 +16,8 @@ const osc = @import("osc.zig");
 const osc_color = @import("osc/parsers/color.zig");
 const kitty_color = @import("kitty/color.zig");
 const size_report = @import("size_report.zig");
+const simd = @import("../simd/main.zig");
+const terminfo = @import("../terminfo/main.zig");
 const Terminal = @import("Terminal.zig");
 
 const log = std.log.scoped(.stream_terminal);
@@ -55,6 +57,11 @@ pub const Handler = struct {
     /// effects.
     effects: Effects = .readonly,
 
+    /// Whether CSI 21 t may report the terminal title. This is disabled by
+    /// default because reporting an attacker-controlled title to the pty can
+    /// inject text into the input stream of the foreground process.
+    title_report: bool = false,
+
     /// The APC command handler maintains the APC state. APC is like
     /// CSI or OSC, but it is a private escape sequence that is used
     /// to send commands to the terminal emulator. This is used by
@@ -63,6 +70,23 @@ pub const Handler = struct {
 
     /// The DCS command handler maintains state for DCS queries.
     dcs_handler: dcs.Handler = .{},
+
+    /// Called for sequence identifiers not supported by this library.
+    /// Currently, only APC is reported. Content is borrowed and only valid
+    /// for the duration of the callback. Set `apc_handler.unknown_max_bytes`
+    /// before starting the Stream to enable APC capture.
+    unknown_sequence: ?*const fn (*Handler, UnknownSequence) void = null,
+
+    /// The name of the terminfo entry this terminal runs as, reported in
+    /// response to an XTGETTCAP query for "TN".
+    ///
+    /// The memory must remain valid for the lifetime of the handler.
+    /// Empty names and names longer than `max_terminfo_name_bytes` are
+    /// silently ignored.
+    terminfo_name: ?[]const u8 = null,
+
+    /// Maximum byte length accepted for `terminfo_name`.
+    pub const max_terminfo_name_bytes = 128;
 
     pub const Effects = struct {
         /// Called when the terminal needs to write data back to the pty,
@@ -151,6 +175,18 @@ pub const Handler = struct {
         };
     };
 
+    /// A sequence unsupported by the active handler. Payload data is borrowed
+    /// only for the duration of the handler callback.
+    pub const UnknownSequence = union(enum) {
+        apc: String,
+
+        /// Content between a string sequence's introducer and terminator.
+        pub const String = struct {
+            content: []const u8,
+            truncated: bool,
+        };
+    };
+
     pub fn init(terminal: *Terminal) Handler {
         return .{
             .terminal = terminal,
@@ -203,6 +239,11 @@ pub const Handler = struct {
             self.semantic_failure = true;
             log.warn("error handling VT action action={} err={}", .{ action, err });
         };
+    }
+
+    fn unknownSequence(self: *Handler, value: UnknownSequence) void {
+        const func = self.unknown_sequence orelse return;
+        func(self, value);
     }
 
     inline fn vtFallible(
@@ -320,7 +361,7 @@ pub const Handler = struct {
             .apc_start => self.apc_handler.start(),
             .apc_put => self.apc_handler.feed(self.terminal.gpa(), value),
             .apc_put_slice => self.apc_handler.feedSlice(self.terminal.gpa(), value.bytes),
-            .apc_end => self.apcEnd(),
+            .apc_end => self.apcEnd(value.terminated),
 
             // Effect-based handlers
             .bell => self.bell(),
@@ -395,10 +436,49 @@ pub const Handler = struct {
                 self.writePty(response[0..encoded.len :0]);
             },
 
-            .tmux,
-            .xtgettcap,
-            => {},
+            .xtgettcap => |*gettcap| {
+                if (self.effects.write_pty == null) return;
+                const map = comptime terminfo.ghostty.xtgettcapMap();
+                while (gettcap.next()) |key| {
+                    if (std.mem.eql(u8, key, encoded_tn_key)) {
+                        self.writeTerminfoName();
+                        continue;
+                    }
+                    self.writePty(map.get(key) orelse continue);
+                }
+            },
+
+            .tmux => {},
         }
+    }
+
+    // Hex-encoded "TN", the XTGETTCAP key naming the terminfo entry.
+    // The static map also carries this key with Ghostty's own name, so
+    // it is intercepted before the lookup: an embedder that never
+    // configured a name must not be reported as Ghostty's entry.
+    const encoded_tn_key = &std.fmt.bytesToHex("TN", .upper);
+
+    /// Answer an XTGETTCAP "TN" query from the configured terminfo name.
+    /// Unset, empty, or over-long names leave the query unanswered.
+    fn writeTerminfoName(self: *Handler) void {
+        const name = self.terminfo_name orelse return;
+        if (name.len == 0 or name.len > max_terminfo_name_bytes) return;
+
+        // Fixed upper bound for an encoded "TN" reply calculated
+        // at comptime from our max terminfo size.
+        const max_tn_response_bytes =
+            comptime "\x1bP1+r".len + encoded_tn_key.len + "=".len +
+            (max_terminfo_name_bytes * 2) + "\x1b\\".len +
+            1; // null terminator
+
+        // Values are hex-encoded uppercase, matching the static map. The
+        // buffer fits any name allowed above, so the print cannot fail.
+        var buf: [max_tn_response_bytes]u8 = undefined;
+        self.writePty(std.fmt.bufPrintZ(
+            &buf,
+            "\x1bP1+r" ++ encoded_tn_key ++ "={X}\x1b\\",
+            .{name},
+        ) catch unreachable);
     }
 
     fn bell(self: *Handler) void {
@@ -440,12 +520,13 @@ pub const Handler = struct {
             return;
         }
 
-        const decoder = std.base64.standard.Decoder;
-        const decoded_len = try decoder.calcSizeForSlice(data);
+        // Decode the base64 payload with the SIMD decoder (the same one
+        // used for Kitty graphics payloads) rather than the scalar std
+        // implementation; clipboard payloads can be megabytes.
         const alloc = self.terminal.gpa();
-        const decoded = try alloc.alloc(u8, decoded_len);
-        defer alloc.free(decoded);
-        try decoder.decode(decoded, data);
+        const buf = try alloc.alloc(u8, simd.base64.maxLen(data));
+        defer alloc.free(buf);
+        const decoded = try simd.base64.decode(data, buf);
 
         const contents = [_]clipboard.Content{.{
             .mime = "text/plain",
@@ -563,6 +644,7 @@ pub const Handler = struct {
         // Build the response.
         switch (style) {
             .csi_21_t => {
+                if (!self.title_report) return;
                 const title = self.terminal.getTitle() orelse "";
                 aw.writer.print("\x1b]l{s}\x1b\\", .{title}) catch return;
             },
@@ -940,13 +1022,18 @@ pub const Handler = struct {
         }
     }
 
-    fn apcEnd(self: *Handler) void {
+    fn apcEnd(self: *Handler, terminated: bool) void {
         const io = self.terminal.io();
         const alloc = self.terminal.gpa();
-        var cmd = self.apc_handler.end() orelse return;
-        defer cmd.deinit(alloc);
-
-        switch (cmd) {
+        var result = self.apc_handler.end() orelse return;
+        defer result.deinit(alloc);
+        switch (result) {
+            .unknown => |*unknown| {
+                if (terminated) self.unknownSequence(.{ .apc = .{
+                    .content = unknown.content,
+                    .truncated = unknown.truncated,
+                } });
+            },
             .kitty => |*kitty_cmd| if (comptime build_options.kitty_graphics) {
                 if (self.terminal.kittyGraphics(
                     io,
@@ -1006,6 +1093,51 @@ test "resize clears synchronized output on unchanged cell dimensions" {
     try testing.expect(!t.modes.get(.synchronized_output));
     try testing.expectEqual(@as(u32, 720), t.width_px);
     try testing.expectEqual(@as(u32, 432), t.height_px);
+}
+
+test "unknown APC effect callback" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var count: usize = 0;
+        var content: [16]u8 = undefined;
+        var content_len: usize = undefined;
+        var truncated: bool = undefined;
+
+        fn unknownSequence(_: *Handler, value: Handler.UnknownSequence) void {
+            switch (value) {
+                .apc => |apc_value| {
+                    content_len = apc_value.content.len;
+                    @memcpy(content[0..apc_value.content.len], apc_value.content);
+                    truncated = apc_value.truncated;
+                },
+            }
+            count += 1;
+        }
+    };
+    S.count = 0;
+
+    var handler: Handler = .init(&t);
+    handler.unknown_sequence = &S.unknownSequence;
+    handler.apc_handler.unknown_max_bytes = 8;
+    var s: Stream = .init(.{
+        .allocator = testing.allocator,
+        .handler = handler,
+    });
+    defer s.deinit();
+
+    // Unknown OSC commands retain their legacy behavior and are ignored.
+    s.nextSlice("\x1B]999;abcdef\x07");
+    s.nextSlice("\x1B_abcd;payload\x1B\\");
+
+    try testing.expectEqual(@as(usize, 1), S.count);
+    try testing.expectEqualStrings("abcd;pay", S.content[0..S.content_len]);
+    try testing.expect(S.truncated);
+
+    // Aborted unknown APCs are suppressed.
+    s.nextSlice("\x1B_Xpayload\x18");
+    try testing.expectEqual(@as(usize, 1), S.count);
 }
 
 test "resize reports mode 2048 geometry" {
@@ -1441,13 +1573,17 @@ test "DECRQSS responses" {
     s.nextSlice("\x1B[1m\x1BP$qm\x1B\\");
     try S.expectResponse("\x1BP1$r0;1m\x1B\\");
 
+    // Overline
+    s.nextSlice("\x1B[0;53m\x1BP$qm\x1B\\");
+    try S.expectResponse("\x1BP1$r0;53m\x1B\\");
+
     // Requests larger than the parser's fixed request buffer are ignored,
     // and the next DCS command must still be processed normally.
     s.nextSlice("\x1BP$qfoo\x1B\\");
     try testing.expectEqual(@as(usize, 0), S.calls);
     try testing.expect(!s.handler.semantic_failure);
     s.nextSlice("\x1BP$qm\x1B\\");
-    try S.expectResponse("\x1BP1$r0;1m\x1B\\");
+    try S.expectResponse("\x1BP1$r0;53m\x1B\\");
 }
 
 test "DECRQSS without write effect is ignored" {
@@ -1465,6 +1601,161 @@ test "DECRQSS without write effect is ignored" {
     try testing.expect(!s.handler.semantic_failure);
 }
 
+test "XTGETTCAP responses" {
+    var t: Terminal = try .init(
+        testing.io,
+        testing.allocator,
+        .{ .cols = 80, .rows = 24 },
+    );
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var response: [128]u8 = undefined;
+        var response_len: usize = 0;
+        var calls: usize = 0;
+
+        fn reset() void {
+            response_len = 0;
+            calls = 0;
+        }
+
+        fn writePty(_: *Handler, data: [:0]const u8) void {
+            @memcpy(response[0..data.len], data);
+            response_len = data.len;
+            calls += 1;
+        }
+
+        fn expectResponse(expected: []const u8) !void {
+            try testing.expectEqual(@as(usize, 1), calls);
+            try testing.expectEqualStrings(
+                expected,
+                response[0..response_len],
+            );
+            reset();
+        }
+    };
+    S.reset();
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    // The full capability table comes from the static terminfo map; this
+    // checks the wiring for a valued and a valueless (boolean) capability.
+    s.nextSlice("\x1BP+q" ++ std.fmt.bytesToHex("Co", .upper) ++ "\x1B\\");
+    try S.expectResponse("\x1BP1+r" ++ std.fmt.bytesToHex("Co", .upper) ++ "=" ++
+        std.fmt.bytesToHex("256", .upper) ++ "\x1B\\");
+    s.nextSlice("\x1BP+q" ++ std.fmt.bytesToHex("am", .upper) ++ "\x1B\\");
+    try S.expectResponse("\x1BP1+r" ++ std.fmt.bytesToHex("am", .upper) ++ "\x1B\\");
+
+    // One response per requested key; lowercase hex is normalized by the
+    // DCS parser. The capture holds the last ("Co") reply.
+    s.nextSlice("\x1BP+q" ++ std.fmt.bytesToHex("am", .lower) ++ ";" ++
+        std.fmt.bytesToHex("Co", .lower) ++ "\x1B\\");
+    try testing.expectEqual(@as(usize, 2), S.calls);
+    try testing.expectEqualStrings(
+        "\x1BP1+r" ++ std.fmt.bytesToHex("Co", .upper) ++ "=" ++
+            std.fmt.bytesToHex("256", .upper) ++ "\x1B\\",
+        S.response[0..S.response_len],
+    );
+    S.reset();
+
+    // Unknown and malformed keys are skipped without an error.
+    s.nextSlice("\x1BP+qWHO;5;GG\x1B\\");
+    try testing.expectEqual(@as(usize, 0), S.calls);
+    try testing.expect(!s.handler.semantic_failure);
+}
+
+test "XTGETTCAP without write effect is ignored" {
+    var t: Terminal = try .init(
+        testing.io,
+        testing.allocator,
+        .{ .cols = 80, .rows = 24 },
+    );
+    defer t.deinit(testing.allocator);
+
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = .init(&t) });
+    defer s.deinit();
+
+    s.nextSlice("\x1BP+q" ++ std.fmt.bytesToHex("TN", .upper) ++ ";" ++
+        std.fmt.bytesToHex("am", .upper) ++ "\x1B\\");
+    try testing.expect(!s.handler.semantic_failure);
+}
+
+test "XTGETTCAP TN responses" {
+    var t: Terminal = try .init(
+        testing.io,
+        testing.allocator,
+        .{ .cols = 80, .rows = 24 },
+    );
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var response: [512]u8 = undefined;
+        var response_len: usize = 0;
+        var calls: usize = 0;
+
+        fn reset() void {
+            response_len = 0;
+            calls = 0;
+        }
+
+        fn writePty(_: *Handler, data: [:0]const u8) void {
+            @memcpy(response[0..data.len], data);
+            response_len = data.len;
+            calls += 1;
+        }
+
+        fn expectResponse(expected: []const u8) !void {
+            try testing.expectEqual(@as(usize, 1), calls);
+            try testing.expectEqualStrings(
+                expected,
+                response[0..response_len],
+            );
+            reset();
+        }
+    };
+    S.reset();
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    const tn_query = "\x1BP+q" ++ std.fmt.bytesToHex("TN", .upper) ++ "\x1B\\";
+
+    // While no name is configured the query goes unanswered.
+    s.nextSlice(tn_query);
+    try testing.expectEqual(@as(usize, 0), S.calls);
+
+    // A configured name is reported hex-encoded.
+    s.handler.terminfo_name = "xterm-256color";
+    s.nextSlice(tn_query);
+    try S.expectResponse("\x1BP1+r" ++ std.fmt.bytesToHex("TN", .upper) ++ "=" ++
+        std.fmt.bytesToHex("xterm-256color", .upper) ++ "\x1B\\");
+
+    // A maximum-length name is still reported in full.
+    const max_name = "a" ** Handler.max_terminfo_name_bytes;
+    s.handler.terminfo_name = max_name;
+    s.nextSlice(tn_query);
+    try S.expectResponse("\x1BP1+r" ++ std.fmt.bytesToHex("TN", .upper) ++ "=" ++
+        std.fmt.bytesToHex(max_name.*, .upper) ++ "\x1B\\");
+
+    // An empty name is silent; "Co" is still answered.
+    s.handler.terminfo_name = "";
+    s.nextSlice("\x1BP+q" ++ std.fmt.bytesToHex("TN", .upper) ++ ";" ++
+        std.fmt.bytesToHex("Co", .upper) ++ "\x1B\\");
+    try S.expectResponse("\x1BP1+r" ++ std.fmt.bytesToHex("Co", .upper) ++ "=" ++
+        std.fmt.bytesToHex("256", .upper) ++ "\x1B\\");
+
+    // As are names beyond the maximum length.
+    s.handler.terminfo_name = "a" ** (Handler.max_terminfo_name_bytes + 1);
+    s.nextSlice(tn_query);
+    try testing.expectEqual(@as(usize, 0), S.calls);
+    try testing.expect(!s.handler.semantic_failure);
+}
+
 test "DCS command memory is released" {
     var t: Terminal = try .init(
         testing.io,
@@ -1475,8 +1766,8 @@ test "DCS command memory is released" {
 
     var s: Stream = .init(.{ .allocator = testing.allocator, .handler = .init(&t) });
 
-    // A completed, unsupported command transfers its allocation to Command;
-    // dcsCommand must release it even though stream_terminal ignores it.
+    // A completed command transfers its allocation to Command; dcsCommand
+    // must release it even when there is no write effect.
     s.nextSlice("\x1BP+q536D756C78\x1B\\");
 
     // An incomplete command remains owned by the handler and must be released
@@ -1665,6 +1956,9 @@ test "OSC 11 set and reset background color" {
     var s: Stream = .init(.{ .allocator = testing.allocator, .handler = .init(&t) });
     defer s.deinit();
 
+    const default: color.RGB = .{ .r = 0x10, .g = 0x20, .b = 0x30 };
+    t.colors.background.default = default;
+
     // Set background to green
     s.nextSlice("\x1b]11;rgb:00/ff/00\x1b\\");
     const bg = t.colors.background.get().?;
@@ -1674,7 +1968,13 @@ test "OSC 11 set and reset background color" {
 
     // Reset background
     s.nextSlice("\x1b]111\x1b\\");
-    try testing.expect(t.colors.background.get() == null);
+    try testing.expectEqual(default, t.colors.background.get().?);
+    try testing.expectEqual(null, t.colors.background.override);
+
+    // A reset color continues to follow later configuration changes.
+    const updated: color.RGB = .{ .r = 0x40, .g = 0x50, .b = 0x60 };
+    t.colors.background.default = updated;
+    try testing.expectEqual(updated, t.colors.background.get().?);
 }
 
 test "OSC 12 set and reset cursor color" {
@@ -2383,6 +2683,10 @@ test "request mode DECRQM with write_pty callback" {
         // Query an unknown mode
         s.nextSlice("\x1B[?9999$p");
         try testing.expectEqualStrings("\x1B[?9999;0$y", S.last_response.?);
+
+        // Query DECECM, which Ghostty recognizes but does not allow changing
+        s.nextSlice("\x1B[?117$p");
+        try testing.expectEqualStrings("\x1B[?117;4$y", S.last_response.?);
     }
 }
 
@@ -2682,7 +2986,7 @@ test "size report no effect callback" {
     try testing.expect(S.written == null);
 }
 
-test "size report csi_21_t title" {
+test "size report csi_21_t title disabled by default" {
     var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
     defer t.deinit(testing.allocator);
 
@@ -2696,6 +3000,33 @@ test "size report csi_21_t title" {
 
     var handler: Handler = .init(&t);
     handler.effects.write_pty = &S.writePty;
+
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    // Set a title first
+    s.nextSlice("\x1b]2;My Title\x1b\\");
+
+    // CSI 21 t - report title (no size effect needed)
+    s.nextSlice("\x1b[21t");
+    try testing.expect(S.written == null);
+}
+
+test "size report csi_21_t title enabled" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var written: ?[]const u8 = null;
+        fn writePty(_: *Handler, data: [:0]const u8) void {
+            written = testing.allocator.dupe(u8, data) catch @panic("OOM");
+        }
+    };
+    S.written = null;
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    handler.title_report = true;
 
     var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
     defer s.deinit();
