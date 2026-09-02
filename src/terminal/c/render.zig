@@ -526,6 +526,219 @@ pub fn row_cells_get(
     };
 }
 
+/// C: GhosttyRenderStateRowCellEntry
+///
+/// One cell's worth of render data, filled by row_cells_get_all. Text lives
+/// out of line in the batch's text buffer so this record stays small enough
+/// that a whole row of them fits in cache.
+pub const RowCellEntry = extern struct {
+    /// Byte offset of this cell's UTF-8 grapheme cluster within the batch's
+    /// text buffer.
+    text_offset: u32 = 0,
+
+    /// Byte length of this cell's grapheme cluster. Zero when the cell has
+    /// no text.
+    text_len: u32 = 0,
+
+    /// Index of this cell's style within the batch's styles array. Always
+    /// zero when the caller passed a NULL styles array.
+    style_index: u32 = 0,
+
+    /// The resolved foreground color. Only meaningful when has_fg is true.
+    fg: colorpkg.RGB.C = .{ .r = 0, .g = 0, .b = 0 },
+
+    /// The resolved background color. Only meaningful when has_bg is true.
+    bg: colorpkg.RGB.C = .{ .r = 0, .g = 0, .b = 0 },
+
+    /// Whether fg holds a resolved foreground color. False means the cell
+    /// has no explicit foreground and the caller should use its own default.
+    has_fg: bool = false,
+
+    /// Whether bg holds a resolved background color. False means the cell
+    /// has no explicit background and the caller should use its own default.
+    has_bg: bool = false,
+
+    /// Whether the cell carries a non-default style entry.
+    has_styling: bool = false,
+
+    /// Whether the cell falls inside the row's selection range.
+    selected: bool = false,
+
+    /// The cell's wide property, a GhosttyCellWide value narrowed to a byte.
+    wide: u8 = 0,
+
+    _reserved: u8 = 0,
+};
+
+/// C: GhosttyRenderStateRowCellsBatch
+///
+/// In/out parameter block for row_cells_get_all. The caller owns every
+/// buffer; the function only writes into them.
+pub const RowCellsBatch = extern struct {
+    /// Size of this struct in bytes. Must be set by the caller.
+    size: usize = @sizeOf(RowCellsBatch),
+
+    /// Array receiving one entry per cell in the row, in column order.
+    entries: ?[*]RowCellEntry = null,
+
+    /// Capacity of entries, in elements.
+    entries_cap: usize = 0,
+
+    /// Array receiving the row's styles, deduplicated by style id: a new
+    /// entry is appended only where a cell's style differs from the
+    /// preceding cell's. May be NULL to skip style materialization, in
+    /// which case every entry's style_index is zero and styles_len is zero.
+    styles: ?[*]style_c.Style = null,
+
+    /// Capacity of styles, in elements.
+    styles_cap: usize = 0,
+
+    /// Buffer receiving every cell's UTF-8 grapheme cluster, laid out back
+    /// to back in column order. Each entry's text_offset/text_len index
+    /// into it.
+    text: lib.Buffer = .{},
+
+    /// Number of entries written, or the required entry capacity when the
+    /// call returns GHOSTTY_OUT_OF_SPACE.
+    entries_len: usize = 0,
+
+    /// Number of styles written, or the required style capacity when the
+    /// call returns GHOSTTY_OUT_OF_SPACE.
+    styles_len: usize = 0,
+};
+
+/// Read an entire row's cells in one call.
+///
+/// This is the batched counterpart to row_cells_get: it fills a caller-owned
+/// record per cell plus a shared text buffer, so a renderer pays one C API
+/// call per ROW instead of several per cell.
+///
+/// The iterator position is neither read nor modified: the whole row is read
+/// regardless of where row_cells_next/row_cells_select left it.
+///
+/// On GHOSTTY_OUT_OF_SPACE the required capacities are reported in
+/// entries_len, styles_len and text.len, and the contents of the caller's
+/// buffers are unspecified.
+pub fn row_cells_get_all(
+    cells_: RowCells,
+    batch_: ?*RowCellsBatch,
+) callconv(lib.calling_conv) Result {
+    const cells = cells_ orelse return .invalid_value;
+    const batch = batch_ orelse return .invalid_value;
+    if (batch.size < @sizeOf(RowCellsBatch)) return .invalid_value;
+
+    const len = cells.raws.len;
+    const want_styles = batch.styles != null;
+
+    // Space check up front so the write loop never has to branch on the
+    // entry or style capacity. The text buffer is checked as it is filled,
+    // because its requirement is only known once the clusters are encoded.
+    var out_of_space = batch.entries == null or batch.entries_cap < len;
+    if (want_styles and batch.styles_cap < 1) out_of_space = true;
+
+    var text_len: usize = 0;
+    var styles_len: usize = 0;
+
+    // The last style id appended to the styles array, and its index. A style
+    // id identifies a style exactly (0 is always the default), so a run of
+    // cells sharing one costs a single styles entry. The resolved foreground
+    // depends only on the style, so it is carried across the run too.
+    var last_style_id: u32 = 0;
+    var have_last_style = false;
+    var last_fg: ?colorpkg.RGB.C = null;
+
+    for (cells.raws, 0..) |cell, x| {
+        const s: Style = if (cell.hasStyling()) cells.styles[x] else .{};
+
+        if (!have_last_style or last_style_id != cell.style_id) {
+            have_last_style = true;
+            last_style_id = cell.style_id;
+            last_fg = if (s.fg_color == .none)
+                null
+            else
+                s.fg(.{ .default = .{}, .palette = cells.palette }).cval();
+
+            if (want_styles) {
+                if (styles_len < batch.styles_cap) {
+                    batch.styles.?[styles_len] = style_c.Style.fromStyle(s);
+                } else {
+                    out_of_space = true;
+                }
+                styles_len += 1;
+            }
+        }
+
+        const text_offset = text_len;
+        text_len += rowCellsEncodeCluster(
+            cell,
+            if (cell.hasGrapheme()) cells.graphemes[x] else &.{},
+            batch.text,
+            text_len,
+            &out_of_space,
+        );
+
+        if (out_of_space) continue;
+
+        const bg = s.bg(&cell, cells.palette);
+        batch.entries.?[x] = .{
+            .text_offset = @intCast(text_offset),
+            .text_len = @intCast(text_len - text_offset),
+            .style_index = if (want_styles) @intCast(styles_len - 1) else 0,
+            .fg = last_fg orelse .{ .r = 0, .g = 0, .b = 0 },
+            .bg = if (bg) |c| c.cval() else .{ .r = 0, .g = 0, .b = 0 },
+            .has_fg = last_fg != null,
+            .has_bg = bg != null,
+            .has_styling = cell.hasStyling(),
+            .selected = if (cells.selection) |sel|
+                x >= @as(usize, sel[0]) and x <= @as(usize, sel[1])
+            else
+                false,
+            .wide = @intCast(@intFromEnum(cell.wide)),
+        };
+    }
+
+    batch.entries_len = len;
+    batch.styles_len = styles_len;
+    batch.text.len = text_len;
+    return if (out_of_space) .out_of_space else .success;
+}
+
+/// Encode one cell's grapheme cluster into `buf` at `offset`, returning the
+/// byte length the cluster needs. Sets `out_of_space` and writes nothing
+/// when the buffer cannot hold it, so the caller still learns the total
+/// capacity the row requires.
+fn rowCellsEncodeCluster(
+    cell: page.Cell,
+    extra: []const u21,
+    buf: lib.Buffer,
+    offset: usize,
+    out_of_space: *bool,
+) usize {
+    if (!cell.hasText()) return 0;
+
+    var needed: usize = std.unicode.utf8CodepointSequenceLength(cell.codepoint()) catch 0;
+    for (extra) |cp| {
+        needed += std.unicode.utf8CodepointSequenceLength(cp) catch 0;
+    }
+
+    const ptr = buf.ptr orelse {
+        out_of_space.* = true;
+        return needed;
+    };
+    if (out_of_space.* or offset + needed > buf.cap) {
+        out_of_space.* = true;
+        return needed;
+    }
+
+    const dst = ptr[offset..buf.cap];
+    var i: usize = 0;
+    i += std.unicode.utf8Encode(cell.codepoint(), dst[i..]) catch 0;
+    for (extra) |cp| {
+        i += std.unicode.utf8Encode(cp, dst[i..]) catch 0;
+    }
+    return i;
+}
+
 pub fn row_cells_get_multi(
     cells_: RowCells,
     count: usize,
@@ -1989,4 +2202,151 @@ test "render: row_cells_get_multi null returns invalid_value" {
     var raw: row.CRow = undefined;
     var values = [_]?*anyopaque{@ptrCast(&raw)};
     try testing.expectEqual(Result.invalid_value, row_cells_get_multi(null, 1, null, &values, null));
+}
+
+test "render: row_cells_get_all reads a whole row" {
+    var terminal: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &terminal,
+        8,
+        2,
+    ));
+    defer terminal_c.free(terminal);
+
+    // "AB" in bold red, then a wide glyph so the spacer tail is covered.
+    const seq = "\x1b[1;31mAB\x1b[0m\u{6771}";
+    terminal_c.vt_write(terminal, seq, seq.len);
+
+    var state: RenderState = null;
+    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &state));
+    defer free(state);
+    try testing.expectEqual(Result.success, update(state, terminal));
+
+    var it: RowIterator = null;
+    try testing.expectEqual(Result.success, row_iterator_new(&lib.alloc.test_allocator, &it));
+    defer row_iterator_free(it);
+    try testing.expectEqual(Result.success, get(state, .row_iterator, @ptrCast(&it)));
+    try testing.expect(row_iterator_next(it));
+
+    var cells: RowCells = null;
+    try testing.expectEqual(Result.success, row_cells_new(&lib.alloc.test_allocator, &cells));
+    defer row_cells_free(cells);
+    try testing.expectEqual(Result.success, row_get(it, .cells, @ptrCast(&cells)));
+
+    var entries: [8]RowCellEntry = undefined;
+    var styles: [8]style_c.Style = undefined;
+    var text: [64]u8 = undefined;
+    var batch: RowCellsBatch = .{
+        .entries = &entries,
+        .entries_cap = entries.len,
+        .styles = &styles,
+        .styles_cap = styles.len,
+        .text = .{ .ptr = &text, .cap = text.len, .len = 0 },
+    };
+
+    try testing.expectEqual(Result.success, row_cells_get_all(cells, &batch));
+    try testing.expectEqual(@as(usize, 8), batch.entries_len);
+
+    // The batch must agree cell-for-cell with the per-cell reads it replaces.
+    for (0..batch.entries_len) |x| {
+        try testing.expectEqual(Result.success, row_cells_select(cells, @intCast(x)));
+
+        const entry = entries[x];
+
+        var utf8: [16]u8 = undefined;
+        var buf: lib.Buffer = .{ .ptr = &utf8, .cap = utf8.len, .len = 0 };
+        try testing.expectEqual(Result.success, row_cells_get(cells, .graphemes_utf8, @ptrCast(&buf)));
+        try testing.expectEqual(buf.len, @as(usize, entry.text_len));
+        try testing.expectEqualSlices(
+            u8,
+            utf8[0..buf.len],
+            text[entry.text_offset..][0..entry.text_len],
+        );
+
+        var raw: page.Cell.C = undefined;
+        try testing.expectEqual(Result.success, row_cells_get(cells, .raw, @ptrCast(&raw)));
+        const cell: page.Cell = @bitCast(raw);
+        try testing.expectEqual(@intFromEnum(cell.wide), entry.wide);
+        try testing.expectEqual(cell.hasStyling(), entry.has_styling);
+
+        var fg: colorpkg.RGB.C = undefined;
+        const fg_result = row_cells_get(cells, .fg_color, @ptrCast(&fg));
+        try testing.expectEqual(fg_result == .success, entry.has_fg);
+        if (entry.has_fg) try testing.expectEqual(fg, entry.fg);
+
+        var bg: colorpkg.RGB.C = undefined;
+        const bg_result = row_cells_get(cells, .bg_color, @ptrCast(&bg));
+        try testing.expectEqual(bg_result == .success, entry.has_bg);
+        if (entry.has_bg) try testing.expectEqual(bg, entry.bg);
+
+        var style: style_c.Style = undefined;
+        style.size = @sizeOf(style_c.Style);
+        try testing.expectEqual(Result.success, row_cells_get(cells, .style, @ptrCast(&style)));
+        try testing.expect(entry.style_index < batch.styles_len);
+        try testing.expectEqual(style.bold, styles[entry.style_index].bold);
+        try testing.expectEqual(style.fg_color.tag, styles[entry.style_index].fg_color.tag);
+    }
+
+    // The styled prefix and the unstyled remainder are distinct runs, so the
+    // dedup must have produced more than one style but far fewer than 8.
+    try testing.expect(batch.styles_len >= 2);
+    try testing.expect(batch.styles_len < batch.entries_len);
+}
+
+test "render: row_cells_get_all reports required capacity" {
+    var terminal: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &terminal,
+        8,
+        2,
+    ));
+    defer terminal_c.free(terminal);
+    terminal_c.vt_write(terminal, "hello", 5);
+
+    var state: RenderState = null;
+    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &state));
+    defer free(state);
+    try testing.expectEqual(Result.success, update(state, terminal));
+
+    var it: RowIterator = null;
+    try testing.expectEqual(Result.success, row_iterator_new(&lib.alloc.test_allocator, &it));
+    defer row_iterator_free(it);
+    try testing.expectEqual(Result.success, get(state, .row_iterator, @ptrCast(&it)));
+    try testing.expect(row_iterator_next(it));
+
+    var cells: RowCells = null;
+    try testing.expectEqual(Result.success, row_cells_new(&lib.alloc.test_allocator, &cells));
+    defer row_cells_free(cells);
+    try testing.expectEqual(Result.success, row_get(it, .cells, @ptrCast(&cells)));
+
+    // No buffers at all: the call still reports what the row needs.
+    var batch: RowCellsBatch = .{};
+    try testing.expectEqual(Result.out_of_space, row_cells_get_all(cells, &batch));
+    try testing.expectEqual(@as(usize, 8), batch.entries_len);
+    try testing.expectEqual(@as(usize, 5), batch.text.len);
+
+    // A styles array is optional; omitting it leaves every index at zero.
+    var entries: [8]RowCellEntry = undefined;
+    var text: [8]u8 = undefined;
+    batch = .{
+        .entries = &entries,
+        .entries_cap = entries.len,
+        .text = .{ .ptr = &text, .cap = text.len, .len = 0 },
+    };
+    try testing.expectEqual(Result.success, row_cells_get_all(cells, &batch));
+    try testing.expectEqual(@as(usize, 0), batch.styles_len);
+    for (entries[0..batch.entries_len]) |entry| {
+        try testing.expectEqual(@as(u32, 0), entry.style_index);
+    }
+    try testing.expectEqualSlices(u8, "hello", text[0..batch.text.len]);
+}
+
+test "render: row_cells_get_all null returns invalid_value" {
+    var batch: RowCellsBatch = .{};
+    try testing.expectEqual(Result.invalid_value, row_cells_get_all(null, &batch));
+
+    var undersized: RowCellsBatch = .{ .size = 1 };
+    try testing.expectEqual(Result.invalid_value, row_cells_get_all(null, &undersized));
 }

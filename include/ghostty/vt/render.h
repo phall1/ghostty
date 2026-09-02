@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <ghostty/vt/allocator.h>
 #include <ghostty/vt/color.h>
+#include <ghostty/vt/style.h>
 #include <ghostty/vt/terminal.h>
 #include <ghostty/vt/types.h>
 
@@ -776,6 +777,138 @@ GHOSTTY_API GhosttyResult ghostty_render_state_row_cells_get_multi(
     const GhosttyRenderStateRowCellsData* keys,
     void** values,
     size_t* out_written);
+
+/**
+ * One cell's worth of render data, filled by
+ * ghostty_render_state_row_cells_get_all().
+ *
+ * Text lives out of line in the batch's text buffer so this record stays
+ * small enough that a whole row of them fits in cache.
+ *
+ * @ingroup render
+ */
+typedef struct {
+  /**
+   * Byte offset of this cell's UTF-8 grapheme cluster within the batch's
+   * text buffer.
+   */
+  uint32_t text_offset;
+
+  /** Byte length of the cluster. Zero when the cell has no text. */
+  uint32_t text_len;
+
+  /**
+   * Index of this cell's style within the batch's styles array. Always
+   * zero when the caller passed a NULL styles array.
+   */
+  uint32_t style_index;
+
+  /** The resolved foreground color. Only meaningful when has_fg is true. */
+  GhosttyColorRgb fg;
+
+  /** The resolved background color. Only meaningful when has_bg is true. */
+  GhosttyColorRgb bg;
+
+  /**
+   * Whether fg holds a resolved foreground color. False means the cell has
+   * no explicit foreground and the caller should use its own default.
+   */
+  bool has_fg;
+
+  /**
+   * Whether bg holds a resolved background color. False means the cell has
+   * no explicit background and the caller should use its own default.
+   */
+  bool has_bg;
+
+  /** Whether the cell carries a non-default style entry. */
+  bool has_styling;
+
+  /** Whether the cell falls inside the row's selection range. */
+  bool selected;
+
+  /** The cell's GhosttyCellWide value, narrowed to a byte. */
+  uint8_t wide;
+
+  uint8_t reserved;
+} GhosttyRenderStateRowCellEntry;
+
+/**
+ * In/out parameter block for ghostty_render_state_row_cells_get_all().
+ *
+ * The caller owns every buffer; the function only writes into them.
+ *
+ * This is a sized struct. Use GHOSTTY_INIT_SIZED() to initialize it.
+ *
+ * @ingroup render
+ */
+typedef struct {
+  /** Size of this struct in bytes. Must be set by the caller. */
+  size_t size;
+
+  /** Array receiving one entry per cell in the row, in column order. */
+  GhosttyRenderStateRowCellEntry* entries;
+
+  /** Capacity of entries, in elements. */
+  size_t entries_cap;
+
+  /**
+   * Array receiving the row's styles, deduplicated by style id: a new entry
+   * is appended only where a cell's style differs from the preceding cell's.
+   * May be NULL to skip style materialization, in which case every entry's
+   * style_index is zero and styles_len is zero.
+   */
+  GhosttyStyle* styles;
+
+  /** Capacity of styles, in elements. */
+  size_t styles_cap;
+
+  /**
+   * Buffer receiving every cell's UTF-8 grapheme cluster, laid out back to
+   * back in column order. Each entry's text_offset/text_len indexes into it.
+   */
+  GhosttyBuffer text;
+
+  /**
+   * Number of entries written, or the required entry capacity when the call
+   * returns GHOSTTY_OUT_OF_SPACE.
+   */
+  size_t entries_len;
+
+  /**
+   * Number of styles written, or the required style capacity when the call
+   * returns GHOSTTY_OUT_OF_SPACE.
+   */
+  size_t styles_len;
+} GhosttyRenderStateRowCellsBatch;
+
+/**
+ * Read an entire row's cells in one call.
+ *
+ * This is the batched counterpart to ghostty_render_state_row_cells_get():
+ * it fills a caller-owned record per cell plus a shared text buffer, so a
+ * renderer pays one C API call per ROW instead of several per cell.
+ *
+ * The iterator position is neither read nor modified: the whole row is read
+ * regardless of where ghostty_render_state_row_cells_next() or
+ * ghostty_render_state_row_cells_select() left it.
+ *
+ * On GHOSTTY_OUT_OF_SPACE the required capacities are reported in
+ * entries_len, styles_len and text.len, and the contents of the caller's
+ * buffers are unspecified.
+ *
+ * @param cells The row cells handle (NULL returns GHOSTTY_INVALID_VALUE)
+ * @param[in,out] batch The parameter block (NULL, or a size smaller than
+ *        sizeof(GhosttyRenderStateRowCellsBatch), returns
+ *        GHOSTTY_INVALID_VALUE)
+ * @return GHOSTTY_SUCCESS on success, GHOSTTY_OUT_OF_SPACE if any caller
+ *         buffer is too small
+ *
+ * @ingroup render
+ */
+GHOSTTY_API GhosttyResult ghostty_render_state_row_cells_get_all(
+    GhosttyRenderStateRowCells cells,
+    GhosttyRenderStateRowCellsBatch* batch);
 
 /**
  * Free a row cells instance.
