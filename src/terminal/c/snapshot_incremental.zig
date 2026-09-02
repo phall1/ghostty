@@ -68,6 +68,14 @@ pub const DetachOptions = extern struct {
     max_pages: usize,
     max_total_bytes: usize,
     max_rows: usize,
+    /// Pin the retained history through a copy-on-write lease and encode each
+    /// record on demand instead of owning every record up front.
+    ///
+    /// Leased detachment is constant-time however deep the scrollback is, and
+    /// retains one page at a time rather than the whole encoded history, but
+    /// the source terminal must then outlive the continuation. It may still be
+    /// mutated freely.
+    leased: bool,
 };
 
 pub const ContinuationOptions = extern struct {
@@ -568,10 +576,28 @@ pub fn captureDetachReady(
     if (state.page_records > state.max_pages) return .invalid_state;
     const remaining_pages = state.max_pages - state.page_records;
     const detached_page_limit = @min(options.max_pages, remaining_pages);
+    const status = if (options.leased)
+        attachLeased(state, state.terminal, terminal, detached_page_limit, options)
+    else
+        attachOwned(state, terminal, detached_page_limit, options);
+    if (status != .success) return status;
+    state.detached = true;
+    capture.* = null;
+    out.* = state;
+    return .success;
+}
+
+/// Own every post-READY record now, releasing the terminal entirely.
+fn attachOwned(
+    state: *CaptureState,
+    terminal: *terminal_c.ZigTerminal,
+    page_limit: usize,
+    options: *const DetachOptions,
+) Status {
     var detached = snapshot.history.DetachedHistories.init(
         state.alloc,
         terminal,
-        detached_page_limit,
+        page_limit,
         options.max_total_bytes,
         state.output_buffer.len,
         options.max_rows,
@@ -580,9 +606,31 @@ pub fn captureDetachReady(
         detached.deinit();
         return .invalid_state;
     };
-    state.detached = true;
-    capture.* = null;
-    out.* = state;
+    return .success;
+}
+
+/// Pin every post-READY record through a lease, encoding none of them yet.
+fn attachLeased(
+    state: *CaptureState,
+    handle: terminal_c.Terminal,
+    terminal: *terminal_c.ZigTerminal,
+    page_limit: usize,
+    options: *const DetachOptions,
+) Status {
+    if (!authenticated_history) return .unsupported_feature;
+    const io_ = terminal_c.terminalIo(handle) orelse return .wrong_terminal;
+    var leased = snapshot.history.LeasedHistories.init(
+        io_,
+        state.alloc,
+        terminal,
+        page_limit,
+        state.output_buffer.len,
+        options.max_rows,
+    ) catch |err| return mapError(err);
+    state.encoder.attachLeasedHistories(leased) catch {
+        leased.deinit();
+        return .invalid_state;
+    };
     return .success;
 }
 
