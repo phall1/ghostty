@@ -229,6 +229,17 @@ typedef struct {
     size_t max_total_bytes;
     /** Inclusive rows represented by any owned PAGE record. */
     size_t max_rows;
+    /**
+     * Pin retained history through a copy-on-write lease and encode each
+     * record on demand instead of owning every record up front.
+     *
+     * Leased detachment costs the same however deep the scrollback is and
+     * retains one page at a time rather than the whole encoded history, but
+     * the source terminal must then outlive the continuation. It may still be
+     * mutated freely; a page pruned before it is delivered fails the stream
+     * with PRUNED rather than delivering stale bytes.
+     */
+    bool leased;
 } GhosttyTerminalSnapshotDetachOptions;
 
 /** Per-call delivery limits for a terminal-independent continuation. */
@@ -412,6 +423,11 @@ ghostty_terminal_snapshot_capture_next(
  * limits before ownership changes. On failure, `*capture` is unchanged and
  * `*out_continuation` is NULL. On success, `*capture` becomes NULL; the source
  * terminal may immediately be mutated or freed.
+ *
+ * With `options->leased` set, no history is encoded here: the records are
+ * pinned by a copy-on-write lease and encoded one per
+ * ghostty_terminal_snapshot_continuation_next() call. The source terminal may
+ * then be mutated but must not be freed until the continuation is.
  */
 GHOSTTY_API GhosttyTerminalSnapshotStatus
 ghostty_terminal_snapshot_capture_detach_ready(

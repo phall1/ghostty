@@ -133,6 +133,7 @@ pub const EncodeError = Allocator.Error ||
     terminal.EncodeError ||
     screen.EncodeError ||
     history.EncodeError ||
+    history.LeasedHistories.NextError ||
     checkpoint.EncodeError ||
     continuation.EncodeError ||
     error{RecordLimitExceeded};
@@ -180,6 +181,7 @@ pub const Encoder = struct {
     screen_encoder: ?screen.Encoder = null,
     history_encoder: ?history.Encoder = null,
     detached_histories: ?history.DetachedHistories = null,
+    leased_histories: ?history.LeasedHistories = null,
 
     pub fn init(
         alloc: Allocator,
@@ -255,6 +257,7 @@ pub const Encoder = struct {
 
     pub fn deinit(self: *Encoder) void {
         if (self.detached_histories) |*detached| detached.deinit();
+        if (self.leased_histories) |*leased| leased.deinit();
         self.stream.deinit();
         self.* = undefined;
     }
@@ -271,20 +274,49 @@ pub const Encoder = struct {
         self: *Encoder,
         detached: history.DetachedHistories,
     ) error{InvalidState}!void {
+        try self.claimHistories();
+        self.detached_histories = detached;
+    }
+
+    /// Replace the borrowed post-READY history traversal with a lease-pinned
+    /// one.
+    ///
+    /// Unlike `attachDetachedHistories` this keeps encoding lazy: nothing has
+    /// been materialized, so the terminal must stay alive for the rest of the
+    /// stream. It may be mutated freely -- the lease holds the cut
+    /// copy-on-write -- and a page pruned before it is delivered fails the
+    /// stream rather than corrupting it.
+    pub fn attachLeasedHistories(
+        self: *Encoder,
+        leased: history.LeasedHistories,
+    ) error{InvalidState}!void {
+        try self.claimHistories();
+        self.leased_histories = leased;
+    }
+
+    /// Reject a post-READY history substitution that would race the borrowed
+    /// traversal or a substitution already in place.
+    fn claimHistories(self: *const Encoder) error{InvalidState}!void {
         if (self.state != .histories or
             self.history_encoder != null or
-            self.detached_histories != null)
+            self.detached_histories != null or
+            self.leased_histories != null)
         {
             return error.InvalidState;
         }
-        self.detached_histories = detached;
     }
 
     pub fn detachedNextRows(self: *const Encoder) ?usize {
         if (self.state != .histories) return null;
-        const detached = self.detached_histories orelse return null;
-        if (detached.finished()) return null;
-        return detached.nextRows();
+        if (self.detached_histories) |detached| {
+            if (detached.finished()) return null;
+            return detached.nextRows();
+        }
+        if (self.leased_histories) |*leased| {
+            if (leased.finished()) return null;
+            return leased.nextRows();
+        }
+        return null;
     }
 
     /// Emit at most one unit of caller-controlled work.
@@ -347,6 +379,15 @@ pub const Encoder = struct {
                         continue;
                     }
                     try detached.next(self.stream.writer());
+                    return .progress;
+                }
+
+                if (self.leased_histories) |*leased| {
+                    if (leased.finished()) {
+                        self.state = .finish;
+                        continue;
+                    }
+                    try leased.next(self.stream.writer());
                     return .progress;
                 }
 

@@ -102,6 +102,18 @@ pub const NextResult = union(enum) {
     },
 };
 
+/// Result of requesting the next record-framed history slice.
+pub const RecordResult = union(enum) {
+    /// The checkpoint contains no more history.
+    end,
+    /// One complete record-framed PAGE record was emitted.
+    chunk: struct {
+        bytes: usize,
+        rows: usize,
+        page_complete: bool,
+    },
+};
+
 pub const CursorError = Allocator.Error ||
     page.EncodeError ||
     TerminalPage.CloneFromError ||
@@ -116,6 +128,10 @@ pub const CursorError = Allocator.Error ||
         Resize,
         CursorAlreadyTaken,
     };
+
+/// `CursorError` plus the bounded record-encoding failures a record-framed
+/// slice can hit. Every one of them is nonadvancing.
+pub const RecordError = CursorError || PageSliceEncodeLimitedError;
 
 /// Authenticated identity for one captured history cut.
 ///
@@ -527,27 +543,12 @@ pub const HistoryCursor = struct {
             state.pages_inspected += 1;
         }
         state.sequence += 1;
-        const row_start = row_end - rows;
-        const page_complete = row_start == 0;
-        if (page_complete) {
-            if (source_node.serial == state.boundary_serial) {
-                terminal_screen.pages.untrackPin(pin_);
-                if (state.boundary) |boundary| {
-                    terminal_screen.pages.untrackPin(boundary);
-                    state.boundary = null;
-                }
-                state.current = null;
-            } else if (source_node.prev) |previous| {
-                pin_.node = previous;
-                pin_.y = previous.rows() - 1;
-                pin_.x = 0;
-                state.current_serial = previous.serial;
-            } else {
-                return error.Pruned;
-            }
-        } else {
-            pin_.y = @intCast(row_start - 1);
-        }
+        const page_complete = try advanceCurrent(
+            terminal_screen,
+            state,
+            pin_,
+            row_end - rows,
+        );
 
         return .{ .chunk = .{
             .bytes = encoded_len,
@@ -555,7 +556,109 @@ pub const HistoryCursor = struct {
             .page_complete = page_complete,
         } };
     }
+
+    /// Rows the next record-framed slice carries, or null once the pinned cut
+    /// is exhausted. Encodes nothing, so a caller can gate a row budget before
+    /// paying for the slice.
+    pub fn peekRecordRows(
+        self: *const HistoryCursor,
+        terminal_: *Terminal,
+        max_rows: usize,
+    ) CursorError!?usize {
+        std.debug.assert(max_rows > 0);
+        const resolved = try resolveLease(self.bytes, terminal_);
+        const pin_ = resolved.state.current orelse return null;
+        return @min(@as(usize, pin_.y) + 1, max_rows);
+    }
+
+    /// Emit one complete record-framed PAGE record from the pinned cut.
+    ///
+    /// Unlike `next`, no authenticated unit header is written and the slice is
+    /// split on `max_rows` alone: the bytes are exactly the PAGE record the
+    /// borrowed `Encoder` would have emitted, so a decoder consuming a capture
+    /// record stream needs no second codec. Encoding failure is nonadvancing.
+    pub fn nextRecord(
+        self: *const HistoryCursor,
+        terminal_: *Terminal,
+        max_rows: usize,
+        max_record_bytes: usize,
+        destination: *std.Io.Writer,
+    ) RecordError!RecordResult {
+        std.debug.assert(max_rows > 0);
+        const resolved = try resolveLease(self.bytes, terminal_);
+        const terminal_screen = resolved.screen;
+        const state = resolved.state;
+        const pin_ = state.current orelse return .end;
+
+        const source_node = pin_.node;
+        const row_end: usize = @as(usize, pin_.y) + 1;
+        const rows = @min(row_end, max_rows);
+        var preserved = try source_node.pagePreservingState(terminal_screen.alloc);
+        defer preserved.deinit();
+
+        try history_tw.check(.encode_page);
+        const encoded = try encodePageSliceLimited(
+            terminal_screen.alloc,
+            preserved.page(),
+            row_end - rows,
+            row_end,
+            max_record_bytes,
+        );
+        defer terminal_screen.alloc.free(encoded);
+        try destination.writeAll(encoded);
+
+        if (state.inspected_serial != source_node.serial) {
+            state.inspected_serial = source_node.serial;
+            state.pages_inspected += 1;
+        }
+        state.sequence += 1;
+        const page_complete = try advanceCurrent(
+            terminal_screen,
+            state,
+            pin_,
+            row_end - rows,
+        );
+        return .{ .chunk = .{
+            .bytes = encoded.len,
+            .rows = rows,
+            .page_complete = page_complete,
+        } };
+    }
 };
+
+/// Move a cut's tracked pin back by one delivered slice.
+///
+/// Returns whether the slice completed its source page. A page whose
+/// predecessor was pruned out from under the cut is reported as
+/// `error.Pruned` rather than silently skipped.
+fn advanceCurrent(
+    terminal_screen: *TerminalScreen,
+    state: *LeaseState,
+    pin_: *TerminalPageList.Pin,
+    row_start: usize,
+) error{Pruned}!bool {
+    if (row_start != 0) {
+        pin_.y = @intCast(row_start - 1);
+        return false;
+    }
+    const source_node = pin_.node;
+    if (source_node.serial == state.boundary_serial) {
+        terminal_screen.pages.untrackPin(pin_);
+        if (state.boundary) |boundary| {
+            terminal_screen.pages.untrackPin(boundary);
+            state.boundary = null;
+        }
+        state.current = null;
+    } else if (source_node.prev) |previous| {
+        pin_.node = previous;
+        pin_.y = previous.rows() - 1;
+        pin_.x = 0;
+        state.current_serial = previous.serial;
+    } else {
+        return error.Pruned;
+    }
+    return true;
+}
 
 const PageSliceEncodeError = Allocator.Error ||
     page.EncodeError ||
@@ -1231,6 +1334,219 @@ pub const DetachedHistories = struct {
         self.index += 1;
     }
 };
+
+/// Lease-pinned HISTORY/PAGE records encoded one at a time.
+///
+/// This is the lazy counterpart of `DetachedHistories`. Construction takes one
+/// copy-on-write `HistoryLease` per screen and counts pages; it encodes no
+/// history at all, so releasing a READY capture back to live mutation costs the
+/// same however deep the scrollback is. Each `next` then encodes exactly one
+/// record from the pinned cut, newest-to-oldest, split at `max_rows`, in the
+/// same record framing the borrowed `Encoder` emits.
+///
+/// The source terminal must outlive this value, and callers must keep passing
+/// the same one. Pages pruned after construction surface as `error.Pruned`
+/// rather than stale bytes, which is exactly the signal a transport needs to
+/// tombstone a history stream instead of delivering garbage.
+pub const LeasedHistories = struct {
+    const ScreenCut = struct {
+        key: TerminalScreenKey,
+        lease: HistoryLease,
+        cursor: HistoryCursor,
+        page_count: u32,
+        header_pending: bool = true,
+    };
+
+    const Pending = struct {
+        index: usize,
+        header: bool,
+        rows: usize,
+    };
+
+    pub const InitError = HistoryLease.InitError ||
+        CursorError ||
+        error{
+            InvalidLimit,
+            PageLimitExceeded,
+        };
+
+    pub const NextError = RecordError ||
+        Allocator.Error ||
+        record.Writer.FinishError ||
+        std.Io.Writer.Error ||
+        error{InvalidState};
+
+    alloc: Allocator,
+    terminal_: *Terminal,
+    cuts: [2]?ScreenCut,
+    index: usize = 0,
+    max_rows: usize,
+    max_record_bytes: usize,
+
+    pub fn init(
+        io_: std.Io,
+        alloc: Allocator,
+        terminal_: *Terminal,
+        max_pages: usize,
+        max_record_bytes: usize,
+        max_rows: usize,
+    ) InitError!LeasedHistories {
+        if (max_record_bytes < record.Header.len or max_rows == 0) {
+            return error.InvalidLimit;
+        }
+
+        const keys = [_]TerminalScreenKey{ .primary, .alternate };
+        var cuts: [keys.len]?ScreenCut = .{ null, null };
+        errdefer for (&cuts) |*slot| {
+            if (slot.*) |cut| cut.lease.deinit(terminal_);
+        };
+
+        var total_pages: usize = 0;
+        for (keys, 0..) |key, key_index| {
+            const terminal_screen = terminal_.screens.get(key) orelse continue;
+            const page_count = try countSplitPages(
+                terminal_screen,
+                max_rows,
+                max_pages,
+                &total_pages,
+            );
+            const lease = try HistoryLease.init(io_, terminal_, key);
+            // Own the lease in `cuts` only once its cursor is in hand: a
+            // failed `cursor` would otherwise leave the lease registered on
+            // the screen's PageList, pinning those pages for good.
+            errdefer lease.deinit(terminal_);
+            const screen_cursor = try lease.cursor(terminal_);
+            cuts[key_index] = .{
+                .key = key,
+                .lease = lease,
+                .cursor = screen_cursor,
+                .page_count = page_count,
+            };
+        }
+
+        return .{
+            .alloc = alloc,
+            .terminal_ = terminal_,
+            .cuts = cuts,
+            .max_rows = max_rows,
+            .max_record_bytes = max_record_bytes,
+        };
+    }
+
+    pub fn deinit(self: *LeasedHistories) void {
+        for (&self.cuts) |*slot| {
+            if (slot.*) |cut| cut.lease.deinit(self.terminal_);
+            slot.* = null;
+        }
+        self.* = undefined;
+    }
+
+    pub fn finished(self: *const LeasedHistories) bool {
+        return self.peekPending() == null;
+    }
+
+    /// Rows the next record carries. Zero for a HISTORY header record, which
+    /// keeps row accounting identical to the owned path.
+    pub fn nextRows(self: *const LeasedHistories) usize {
+        const pending = self.peekPending() orelse return 0;
+        return pending.rows;
+    }
+
+    /// Emit the next complete record of the pinned history stream.
+    ///
+    /// Exactly one record per call, so this composes with the encoder's
+    /// one-record-per-`next` contract unchanged.
+    pub fn next(
+        self: *LeasedHistories,
+        destination: *std.Io.Writer,
+    ) NextError!void {
+        const pending = self.peekPending() orelse return error.InvalidState;
+        self.index = pending.index;
+        const cut = &(self.cuts[pending.index].?);
+        if (pending.header) {
+            const header_bytes = try encodeDetachedHeader(
+                self.alloc,
+                cut.key,
+                cut.page_count,
+            );
+            defer self.alloc.free(header_bytes);
+            if (header_bytes.len > self.max_record_bytes) {
+                return error.RecordLimitExceeded;
+            }
+            try destination.writeAll(header_bytes);
+            cut.header_pending = false;
+            return;
+        }
+        switch (try cut.cursor.nextRecord(
+            self.terminal_,
+            self.max_rows,
+            self.max_record_bytes,
+            destination,
+        )) {
+            .chunk => {},
+            // `peekPending` reported rows for this cut in this same call, so an
+            // exhausted cursor here means the pinned cut moved underneath us.
+            .end => return error.Stale,
+        }
+    }
+
+    /// The record `next` would emit, without encoding it.
+    ///
+    /// A cursor error is reported as a zero-row pending record rather than
+    /// swallowed: `next` re-resolves the same lease and returns the exact
+    /// error, so no failure is lost and `finished` never lies about a live cut.
+    fn peekPending(self: *const LeasedHistories) ?Pending {
+        var index = self.index;
+        while (index < self.cuts.len) : (index += 1) {
+            const cut = if (self.cuts[index]) |*value| value else continue;
+            if (cut.header_pending) {
+                return .{ .index = index, .header = true, .rows = 0 };
+            }
+            const rows = cut.cursor.peekRecordRows(
+                self.terminal_,
+                self.max_rows,
+            ) catch return .{ .index = index, .header = false, .rows = 0 };
+            if (rows) |value| {
+                return .{ .index = index, .header = false, .rows = value };
+            }
+        }
+        return null;
+    }
+};
+
+/// Count the `max_rows`-split PAGE records one screen's leased cut will
+/// produce, rejecting a prefix that overruns the shared page budget.
+///
+/// This walks exactly the range `HistoryLease` pins -- the newest history row
+/// back to the oldest node -- so the HISTORY header's page count matches the
+/// records the cursor actually emits. The borrowed encoder's whole-node walk
+/// would under-count, because a node holding both history and active rows is
+/// partly historical to a lease and entirely skipped by that walk.
+fn countSplitPages(
+    terminal_screen: *const TerminalScreen,
+    max_rows: usize,
+    max_pages: usize,
+    total_pages: *usize,
+) error{PageLimitExceeded}!u32 {
+    const newest = terminal_screen.pages.getBottomRight(.history) orelse return 0;
+    const oldest_node = terminal_screen.pages.getTopLeft(.screen).node;
+    var count: usize = 0;
+    var node: ?*TerminalPageList.List.Node = newest.node;
+    var node_rows: usize = @as(usize, newest.y) + 1;
+    while (node) |current_node| {
+        const chunks = std.math.divCeil(usize, node_rows, max_rows) catch
+            return error.PageLimitExceeded;
+        count = std.math.add(usize, count, chunks) catch
+            return error.PageLimitExceeded;
+        total_pages.* = std.math.add(usize, total_pages.*, chunks) catch
+            return error.PageLimitExceeded;
+        if (total_pages.* > max_pages) return error.PageLimitExceeded;
+        if (current_node == oldest_node) break;
+        node = current_node.prev;
+        node_rows = if (node) |previous| previous.rows() else 0;
+    }
+    return std.math.cast(u32, count) orelse error.PageLimitExceeded;
+}
 
 fn encodeDetachedHeader(
     alloc: Allocator,
