@@ -1425,6 +1425,21 @@ GHOSTTY_API void ghostty_terminal_free(GhosttyTerminal terminal);
 GHOSTTY_API void ghostty_terminal_reset(GhosttyTerminal terminal);
 
 /**
+ * Clear the active presentation without consuming or resetting the VT parser.
+ *
+ * Performs the terminal operations of CUP 1;1, ED 2, and ED 3 directly, then
+ * clears selection and follows the bottom viewport. Existing origin/margin
+ * and erase-protection semantics apply, just as for those control sequences.
+ * Preserves pending VT/UTF-8 continuation, modes, rendition, title, dimensions,
+ * and terminal ownership. Does not emit PTY writes or other stream effects.
+ * Borrowed grid references are invalidated as with any terminal mutation.
+ * NULL is a no-op.
+ *
+ * @param terminal The terminal instance, or NULL.
+ */
+GHOSTTY_API void ghostty_terminal_clear_presentation(GhosttyTerminal terminal);
+
+/**
  * Resize the terminal to the given dimensions.
  *
  * Changes the number of columns and rows in the terminal. The primary

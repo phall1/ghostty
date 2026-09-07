@@ -949,6 +949,18 @@ pub fn reset(terminal_: Terminal) callconv(lib.calling_conv) void {
     t.fullReset();
 }
 
+/// Client-local Clear, without feeding control bytes into the live stream.
+/// In particular, do not reset or replace wrapper.stream: it may own a partial
+/// CSI, OSC, DCS, or UTF-8 codepoint received from the remote process.
+pub fn clear_presentation(terminal_: Terminal) callconv(lib.calling_conv) void {
+    const t: *ZigTerminal = (terminal_ orelse return).terminal;
+    t.screens.active.clearSelection();
+    t.setCursorPos(1, 1);
+    t.eraseDisplay(.complete, false);
+    t.eraseDisplay(.scrollback, false);
+    t.scrollViewport(.bottom);
+}
+
 pub fn mode_get(
     terminal_: Terminal,
     tag: modes.ModeTag.Backing,
@@ -1644,6 +1656,43 @@ test "reset" {
 
 test "reset null" {
     reset(null);
+}
+
+test "clear presentation preserves exact stream continuation" {
+    const prefixes = [_][]const u8{
+        "\x1b[3",
+        "\x1b]2;pending title",
+        "\x1bP$q",
+        "\xe2",
+        "\xe2\x82",
+        "\xf0\x9f\x98",
+    };
+    for (prefixes) |prefix| {
+        var t: Terminal = null;
+        try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 10, 2));
+        defer free(t);
+        const old = "old\r\nhistory\r\nvisible";
+        vt_write(t, old, old.len);
+        vt_write(t, prefix.ptr, prefix.len);
+        var before: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer before.deinit();
+        try writeSnapshotContinuation(t, &before.writer);
+        try testing.expect(before.written().len > 0);
+
+        clear_presentation(t);
+
+        var after: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer after.deinit();
+        try writeSnapshotContinuation(t, &after.writer);
+        try testing.expectEqualSlices(u8, before.written(), after.written());
+        const text = try t.?.terminal.plainString(testing.allocator);
+        defer testing.allocator.free(text);
+        try testing.expectEqualStrings("", text);
+    }
+}
+
+test "clear presentation null" {
+    clear_presentation(null);
 }
 
 test "resize" {
