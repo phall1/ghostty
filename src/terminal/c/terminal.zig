@@ -1188,6 +1188,18 @@ pub fn reset(terminal_: Terminal) callconv(lib.calling_conv) void {
     t.fullReset();
 }
 
+/// Client-local Clear, without feeding control bytes into the live stream.
+/// In particular, do not reset or replace wrapper.stream: it may own a partial
+/// CSI, OSC, DCS, or UTF-8 codepoint received from the remote process.
+pub fn clear_presentation(terminal_: Terminal) callconv(lib.calling_conv) void {
+    const t: *ZigTerminal = (terminal_ orelse return).terminal;
+    t.screens.active.clearSelection();
+    t.setCursorPos(1, 1);
+    t.eraseDisplay(.complete, false);
+    t.eraseDisplay(.scrollback, false);
+    t.scrollViewport(.bottom);
+}
+
 /// C: GhosttyKittyGraphics
 pub const KittyGraphics = kitty_gfx_c.KittyGraphics;
 
@@ -2186,6 +2198,51 @@ test "reset" {
 
 test "reset null" {
     reset(null);
+}
+
+test "clear presentation preserves exact stream continuation" {
+    const prefixes = [_][]const u8{
+        "\x1b[3",
+        "\x1b]2;pending title",
+        "\x1bP$q",
+        "\xe2",
+        "\xe2\x82",
+        "\xf0\x9f\x98",
+    };
+    for (prefixes) |prefix| {
+        var t: Terminal = null;
+        try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 10, 2));
+        defer free(t);
+        try testEnableContinuation(t);
+        const old = "old\r\nhistory\r\nvisible";
+        vt_write(t, old, old.len);
+        vt_write(t, prefix.ptr, prefix.len);
+
+        var before: [64]u8 = undefined;
+        var before_len: usize = 0;
+        try testing.expectEqual(
+            Result.success,
+            continuation_buf(t, &before, before.len, &before_len),
+        );
+        try testing.expect(before_len > 0);
+
+        clear_presentation(t);
+
+        var after: [64]u8 = undefined;
+        var after_len: usize = 0;
+        try testing.expectEqual(
+            Result.success,
+            continuation_buf(t, &after, after.len, &after_len),
+        );
+        try testing.expectEqualSlices(u8, before[0..before_len], after[0..after_len]);
+        const text = try t.?.terminal.plainString(testing.allocator);
+        defer testing.allocator.free(text);
+        try testing.expectEqualStrings("", text);
+    }
+}
+
+test "clear presentation null" {
+    clear_presentation(null);
 }
 
 test "resize" {
