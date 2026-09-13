@@ -378,6 +378,9 @@ comptime {
         }
         if (features.snapshot) {
             @export(&c.snapshot_encode, .{ .name = "ghostty_snapshot_encode" });
+            @export(&c.snapshot_capture_new, .{ .name = "ghostty_snapshot_capture_new" });
+            @export(&c.snapshot_capture_next, .{ .name = "ghostty_snapshot_capture_next" });
+            @export(&c.snapshot_capture_free, .{ .name = "ghostty_snapshot_capture_free" });
             @export(&c.snapshot_encode_buf, .{ .name = "ghostty_snapshot_encode_buf" });
             @export(&c.snapshot_encode_alloc, .{ .name = "ghostty_snapshot_encode_alloc" });
             @export(&c.snapshot_decoder_new, .{ .name = "ghostty_snapshot_decoder_new" });

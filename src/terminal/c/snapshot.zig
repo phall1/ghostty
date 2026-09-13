@@ -16,6 +16,41 @@ const apc = @import("../apc.zig");
 const default_max_continuation_bytes = apc.Protocol.maxDefaultBytes();
 const terminal_c = @import("terminal.zig");
 
+pub const CaptureOptions = extern struct {
+    size: usize,
+    max_record_bytes: usize,
+    max_pages: usize,
+};
+
+pub const CaptureEventKind = enum(c_int) {
+    record = 0,
+    ready = 1,
+    history_page = 2,
+    finish = 3,
+    _,
+};
+
+pub const CaptureEvent = extern struct {
+    size: usize,
+    kind: CaptureEventKind,
+    screen: terminal_c.TerminalScreen,
+    rows: usize,
+    remaining: u32,
+    written: usize,
+};
+
+const CaptureWrapper = struct {
+    alloc: std.mem.Allocator,
+    terminal_alloc: std.mem.Allocator,
+    continuation: []u8,
+    adapter: io_c.WriterAdapter,
+    encoder: snapshot_core.Encoder,
+    max_pages: usize,
+    pages: usize = 0,
+};
+
+pub const Capture = ?*CaptureWrapper;
+
 /// C: GhosttySnapshotDecoderOption.
 ///
 /// Options configure validation and returned-terminal policy before snapshot
@@ -552,6 +587,93 @@ fn continuationOwned(terminal: terminal_c.Terminal) struct {
 /// Convert exported bytes to the core snapshot continuation representation.
 fn continuationValue(bytes: []const u8) snapshot_core.Continuation {
     return if (bytes.len == 0) .ground else .{ .bytes = bytes };
+}
+
+/// Create a bounded record-at-a-time capture over the current snapshot codec.
+pub fn capture_new(
+    alloc_: ?*const CAllocator,
+    terminal: terminal_c.Terminal,
+    writer: io_c.Writer,
+    options_: ?*const CaptureOptions,
+    out_: ?*Capture,
+) callconv(lib.calling_conv) Result {
+    const out = out_ orelse return .invalid_value;
+    out.* = null;
+    const options = options_ orelse return .invalid_value;
+    if (options.size < @sizeOf(CaptureOptions) or
+        options.max_record_bytes < snapshot_core.record.Header.len or
+        options.max_pages == 0 or writer.write == null)
+    {
+        return .invalid_value;
+    }
+    const native = terminal_c.zigTerminal(terminal) orelse return .invalid_value;
+    const continuation = continuationOwned(terminal);
+    if (continuation.result != .success) return continuation.result;
+    errdefer native.gpa().free(continuation.bytes);
+
+    const alloc = lib.alloc.default(alloc_);
+    const capture = alloc.create(CaptureWrapper) catch return .out_of_memory;
+    errdefer alloc.destroy(capture);
+    capture.* = undefined;
+    capture.alloc = alloc;
+    capture.terminal_alloc = native.gpa();
+    capture.continuation = continuation.bytes;
+    capture.adapter = .init(writer);
+    capture.max_pages = options.max_pages;
+    capture.pages = 0;
+    capture.encoder = snapshot_core.Encoder.initLimited(
+        alloc,
+        &capture.adapter.interface,
+        native,
+        .{ .continuation = continuationValue(capture.continuation) },
+        options.max_record_bytes,
+    ) catch |err| {
+        return mapEncodeError(err, &capture.adapter);
+    };
+    out.* = capture;
+    return .success;
+}
+
+/// Emit exactly one complete envelope or record from a bounded capture.
+pub fn capture_next(
+    capture_: Capture,
+    out_: ?*CaptureEvent,
+) callconv(lib.calling_conv) Result {
+    const capture = capture_ orelse return .invalid_value;
+    const out = out_ orelse return .invalid_value;
+    if (out.size < @sizeOf(CaptureEvent) or capture.encoder.finished())
+        return .invalid_value;
+    if (capture.encoder.nextIsHistoryPage() and capture.pages >= capture.max_pages)
+        return .limit_exceeded;
+
+    const before = capture.adapter.offset;
+    const event = capture.encoder.next() catch |err|
+        return mapEncodeError(err, &capture.adapter);
+    out.screen = .primary;
+    out.rows = 0;
+    out.remaining = 0;
+    out.kind = switch (event) {
+        .record => .record,
+        .ready => .ready,
+        .finish => .finish,
+        .history_page => |page_event| event: {
+            capture.pages += 1;
+            out.screen = @enumFromInt(@intFromEnum(page_event.key));
+            out.rows = page_event.rows;
+            out.remaining = page_event.remaining;
+            break :event .history_page;
+        },
+    };
+    out.written = capture.adapter.offset - before;
+    return .success;
+}
+
+pub fn capture_free(capture_: Capture) callconv(lib.calling_conv) void {
+    const capture = capture_ orelse return;
+    const alloc = capture.alloc;
+    capture.encoder.deinit();
+    capture.terminal_alloc.free(capture.continuation);
+    alloc.destroy(capture);
 }
 
 /// Encode a terminal snapshot to a synchronous C writer callback.
