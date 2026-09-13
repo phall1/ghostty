@@ -3606,7 +3606,7 @@ pub fn compact(self: *PageList, node: *List.Node) Allocator.Error!?*List.Node {
         .cap = req_cap,
         .exact_size = true,
     });
-    errdefer self.destroyNode(new_node);
+    errdefer self.destroyNodeStorage(new_node);
     const new_page: *Page = new_node.page();
     new_page.size = page.size;
     new_page.dirty = page.dirty;
@@ -3623,7 +3623,7 @@ pub fn compact(self: *PageList, node: *List.Node) Allocator.Error!?*List.Node {
 
         // In this case, let's gracefully degrade by pretending we
         // didn't need to compact.
-        self.destroyNode(new_node);
+        self.destroyNodeStorage(new_node);
         return null;
     };
 
@@ -3639,7 +3639,7 @@ pub fn compact(self: *PageList, node: *List.Node) Allocator.Error!?*List.Node {
         self.invalidateSnapshotHistoryEviction();
     self.pages.insertBefore(node, new_node);
     self.pages.remove(node);
-    self.destroyNode(node);
+    self.destroyNodeStorage(node);
     self.page_compression.markActivity();
 
     new_page.assertIntegrity();
@@ -3688,7 +3688,7 @@ pub fn split(
 
     // Create a new node with the same capacity of managed memory.
     const target = try self.createPage(.{ .cap = page.capacity });
-    errdefer self.destroyNode(target);
+    errdefer self.destroyNodeStorage(target);
 
     // Determine how many rows we're copying
     const y_start = p.y;
@@ -4210,7 +4210,7 @@ pub fn increaseCapacity(
 
     // Create our new page and clone the old page into it.
     const new_node = try self.createPage(.{ .cap = cap });
-    errdefer self.destroyNode(new_node);
+    errdefer self.destroyNodeStorage(new_node);
     const new_page: *Page = new_node.page();
     assert(new_page.capacity.rows >= page.capacity.rows);
     assert(new_page.capacity.cols >= page.capacity.cols);
@@ -4249,7 +4249,7 @@ pub fn increaseCapacity(
         self.invalidateSnapshotHistoryEviction();
     self.pages.insertBefore(node, new_node);
     self.pages.remove(node);
-    self.destroyNode(node);
+    self.destroyNodeStorage(node);
     self.page_compression.markActivity();
 
     new_page.assertIntegrity();
@@ -4921,6 +4921,16 @@ fn compressPage(self: *PageList, node: *List.Node) bool {
 /// responsible for accounting for the removed rows. This function only
 /// updates `page_size` (byte accounting), not row accounting.
 fn destroyNode(self: *PageList, node: *List.Node) void {
+    // This is the conservative destruction path for nodes that may have been
+    // visible to a detached history cut. Advance the fence before freeing so
+    // validation never dereferences reclaimed node storage.
+    self.invalidateSnapshotHistoryEviction();
+    self.destroyNodeStorage(node);
+}
+
+/// Free storage known either never to have entered the list or to have been
+/// covered by an explicit pre-removal fence/classification at the call site.
+fn destroyNodeStorage(self: *PageList, node: *List.Node) void {
     destroyNodeExt(&self.pool, node, &self.page_size);
 }
 
@@ -5516,7 +5526,7 @@ fn erasePage(self: *PageList, node: *List.Node) void {
 
     // Remove the page from the linked list
     self.pages.remove(node);
-    self.destroyNode(node);
+    self.destroyNodeStorage(node);
 }
 
 /// Returns the pin for the given point. The pin is NOT tracked so it
