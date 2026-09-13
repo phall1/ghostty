@@ -58,6 +58,7 @@ const CaptureWrapper = struct {
     continuation: []u8,
     adapter: io_c.WriterAdapter,
     encoder: snapshot_core.Encoder,
+    terminal_identity: u64,
 };
 
 pub const Capture = ?*CaptureWrapper;
@@ -630,6 +631,7 @@ pub fn capture_new(
     capture.terminal_alloc = native.gpa();
     capture.continuation = continuation.bytes;
     capture.adapter = .init(writer);
+    capture.terminal_identity = terminal_c.terminalIdentity(terminal).?;
     capture.encoder = snapshot_core.Encoder.initLimited(
         alloc,
         &capture.adapter.interface,
@@ -681,9 +683,12 @@ pub fn capture_next_history(
     if (out.size < @sizeOf(CaptureEvent) or !capture.encoder.detached() or
         capture.encoder.finished())
         return .invalid_value;
-    const native = terminal_c.zigTerminal(terminal) orelse return .invalid_value;
-
     const before = capture.adapter.offset;
+    if (terminal_c.terminalIdentity(terminal) != capture.terminal_identity) {
+        publishCaptureEvent(out, capture.encoder.wrongTerminal(), 0);
+        return .success;
+    }
+    const native = terminal_c.zigTerminal(terminal).?;
     const event = capture.encoder.nextHistory(native) catch |err|
         return mapEncodeError(err, &capture.adapter);
     publishCaptureEvent(out, event, capture.adapter.offset - before);

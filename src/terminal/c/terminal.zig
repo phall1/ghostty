@@ -43,6 +43,10 @@ const max_path_bytes = if (builtin.os.tag == .freestanding) 4096 else std.fs.max
 
 const log = std.log.scoped(.terminal_c);
 
+/// Process-unique identities prevent detached consumers from accepting a new
+/// terminal whose wrapper happens to reuse the original allocation address.
+var next_identity: std.atomic.Value(u64) = .init(1);
+
 /// C terminals do not retain replay bytes unless the embedding application
 /// opts in through `GHOSTTY_TERMINAL_OPT_CONTINUATION_MAX_BYTES`.
 pub const default_continuation_max_bytes: usize = 0;
@@ -72,6 +76,7 @@ pub const Io = struct {
 /// such as the persistent VT stream needed to handle escape sequences split
 /// across multiple vt_write calls.
 const TerminalWrapper = struct {
+    identity: u64,
     terminal: *ZigTerminal,
     /// C construction has no I/O argument, so the wrapper retains the owner
     /// created by `new` or transferred from snapshot decoding until `free`.
@@ -718,6 +723,10 @@ pub fn zigTerminal(terminal_: Terminal) ?*ZigTerminal {
     return (terminal_ orelse return null).terminal;
 }
 
+pub fn terminalIdentity(terminal_: Terminal) ?u64 {
+    return (terminal_ orelse return null).identity;
+}
+
 /// Attach the persistent C stream and I/O owner to a heap-stable terminal.
 /// The caller retains ownership of both inputs if wrapper allocation fails.
 fn wrap(
@@ -755,6 +764,7 @@ fn wrap(
     };
 
     wrapper.* = .{
+        .identity = next_identity.fetchAdd(1, .monotonic),
         .terminal = t,
         .io = io,
         .terminfo_name_buf = undefined,
