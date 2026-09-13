@@ -122,6 +122,7 @@ typedef struct GhosttySnapshotCaptureImpl* GhosttySnapshotCapture;
 /** Limits fixed when a progressive capture is created. */
 typedef struct {
   size_t size;
+  /** Maximum encoded size of the envelope or any individual record. */
   size_t max_record_bytes;
   size_t max_pages;
 } GhosttySnapshotCaptureOptions;
