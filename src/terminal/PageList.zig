@@ -393,6 +393,15 @@ page_serial: u64,
 /// checked against the live list before its coordinates are used.
 page_serial_epoch: u64,
 
+/// Changes whenever an existing page can no longer be followed safely by a
+/// detached snapshot history cursor. Appending new active pages deliberately
+/// does not change this: it cannot alter the cold prefix captured at READY.
+snapshot_history_revision: u64 = 0,
+
+/// Revision of the most recent removal. This lets detached cursors distinguish
+/// scrollback loss from an in-place or adjacency mutation.
+snapshot_history_eviction_revision: u64 = 0,
+
 /// Byte size of the raw backing mappings owned by active page nodes. This is
 /// logical scrollback accounting and does not change while a mapping is
 /// decommitted. It excludes encoded storage and unused preheated pool items.
@@ -3051,6 +3060,7 @@ fn resizeWithoutReflowGrowCols(
         const y_end = copied;
 
         // Insert our new page
+        self.invalidateSnapshotHistoryMutation();
         self.pages.insertBefore(chunk.node, new_node);
 
         // Update our tracked pins that pointed to this previous page.
@@ -3537,6 +3547,15 @@ pub fn invalidateNodeLayout(self: *PageList, node: *List.Node) void {
     self.page_serial += 1;
 }
 
+fn invalidateSnapshotHistoryMutation(self: *PageList) void {
+    self.snapshot_history_revision +%= 1;
+}
+
+fn invalidateSnapshotHistoryEviction(self: *PageList) void {
+    self.invalidateSnapshotHistoryMutation();
+    self.snapshot_history_eviction_revision = self.snapshot_history_revision;
+}
+
 /// Compact a page to use the minimum required memory for the contents
 /// it stores. Returns the new node pointer if compaction occurred, or null
 /// if the page was already compact or compaction would not provide any
@@ -3605,6 +3624,7 @@ pub fn compact(self: *PageList, node: *List.Node) Allocator.Error!?*List.Node {
     }
 
     // Insert the new page and destroy the old one
+    self.invalidateSnapshotHistoryMutation();
     self.pages.insertBefore(node, new_node);
     self.pages.remove(node);
     self.destroyNode(node);
@@ -3706,6 +3726,7 @@ pub fn split(
     }
     page.size.rows -= y_end - y_start;
 
+    self.invalidateSnapshotHistoryMutation();
     self.pages.insertAfter(original_node, target);
 }
 
@@ -3951,6 +3972,7 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
         // rows then we can't prune. The "+ 1" is because we'll add one
         // more row below.
         if (self.total_rows + 1 < self.rows) {
+            self.invalidateSnapshotHistoryMutation();
             self.pages.prepend(first);
             assert(self.pages.first == first);
             self.total_rows += first.rows();
@@ -4007,6 +4029,7 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
         first.data = .{ .resident = .initBuf(.init(buf), Page.layout(cap)) };
         const page = first.page();
         page.size.rows = 1;
+        self.invalidateSnapshotHistoryEviction();
         self.pages.insertAfter(last, first);
         self.total_rows += 1;
 
@@ -4209,6 +4232,7 @@ pub fn increaseCapacity(
     }
 
     // Insert this page and destroy the old page
+    self.invalidateSnapshotHistoryMutation();
     self.pages.insertBefore(node, new_node);
     self.pages.remove(node);
     self.destroyNode(node);
@@ -4322,6 +4346,7 @@ pub const PageAllocation = struct {
         // No fallible work remains. Publish the page and update every cached
         // quantity affected by inserting rows above the existing first page.
         errdefer comptime unreachable;
+        destination.invalidateSnapshotHistoryMutation();
         destination.pages.prepend(node);
         destination.page_size = page_size;
         destination.total_rows = total_rows;
@@ -4882,6 +4907,7 @@ fn compressPage(self: *PageList, node: *List.Node) bool {
 /// responsible for accounting for the removed rows. This function only
 /// updates `page_size` (byte accounting), not row accounting.
 fn destroyNode(self: *PageList, node: *List.Node) void {
+    self.invalidateSnapshotHistoryEviction();
     destroyNodeExt(&self.pool, node, &self.page_size);
 }
 

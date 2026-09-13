@@ -29,7 +29,8 @@ pub const EncodeError = terminal.EncodeError ||
     screen.EncodeError ||
     history.EncodeError ||
     checkpoint.EncodeError ||
-    continuation.EncodeError;
+    continuation.EncodeError ||
+    error{CaptureNotReady};
 
 pub const EncodeOptions = struct {
     continuation: Continuation,
@@ -39,6 +40,7 @@ const screen_keys = std.enums.values(TerminalScreenKey);
 
 /// Boundary produced after one bounded encoder step.
 pub const EncodeEvent = union(enum) {
+    scan,
     record,
     ready,
     history_page: struct {
@@ -47,22 +49,46 @@ pub const EncodeEvent = union(enum) {
         remaining: u32,
     },
     finish,
+    invalidated: CaptureInvalidation,
+};
+
+pub const CaptureInvalidation = enum {
+    wrong_terminal,
+    reset,
+    resize,
+    mutation,
+    evicted,
 };
 
 /// Incremental encoder for the current engine-owned snapshot format.
 ///
 /// Each call to `next` emits exactly one complete envelope or record. The
-/// terminal must remain immutable until `finished` becomes true.
+/// The terminal must remain immutable through READY. `detach` then releases
+/// that borrow and later history steps borrow the same terminal only for each
+/// synchronous call.
 pub const Encoder = struct {
-    const State = enum { envelope, terminal, screens, continuation, ready, histories, finish, done };
+    const State = enum {
+        envelope,
+        terminal,
+        screens,
+        continuation,
+        ready,
+        histories,
+        finish,
+        done,
+        invalidated,
+    };
 
-    terminal_: *const Terminal,
+    terminal_: ?*const Terminal,
+    terminal_identity: usize,
     options: EncodeOptions,
     stream: record.Writer,
     state: State = .envelope,
     key_index: usize = 0,
     screen_encoder: ?screen.Encoder = null,
-    history_encoder: ?history.Encoder = null,
+    history_cuts: std.EnumMap(TerminalScreenKey, history.Cut) = .init(.{}),
+    scanned_pages: usize = 0,
+    max_pages: usize,
 
     pub fn init(
         alloc: Allocator,
@@ -73,8 +99,10 @@ pub const Encoder = struct {
         try continuation.validate(options.continuation);
         return .{
             .terminal_ = t,
+            .terminal_identity = @intFromPtr(t),
             .options = options,
             .stream = .init(alloc, destination),
+            .max_pages = std.math.maxInt(usize),
         };
     }
 
@@ -84,17 +112,20 @@ pub const Encoder = struct {
         t: *const Terminal,
         options: EncodeOptions,
         max_record_bytes: usize,
+        max_pages: usize,
     ) EncodeError!Encoder {
         try continuation.validate(options.continuation);
         if (max_record_bytes < record.Header.len) return error.PayloadTooLarge;
         return .{
             .terminal_ = t,
+            .terminal_identity = @intFromPtr(t),
             .options = options,
             .stream = try .initLimited(
                 alloc,
                 destination,
                 max_record_bytes - record.Header.len,
             ),
+            .max_pages = max_pages,
         };
     }
 
@@ -107,17 +138,19 @@ pub const Encoder = struct {
         return self.state == .done;
     }
 
-    pub fn nextIsHistoryPage(self: *const Encoder) bool {
-        if (self.state != .histories) return false;
-        const active = self.history_encoder orelse return false;
-        return !active.headerPending();
+    pub fn prefixFinished(self: *const Encoder) bool {
+        return self.state == .histories;
+    }
+
+    pub fn detached(self: *const Encoder) bool {
+        return self.terminal_ == null;
     }
 
     fn nextScreen(self: *Encoder) EncodeError!?EncodeEvent {
         if (self.screen_encoder == null) {
             while (self.key_index < screen_keys.len) {
                 const key = screen_keys[self.key_index];
-                const value = self.terminal_.screens.get(key) orelse {
+                const value = self.terminal_.?.screens.get(key) orelse {
                     self.key_index += 1;
                     continue;
                 };
@@ -138,38 +171,7 @@ pub const Encoder = struct {
         return .record;
     }
 
-    fn nextHistory(self: *Encoder) EncodeError!?EncodeEvent {
-        if (self.history_encoder == null) {
-            while (self.key_index < screen_keys.len) {
-                const key = screen_keys[self.key_index];
-                const value = self.terminal_.screens.get(key) orelse {
-                    self.key_index += 1;
-                    continue;
-                };
-                self.history_encoder = try .init(value, key);
-                break;
-            }
-        }
-        const active = &(self.history_encoder orelse {
-            self.state = .finish;
-            return null;
-        });
-        const is_page = !active.headerPending();
-        const key = active.screenKey();
-        const rows = active.nextRows();
-        try active.next(&self.stream);
-        const remaining = active.remaining();
-        if (active.finished()) {
-            self.history_encoder = null;
-            self.key_index += 1;
-        }
-        return if (is_page)
-            .{ .history_page = .{ .key = key, .rows = rows, .remaining = remaining } }
-        else
-            .record;
-    }
-
-    pub fn next(self: *Encoder) EncodeError!EncodeEvent {
+    pub fn nextPrefix(self: *Encoder) EncodeError!EncodeEvent {
         while (true) switch (self.state) {
             .envelope => {
                 try envelope.encode(self.stream.writer());
@@ -177,7 +179,7 @@ pub const Encoder = struct {
                 return .record;
             },
             .terminal => {
-                try terminal.encode(self.terminal_, &self.stream);
+                try terminal.encode(self.terminal_.?, &self.stream);
                 self.state = .screens;
                 return .record;
             },
@@ -194,15 +196,102 @@ pub const Encoder = struct {
                 self.state = .histories;
                 return .ready;
             },
+            .histories, .finish, .done, .invalidated => unreachable,
+        };
+    }
+
+    /// Capture O(1) cold-page cursors and stop retaining the source terminal.
+    pub fn detach(self: *Encoder) EncodeError!void {
+        if (self.state != .histories or self.terminal_ == null)
+            return error.CaptureNotReady;
+        const source = self.terminal_.?;
+        for (screen_keys) |key| {
+            const value = source.screens.get(key) orelse continue;
+            self.history_cuts.put(key, .init(value, key));
+        }
+        self.terminal_ = null;
+        self.key_index = 0;
+    }
+
+    fn invalidate(self: *Encoder, reason: CaptureInvalidation) EncodeEvent {
+        self.state = .invalidated;
+        return .{ .invalidated = reason };
+    }
+
+    fn mapInvalidation(reason: history.Invalidation) CaptureInvalidation {
+        return switch (reason) {
+            .reset => .reset,
+            .resize => .resize,
+            .mutation => .mutation,
+            .evicted => .evicted,
+        };
+    }
+
+    fn nextHistoryCut(
+        self: *Encoder,
+        source: *const Terminal,
+    ) EncodeError!?EncodeEvent {
+        if (self.key_index >= screen_keys.len) {
+            self.state = .finish;
+            return null;
+        }
+        const key = screen_keys[self.key_index];
+        const cut = self.history_cuts.getPtr(key) orelse {
+            self.key_index += 1;
+            return null;
+        };
+        const terminal_screen = source.screens.get(key) orelse
+            return self.invalidate(.reset);
+        const event = try cut.next(
+            terminal_screen,
+            &self.stream,
+            self.max_pages - self.scanned_pages,
+        );
+        return switch (event) {
+            .scan => .scan,
+            .record => .record,
+            .page => |value| .{ .history_page = .{
+                .key = key,
+                .rows = value.rows,
+                .remaining = value.remaining,
+            } },
+            .done => done: {
+                self.scanned_pages += cut.pages();
+                self.key_index += 1;
+                break :done null;
+            },
+            .invalidated => |reason| self.invalidate(mapInvalidation(reason)),
+        };
+    }
+
+    /// Perform one bounded history scan/record step against the live source.
+    pub fn nextHistory(
+        self: *Encoder,
+        source: *const Terminal,
+    ) EncodeError!EncodeEvent {
+        if (self.terminal_ != null or self.state == .invalidated or
+            self.state == .done)
+            return error.CaptureNotReady;
+        if (@intFromPtr(source) != self.terminal_identity)
+            return self.invalidate(.wrong_terminal);
+
+        while (true) switch (self.state) {
             .histories => {
-                return try self.nextHistory() orelse continue;
+                return try self.nextHistoryCut(source) orelse continue;
             },
             .finish => {
                 try checkpoint.encode(.finish, &self.stream);
                 self.state = .done;
                 return .finish;
             },
-            .done => unreachable,
+            .envelope,
+            .terminal,
+            .screens,
+            .continuation,
+            .ready,
+            .done,
+            .invalidated,
+            => unreachable,
         };
     }
 };
@@ -221,7 +310,11 @@ pub fn encode(
 ) EncodeError!void {
     var encoder = try Encoder.init(alloc, destination, t, options);
     defer encoder.deinit();
-    while (!encoder.finished()) _ = try encoder.next();
+    while (true) {
+        if (try encoder.nextPrefix() == .ready) break;
+    }
+    try encoder.detach();
+    while (!encoder.finished()) _ = try encoder.nextHistory(t);
 }
 
 /// Errors possible while restoring one complete terminal snapshot.
@@ -859,19 +952,28 @@ test "bounded encoder publishes READY before history" {
         &terminal_,
         test_encode_options,
         max_record_bytes,
+        1024,
     );
     defer encoder.deinit();
 
     var ready_offset: ?usize = null;
     var history_pages: usize = 0;
+    var detached = false;
     while (!encoder.finished()) {
         const before = bytes.written().len;
-        const event = try encoder.next();
+        const event = if (!detached)
+            try encoder.nextPrefix()
+        else
+            try encoder.nextHistory(&terminal_);
         const written = bytes.written().len - before;
-        try testing.expect(written > 0);
+        if (event != .scan) try testing.expect(written > 0);
         try testing.expect(written <= max_record_bytes);
         switch (event) {
-            .ready => ready_offset = bytes.written().len,
+            .ready => {
+                ready_offset = bytes.written().len;
+                try encoder.detach();
+                detached = true;
+            },
             .history_page => |page_event| {
                 try testing.expect(ready_offset != null);
                 try testing.expect(page_event.rows > 0);

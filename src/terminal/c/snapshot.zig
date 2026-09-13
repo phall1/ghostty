@@ -26,6 +26,18 @@ pub const CaptureEventKind = enum(c_int) {
     ready = 1,
     history_page = 2,
     finish = 3,
+    scan = 4,
+    invalidated = 5,
+    _,
+};
+
+pub const CaptureInvalidation = enum(c_int) {
+    none = 0,
+    wrong_terminal = 1,
+    reset = 2,
+    resize = 3,
+    mutation = 4,
+    evicted = 5,
     _,
 };
 
@@ -36,6 +48,7 @@ pub const CaptureEvent = extern struct {
     rows: usize,
     remaining: u32,
     written: usize,
+    invalidation: CaptureInvalidation,
 };
 
 const CaptureWrapper = struct {
@@ -44,8 +57,6 @@ const CaptureWrapper = struct {
     continuation: []u8,
     adapter: io_c.WriterAdapter,
     encoder: snapshot_core.Encoder,
-    max_pages: usize,
-    pages: usize = 0,
 };
 
 pub const Capture = ?*CaptureWrapper;
@@ -595,14 +606,13 @@ pub fn capture_new(
     capture.terminal_alloc = native.gpa();
     capture.continuation = continuation.bytes;
     capture.adapter = .init(writer);
-    capture.max_pages = options.max_pages;
-    capture.pages = 0;
     capture.encoder = snapshot_core.Encoder.initLimited(
         alloc,
         &capture.adapter.interface,
         native,
         .{ .continuation = continuationValue(capture.continuation) },
         options.max_record_bytes,
+        options.max_pages,
     ) catch |err| {
         return mapEncodeError(err, &capture.adapter);
     };
@@ -617,31 +627,77 @@ pub fn capture_next(
 ) callconv(lib.calling_conv) Result {
     const capture = capture_ orelse return .invalid_value;
     const out = out_ orelse return .invalid_value;
-    if (out.size < @sizeOf(CaptureEvent) or capture.encoder.finished())
+    if (out.size < @sizeOf(CaptureEvent) or
+        capture.encoder.finished() or capture.encoder.prefixFinished())
         return .invalid_value;
-    if (capture.encoder.nextIsHistoryPage() and capture.pages >= capture.max_pages)
-        return .limit_exceeded;
 
     const before = capture.adapter.offset;
-    const event = capture.encoder.next() catch |err|
+    const event = capture.encoder.nextPrefix() catch |err|
         return mapEncodeError(err, &capture.adapter);
+    publishCaptureEvent(out, event, capture.adapter.offset - before);
+    return .success;
+}
+
+/// Release the source borrow after READY without traversing its history.
+pub fn capture_detach(capture_: Capture) callconv(lib.calling_conv) Result {
+    const capture = capture_ orelse return .invalid_value;
+    capture.encoder.detach() catch |err|
+        return mapEncodeError(err, &capture.adapter);
+    return .success;
+}
+
+/// Perform one bounded detached-history step against the same live terminal.
+pub fn capture_next_history(
+    capture_: Capture,
+    terminal: terminal_c.Terminal,
+    out_: ?*CaptureEvent,
+) callconv(lib.calling_conv) Result {
+    const capture = capture_ orelse return .invalid_value;
+    const out = out_ orelse return .invalid_value;
+    if (out.size < @sizeOf(CaptureEvent) or !capture.encoder.detached() or
+        capture.encoder.finished())
+        return .invalid_value;
+    const native = terminal_c.zigTerminal(terminal) orelse return .invalid_value;
+
+    const before = capture.adapter.offset;
+    const event = capture.encoder.nextHistory(native) catch |err|
+        return mapEncodeError(err, &capture.adapter);
+    publishCaptureEvent(out, event, capture.adapter.offset - before);
+    return .success;
+}
+
+fn publishCaptureEvent(
+    out: *CaptureEvent,
+    event: snapshot_core.EncodeEvent,
+    written: usize,
+) void {
     out.screen = .primary;
     out.rows = 0;
     out.remaining = 0;
+    out.invalidation = .none;
     out.kind = switch (event) {
+        .scan => .scan,
         .record => .record,
         .ready => .ready,
         .finish => .finish,
         .history_page => |page_event| event: {
-            capture.pages += 1;
             out.screen = @enumFromInt(@intFromEnum(page_event.key));
             out.rows = page_event.rows;
             out.remaining = page_event.remaining;
             break :event .history_page;
         },
+        .invalidated => |reason| event: {
+            out.invalidation = switch (reason) {
+                .wrong_terminal => .wrong_terminal,
+                .reset => .reset,
+                .resize => .resize,
+                .mutation => .mutation,
+                .evicted => .evicted,
+            };
+            break :event .invalidated;
+        },
     };
-    out.written = capture.adapter.offset - before;
-    return .success;
+    out.written = written;
 }
 
 pub fn capture_free(capture_: Capture) callconv(lib.calling_conv) void {
@@ -778,9 +834,11 @@ fn mapEncodeError(
         error.Overflow,
         error.PayloadTooLarge,
         error.PageCountOverflow,
+        error.PageLimitExceeded,
         error.ScrollbackLimitOverflow,
         error.StringTooLong,
         => .limit_exceeded,
+        error.CaptureNotReady => .invalid_value,
         else => .invalid_value,
     };
 }
