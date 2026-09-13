@@ -328,6 +328,7 @@ const type_decls = [_]TypeDecl{
     .initEnum("GhosttySgrUnderline", sgr.Attribute.Underline, "GHOSTTY_SGR_UNDERLINE_"),
     .initEnumSentinel("GhosttySizeReportStyle", size_report.Style, "GHOSTTY_SIZE_REPORT_", "STYLE_MAX_VALUE"),
     .initEnum("GhosttySnapshotCaptureEventKind", snapshot.CaptureEventKind, "GHOSTTY_SNAPSHOT_CAPTURE_EVENT_"),
+    .initEnum("GhosttySnapshotCaptureInvalidation", snapshot.CaptureInvalidation, "GHOSTTY_SNAPSHOT_CAPTURE_INVALIDATION_"),
     .initEnum("GhosttySnapshotDecoderData", snapshot.DecoderData, "GHOSTTY_SNAPSHOT_DECODER_DATA_"),
     .initEnum("GhosttySnapshotDecoderOption", snapshot.DecoderOption, "GHOSTTY_SNAPSHOT_DECODER_OPT_"),
     .initEnumSentinel("GhosttyStyleColorTag", style.ColorTag, "GHOSTTY_STYLE_COLOR_", "TAG_MAX_VALUE"),

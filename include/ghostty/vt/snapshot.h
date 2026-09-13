@@ -133,8 +133,23 @@ typedef enum GHOSTTY_ENUM_TYPED {
   GHOSTTY_SNAPSHOT_CAPTURE_EVENT_READY = 1,
   GHOSTTY_SNAPSHOT_CAPTURE_EVENT_HISTORY_PAGE = 2,
   GHOSTTY_SNAPSHOT_CAPTURE_EVENT_FINISH = 3,
+  /** One cold-page descriptor was scanned; no bytes were written. */
+  GHOSTTY_SNAPSHOT_CAPTURE_EVENT_SCAN = 4,
+  /** The READY cut can no longer be read safely; no bytes were written. */
+  GHOSTTY_SNAPSHOT_CAPTURE_EVENT_INVALIDATED = 5,
   GHOSTTY_SNAPSHOT_CAPTURE_EVENT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttySnapshotCaptureEventKind;
+
+/** Typed reason a detached READY history cut became unusable. */
+typedef enum GHOSTTY_ENUM_TYPED {
+  GHOSTTY_SNAPSHOT_CAPTURE_INVALIDATION_NONE = 0,
+  GHOSTTY_SNAPSHOT_CAPTURE_INVALIDATION_WRONG_TERMINAL = 1,
+  GHOSTTY_SNAPSHOT_CAPTURE_INVALIDATION_RESET = 2,
+  GHOSTTY_SNAPSHOT_CAPTURE_INVALIDATION_RESIZE = 3,
+  GHOSTTY_SNAPSHOT_CAPTURE_INVALIDATION_MUTATION = 4,
+  GHOSTTY_SNAPSHOT_CAPTURE_INVALIDATION_EVICTED = 5,
+  GHOSTTY_SNAPSHOT_CAPTURE_INVALIDATION_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+} GhosttySnapshotCaptureInvalidation;
 
 /** Metadata for bytes synchronously written by one capture step. */
 typedef struct {
@@ -144,6 +159,7 @@ typedef struct {
   size_t rows;
   uint32_t remaining;
   size_t written;
+  GhosttySnapshotCaptureInvalidation invalidation;
 } GhosttySnapshotCaptureEvent;
 
 /**
@@ -359,8 +375,10 @@ GHOSTTY_API GhosttyResult ghostty_snapshot_encode(GhosttyTerminal terminal,
 /**
  * Create a record-at-a-time capture using the current GHOSTSNP format.
  *
- * The writer and terminal are borrowed until the capture is freed. Neither
- * may be mutated or destroyed in that interval. The capture allocates exactly
+ * The writer and terminal must remain alive until the capture is freed. The
+ * terminal must remain immutable only through READY; after
+ * ghostty_snapshot_capture_detach succeeds it may be mutated between history
+ * calls but must not be destroyed or replaced. The capture allocates exactly
  * `max_record_bytes - 10` bytes of reusable payload scratch and never stages a
  * complete snapshot.
  */
@@ -371,9 +389,28 @@ GHOSTTY_API GhosttyResult ghostty_snapshot_capture_new(
     const GhosttySnapshotCaptureOptions* options,
     GhosttySnapshotCapture* capture);
 
-/** Emit one complete envelope or record synchronously through the writer. */
+/** Emit one complete prefix envelope or record through READY. */
 GHOSTTY_API GhosttyResult ghostty_snapshot_capture_next(
     GhosttySnapshotCapture capture,
+    GhosttySnapshotCaptureEvent* event);
+
+/** Detach the O(1) history cut after READY and release the terminal borrow. */
+GHOSTTY_API GhosttyResult ghostty_snapshot_capture_detach(
+    GhosttySnapshotCapture capture);
+
+/**
+ * Perform one bounded detached-history step against the original terminal.
+ *
+ * SCAN writes no bytes and inspects one cold page. RECORD, HISTORY_PAGE, and
+ * FINISH each write one complete GHOSTSNP v1 record. INVALIDATED writes no
+ * bytes and carries a typed tombstone; no FINISH can be produced afterward.
+ * The terminal is borrowed immutably only for this synchronous call and may be
+ * mutated between calls. It must be the original still-live terminal passed to
+ * ghostty_snapshot_capture_new.
+ */
+GHOSTTY_API GhosttyResult ghostty_snapshot_capture_next_history(
+    GhosttySnapshotCapture capture,
+    GhosttyTerminal terminal,
     GhosttySnapshotCaptureEvent* event);
 
 /** Free capture state; NULL is a no-op. */
