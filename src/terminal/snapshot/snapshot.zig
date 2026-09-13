@@ -115,7 +115,8 @@ pub const Encoder = struct {
         max_pages: usize,
     ) EncodeError!Encoder {
         try continuation.validate(options.continuation);
-        if (max_record_bytes < record.Header.len) return error.PayloadTooLarge;
+        if (max_record_bytes < @max(record.Header.len, envelope.encoded_len))
+            return error.PayloadTooLarge;
         return .{
             .terminal_ = t,
             .terminal_identity = @intFromPtr(t),
