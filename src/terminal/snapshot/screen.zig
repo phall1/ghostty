@@ -295,8 +295,12 @@ pub const Encoder = struct {
         }
 
         const current = self.next_node.?;
-        std.debug.assert(current.pageIfResident() != null);
-        try page.encode(current.pageAssumeResident(), destination);
+        // Active pages are normally resident, but preserving representation
+        // here keeps snapshot encoding valid if PageList compression policy
+        // changes or a test deliberately compresses an active suffix page.
+        var preserved = try current.pagePreservingState(self.screen.alloc);
+        defer preserved.deinit();
+        try page.encode(preserved.page(), destination);
         self.next_node = current.next;
     }
 };
