@@ -3657,6 +3657,17 @@ fn invalidateSnapshotHistoryEviction(self: *PageList) void {
     self.snapshot_history_eviction_revision = self.snapshot_history_revision;
 }
 
+/// Whether a live node is wholly before the active suffix. Walking backward
+/// to the active boundary and then forward is bounded by active-screen pages,
+/// not by total scrollback length.
+fn nodeIsSnapshotHistory(self: *const PageList, target: *List.Node) bool {
+    var node_: ?*List.Node = self.getTopLeft(.active).node;
+    while (node_) |node| : (node_ = node.next) {
+        if (node == target) return false;
+    }
+    return true;
+}
+
 /// Compact a page to use the minimum required memory for the contents
 /// it stores. Returns the new node pointer if compaction occurred, or null
 /// if the page was already compact or compaction would not provide any
@@ -3725,7 +3736,8 @@ pub fn compact(self: *PageList, node: *List.Node) Allocator.Error!?*List.Node {
     }
 
     // Insert the new page and destroy the old one
-    self.invalidateSnapshotHistoryMutation();
+    if (self.nodeIsSnapshotHistory(node))
+        self.invalidateSnapshotHistoryEviction();
     self.pages.insertBefore(node, new_node);
     self.pages.remove(node);
     self.destroyNode(node);
@@ -3825,7 +3837,8 @@ pub fn split(
     }
     page.size.rows -= y_end - y_start;
 
-    self.invalidateSnapshotHistoryMutation();
+    if (self.nodeIsSnapshotHistory(original_node))
+        self.invalidateSnapshotHistoryMutation();
     self.pages.insertAfter(original_node, target);
 }
 
@@ -4076,7 +4089,6 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
         // rows then we can't prune. The "+ 1" is because we'll add one
         // more row below.
         if (self.total_rows + 1 < self.rows) {
-            self.invalidateSnapshotHistoryMutation();
             self.pages.prepend(first);
             assert(self.pages.first == first);
             self.total_rows += first.rows();
@@ -4393,8 +4405,10 @@ pub fn increaseCapacity(
         p.node = new_node;
     }
 
-    // Insert this page and destroy the old page
-    self.invalidateSnapshotHistoryMutation();
+    // Replacing an active page leaves every detached cold prefix unchanged.
+    // A historical replacement frees a retained identity and must invalidate.
+    if (self.nodeIsSnapshotHistory(node))
+        self.invalidateSnapshotHistoryEviction();
     self.pages.insertBefore(node, new_node);
     self.pages.remove(node);
     self.destroyNode(node);
@@ -5118,7 +5132,6 @@ fn compressPage(self: *PageList, node: *List.Node) bool {
 /// responsible for accounting for the removed rows. This function only
 /// updates `page_size` (byte accounting), not row accounting.
 fn destroyNode(self: *PageList, node: *List.Node) void {
-    self.invalidateSnapshotHistoryEviction();
     destroyNodeExt(&self.pool, node, &self.page_size);
 }
 
@@ -5707,6 +5720,9 @@ fn erasePage(self: *PageList, node: *List.Node) void {
         // This doesn't get marked garbage because the tracked pin
         // movement is sensical.
     }
+
+    if (self.nodeIsSnapshotHistory(node))
+        self.invalidateSnapshotHistoryEviction();
 
     // Remove the page from the linked list
     self.pages.remove(node);
@@ -8571,6 +8587,23 @@ test "PageList replacements preserve compression continuation and mark activity"
     s.page_compression = state;
     _ = (try s.compact(replacement)).?;
     try testing.expectEqual(expected, s.page_compression);
+}
+
+test "PageList snapshot revision ignores active replacement" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    try growColdPagesForTest(&s, 2);
+
+    const revision = s.snapshot_history_revision;
+    const eviction = s.snapshot_history_eviction_revision;
+    _ = try s.increaseCapacity(s.pages.last.?, .styles);
+    try testing.expectEqual(revision, s.snapshot_history_revision);
+    try testing.expectEqual(eviction, s.snapshot_history_eviction_revision);
+
+    _ = try s.increaseCapacity(s.pages.first.?, .styles);
+    try testing.expect(s.snapshot_history_revision != revision);
+    try testing.expect(s.snapshot_history_eviction_revision != eviction);
 }
 
 test "PageList incremental compression bounds inspected pages" {
