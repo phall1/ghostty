@@ -613,7 +613,10 @@ pub fn capture_new(
     out.* = null;
     const options = options_ orelse return .invalid_value;
     if (options.size < @sizeOf(CaptureOptions) or
-        options.max_record_bytes < snapshot_core.record.Header.len or
+        options.max_record_bytes < @max(
+            snapshot_core.record.Header.len,
+            snapshot_core.envelope.encoded_len,
+        ) or
         options.max_pages == 0 or writer.write == null)
     {
         return .invalid_value;
@@ -621,11 +624,12 @@ pub fn capture_new(
     const native = terminal_c.zigTerminal(terminal) orelse return .invalid_value;
     const continuation = continuationOwned(terminal);
     if (continuation.result != .success) return continuation.result;
-    errdefer native.gpa().free(continuation.bytes);
 
     const alloc = lib.alloc.default(alloc_);
-    const capture = alloc.create(CaptureWrapper) catch return .out_of_memory;
-    errdefer alloc.destroy(capture);
+    const capture = alloc.create(CaptureWrapper) catch {
+        native.gpa().free(continuation.bytes);
+        return .out_of_memory;
+    };
     capture.* = undefined;
     capture.alloc = alloc;
     capture.terminal_alloc = native.gpa();
@@ -640,7 +644,10 @@ pub fn capture_new(
         options.max_record_bytes,
         options.max_pages,
     ) catch |err| {
-        return mapEncodeError(err, &capture.adapter);
+        const result = mapEncodeError(err, &capture.adapter);
+        alloc.destroy(capture);
+        native.gpa().free(continuation.bytes);
+        return result;
     };
     out.* = capture;
     return .success;
@@ -976,6 +983,69 @@ test "decoder option and empty source" {
         &terminal,
     ));
     try testing.expectEqual(null, terminal);
+}
+
+test "snapshot capture constructor releases every failed allocation" {
+    var source_failing = testing.FailingAllocator.init(testing.allocator, .{});
+    const source_zig = source_failing.allocator();
+    const source_c: CAllocator = .fromZig(&source_zig);
+    var source: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &source_c,
+        &source,
+        20,
+        4,
+    ));
+    defer terminal_c.free(source);
+    try testEnableContinuation(source);
+    terminal_c.vt_write(source, "hello\x1b[31", "hello\x1b[31".len);
+
+    const Writer = struct {
+        fn write(_: ?*anyopaque, _: [*]const u8, _: usize) callconv(lib.calling_conv) bool {
+            return true;
+        }
+    };
+    const writer: io_c.Writer = .{ .write = &Writer.write };
+    const options: CaptureOptions = .{
+        .size = @sizeOf(CaptureOptions),
+        .max_record_bytes = 1024 * 1024,
+        .max_pages = 1000,
+    };
+    const source_outstanding = source_failing.allocated_bytes - source_failing.freed_bytes;
+
+    for (0..2) |fail_index| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = fail_index,
+        });
+        const failing_zig = failing.allocator();
+        const failing_c: CAllocator = .fromZig(&failing_zig);
+        var capture: Capture = null;
+        try testing.expectEqual(Result.out_of_memory, capture_new(
+            &failing_c,
+            source,
+            writer,
+            &options,
+            &capture,
+        ));
+        try testing.expectEqual(null, capture);
+        try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        try testing.expectEqual(
+            source_outstanding,
+            source_failing.allocated_bytes - source_failing.freed_bytes,
+        );
+    }
+
+    var short = options;
+    short.max_record_bytes = snapshot_core.envelope.encoded_len - 1;
+    var capture: Capture = null;
+    try testing.expectEqual(Result.invalid_value, capture_new(
+        &lib.alloc.test_allocator,
+        source,
+        writer,
+        &short,
+        &capture,
+    ));
+    try testing.expectEqual(null, capture);
 }
 
 test "snapshot C API full round trip restores continuation" {
