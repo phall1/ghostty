@@ -3556,15 +3556,21 @@ fn invalidateSnapshotHistoryEviction(self: *PageList) void {
     self.snapshot_history_eviction_revision = self.snapshot_history_revision;
 }
 
-/// Whether a live node is wholly before the active suffix. Walking backward
-/// to the active boundary and then forward is bounded by active-screen pages,
-/// not by total scrollback length.
+/// Whether a live node is wholly before the active suffix.
+///
+/// Resize temporarily permits fewer list rows than `self.rows`, so this must
+/// not call `getTopLeft(.active)`, whose steady-state contract requires enough
+/// rows. Walking backward also bounds normal work by active-screen pages. If a
+/// transient list cannot yet fill the active height, every live node is active.
 fn nodeIsSnapshotHistory(self: *const PageList, target: *List.Node) bool {
-    var node_: ?*List.Node = self.getTopLeft(.active).node;
-    while (node_) |node| : (node_ = node.next) {
+    var remaining = self.rows;
+    var node_: ?*List.Node = self.pages.last;
+    while (node_) |node| : (node_ = node.prev) {
         if (node == target) return false;
+        if (remaining <= node.rows()) return true;
+        remaining -= node.rows();
     }
-    return true;
+    return false;
 }
 
 /// Compact a page to use the minimum required memory for the contents
@@ -8294,6 +8300,21 @@ test "PageList snapshot revision ignores active replacement" {
     _ = try s.increaseCapacity(s.pages.first.?, .styles);
     try testing.expect(s.snapshot_history_revision != revision);
     try testing.expect(s.snapshot_history_eviction_revision != eviction);
+}
+
+test "PageList snapshot classification tolerates transient short active list" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+
+    // Resize can publish the new active height before it has grown enough rows
+    // to satisfy that height. Every currently live node is active in this
+    // transient state, and classification must not invoke steady-state active
+    // coordinate lookup or mistake one for captured history.
+    const steady_rows = s.rows;
+    s.rows = steady_rows + 1;
+    defer s.rows = steady_rows;
+    try testing.expect(!s.nodeIsSnapshotHistory(s.pages.first.?));
 }
 
 test "PageList incremental compression bounds inspected pages" {
