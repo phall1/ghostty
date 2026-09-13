@@ -794,6 +794,10 @@ fn mapEncodeError(
     if (adapter) |value| {
         if (value.invalid_write) return .limit_exceeded;
         if (value.callback_failed) return .io_error;
+        // A bounded capture's destination is still healthy here, so a write
+        // failure came from its fixed record-payload scratch reaching the
+        // caller-selected limit rather than from allocation.
+        if (err == error.WriteFailed) return .limit_exceeded;
     }
 
     // Fixed and allocating writers surface only core allocation or size errors.
