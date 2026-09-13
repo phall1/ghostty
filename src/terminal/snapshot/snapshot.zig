@@ -1020,6 +1020,67 @@ test "bounded encoder publishes READY before history" {
     );
 }
 
+test "detached capture tombstones before freed heap history dereference" {
+    const testing = std.testing;
+    var tracking = testing.FailingAllocator.init(testing.allocator, .{});
+    const alloc = tracking.allocator();
+
+    {
+        var terminal_ = try Terminal.init(testing.io, alloc, .{
+            .cols = 80,
+            .rows = 24,
+            .max_scrollback_bytes = null,
+            .max_scrollback_lines = null,
+        });
+        defer terminal_.deinit(alloc);
+        const primary = terminal_.screens.get(.primary).?;
+
+        // Force the active page onto heap backing, then append enough pages for
+        // that same allocation to become cold captured history.
+        var oldest = primary.pages.pages.last.?;
+        while (oldest.owned != .heap)
+            oldest = try primary.pages.increaseCapacity(oldest, .grapheme_bytes);
+        while (primary.pages.totalPages() < 3) _ = try primary.pages.grow();
+        try testing.expectEqual(primary.pages.getTopLeft(.screen).node, oldest);
+        try testing.expect(oldest != primary.pages.getTopLeft(.active).node);
+
+        const tail = primary.pages.pages.last.?;
+        while (tail.rows() < tail.capacity().rows) _ = try primary.pages.grow();
+
+        var bytes: std.Io.Writer.Allocating = .init(alloc);
+        defer bytes.deinit();
+        var encoder = try Encoder.initLimited(
+            alloc,
+            &bytes.writer,
+            &terminal_,
+            test_encode_options,
+            1024 * 1024,
+            1024,
+        );
+        defer encoder.deinit();
+        while (true) switch (try encoder.nextPrefix()) {
+            .ready => break,
+            else => {},
+        };
+        try encoder.detach();
+
+        // The next page allocation exceeds this now-current byte limit. Grow
+        // must free the heap-owned oldest page, advancing the eviction fence
+        // before the detached cut can inspect its retained node identity.
+        primary.pages.limits.set(.bytes, primary.pages.page_size);
+        _ = try primary.pages.grow();
+        switch (try encoder.nextHistory(&terminal_)) {
+            .invalidated => |reason| try testing.expectEqual(
+                CaptureInvalidation.evicted,
+                reason,
+            ),
+            else => return error.TestExpectedEviction,
+        }
+    }
+
+    try testing.expectEqual(tracking.allocated_bytes, tracking.freed_bytes);
+}
+
 test "complete snapshot round trip with history and alternate screen" {
     const testing = std.testing;
 
