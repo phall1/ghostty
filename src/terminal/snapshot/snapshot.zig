@@ -35,6 +35,178 @@ pub const EncodeOptions = struct {
     continuation: Continuation,
 };
 
+const screen_keys = std.enums.values(TerminalScreenKey);
+
+/// Boundary produced after one bounded encoder step.
+pub const EncodeEvent = union(enum) {
+    record,
+    ready,
+    history_page: struct {
+        key: TerminalScreenKey,
+        rows: usize,
+        remaining: u32,
+    },
+    finish,
+};
+
+/// Incremental encoder for the current engine-owned snapshot format.
+///
+/// Each call to `next` emits exactly one complete envelope or record. The
+/// terminal must remain immutable until `finished` becomes true.
+pub const Encoder = struct {
+    const State = enum { envelope, terminal, screens, continuation, ready, histories, finish, done };
+
+    terminal_: *const Terminal,
+    options: EncodeOptions,
+    stream: record.Writer,
+    state: State = .envelope,
+    key_index: usize = 0,
+    screen_encoder: ?screen.Encoder = null,
+    history_encoder: ?history.Encoder = null,
+
+    pub fn init(
+        alloc: Allocator,
+        destination: *std.Io.Writer,
+        t: *const Terminal,
+        options: EncodeOptions,
+    ) EncodeError!Encoder {
+        try continuation.validate(options.continuation);
+        return .{
+            .terminal_ = t,
+            .options = options,
+            .stream = .init(alloc, destination),
+        };
+    }
+
+    pub fn initLimited(
+        alloc: Allocator,
+        destination: *std.Io.Writer,
+        t: *const Terminal,
+        options: EncodeOptions,
+        max_record_bytes: usize,
+    ) EncodeError!Encoder {
+        try continuation.validate(options.continuation);
+        if (max_record_bytes < record.Header.len) return error.PayloadTooLarge;
+        return .{
+            .terminal_ = t,
+            .options = options,
+            .stream = try .initLimited(
+                alloc,
+                destination,
+                max_record_bytes - record.Header.len,
+            ),
+        };
+    }
+
+    pub fn deinit(self: *Encoder) void {
+        self.stream.deinit();
+        self.* = undefined;
+    }
+
+    pub fn finished(self: *const Encoder) bool {
+        return self.state == .done;
+    }
+
+    pub fn nextIsHistoryPage(self: *const Encoder) bool {
+        if (self.state != .histories) return false;
+        const active = self.history_encoder orelse return false;
+        return !active.headerPending();
+    }
+
+    fn nextScreen(self: *Encoder) EncodeError!?EncodeEvent {
+        if (self.screen_encoder == null) {
+            while (self.key_index < screen_keys.len) {
+                const key = screen_keys[self.key_index];
+                const value = self.terminal_.screens.get(key) orelse {
+                    self.key_index += 1;
+                    continue;
+                };
+                self.screen_encoder = try .init(value, key);
+                break;
+            }
+        }
+        const active = &(self.screen_encoder orelse {
+            self.key_index = 0;
+            self.state = .continuation;
+            return null;
+        });
+        try active.next(&self.stream);
+        if (active.finished()) {
+            self.screen_encoder = null;
+            self.key_index += 1;
+        }
+        return .record;
+    }
+
+    fn nextHistory(self: *Encoder) EncodeError!?EncodeEvent {
+        if (self.history_encoder == null) {
+            while (self.key_index < screen_keys.len) {
+                const key = screen_keys[self.key_index];
+                const value = self.terminal_.screens.get(key) orelse {
+                    self.key_index += 1;
+                    continue;
+                };
+                self.history_encoder = try .init(value, key);
+                break;
+            }
+        }
+        const active = &(self.history_encoder orelse {
+            self.state = .finish;
+            return null;
+        });
+        const is_page = !active.headerPending();
+        const key = active.screenKey();
+        const rows = active.nextRows();
+        try active.next(&self.stream);
+        const remaining = active.remaining();
+        if (active.finished()) {
+            self.history_encoder = null;
+            self.key_index += 1;
+        }
+        return if (is_page)
+            .{ .history_page = .{ .key = key, .rows = rows, .remaining = remaining } }
+        else
+            .record;
+    }
+
+    pub fn next(self: *Encoder) EncodeError!EncodeEvent {
+        while (true) switch (self.state) {
+            .envelope => {
+                try envelope.encode(self.stream.writer());
+                self.state = .terminal;
+                return .record;
+            },
+            .terminal => {
+                try terminal.encode(self.terminal_, &self.stream);
+                self.state = .screens;
+                return .record;
+            },
+            .screens => {
+                return try self.nextScreen() orelse continue;
+            },
+            .continuation => {
+                try continuation.encode(self.options.continuation, &self.stream);
+                self.state = .ready;
+                return .record;
+            },
+            .ready => {
+                try checkpoint.encode(.ready, &self.stream);
+                self.state = .histories;
+                return .ready;
+            },
+            .histories => {
+                return try self.nextHistory() orelse continue;
+            },
+            .finish => {
+                try checkpoint.encode(.finish, &self.stream);
+                self.state = .done;
+                return .finish;
+            },
+            .done => unreachable,
+        };
+    }
+};
+
 /// Encode one complete terminal snapshot.
 ///
 /// Encoding starts at the destination's current position. Only one record
@@ -47,53 +219,12 @@ pub fn encode(
     t: *const Terminal,
     options: EncodeOptions,
 ) EncodeError!void {
-    // Continuation errors must not emit even the snapshot envelope.
-    try continuation.validate(options.continuation);
-
     // A measured 512-byte buffer handles our smallest records on the stack
     // before larger records fall back to the heap.
     var stack_alloc = std.heap.stackFallback(512, alloc);
-    var stream: record.Writer = .init(stack_alloc.get(), destination);
-    defer stream.deinit();
-
-    // 1. Envelope
-    try envelope.encode(stream.writer());
-
-    // 2. Terminal
-    try terminal.encode(t, &stream);
-
-    // 3. Primary and alt screen
-    try screen.encode(
-        t.screens.get(.primary).?,
-        .primary,
-        &stream,
-    );
-    if (t.screens.get(.alternate)) |alternate| try screen.encode(
-        alternate,
-        .alternate,
-        &stream,
-    );
-
-    // 4. Standard Stream continuation.
-    try continuation.encode(options.continuation, &stream);
-
-    // 5. Ready marker.
-    try checkpoint.encode(.ready, &stream);
-
-    // 6. History
-    try history.encode(
-        t.screens.get(.primary).?,
-        .primary,
-        &stream,
-    );
-    if (t.screens.get(.alternate)) |alternate| try history.encode(
-        alternate,
-        .alternate,
-        &stream,
-    );
-
-    // 7. Finish
-    try checkpoint.encode(.finish, &stream);
+    var encoder = try Encoder.init(stack_alloc.get(), destination, t, options);
+    defer encoder.deinit();
+    while (!encoder.finished()) _ = try encoder.next();
 }
 
 /// Errors possible while restoring one complete terminal snapshot.
@@ -728,6 +859,58 @@ fn testHistoryTerminal(history_pages: u8) !Terminal {
 fn testTopLeftCodepoint(terminal_screen: *const TerminalScreen) u21 {
     return terminal_screen.pages.getTopLeft(.screen).node
         .page().getRowAndCell(0, 0).cell.codepoint();
+}
+
+test "bounded encoder publishes READY before history" {
+    const testing = std.testing;
+    var terminal_ = try testHistoryTerminal(3);
+    defer terminal_.deinit(testing.allocator);
+
+    var bytes: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer bytes.deinit();
+    const max_record_bytes = 1024 * 1024;
+    var encoder = try Encoder.initLimited(
+        testing.allocator,
+        &bytes.writer,
+        &terminal_,
+        test_encode_options,
+        max_record_bytes,
+    );
+    defer encoder.deinit();
+
+    var ready_offset: ?usize = null;
+    var history_pages: usize = 0;
+    while (!encoder.finished()) {
+        const before = bytes.written().len;
+        const event = try encoder.next();
+        const written = bytes.written().len - before;
+        try testing.expect(written > 0);
+        try testing.expect(written <= max_record_bytes);
+        switch (event) {
+            .ready => ready_offset = bytes.written().len,
+            .history_page => |page_event| {
+                try testing.expect(ready_offset != null);
+                try testing.expect(page_event.rows > 0);
+                history_pages += 1;
+            },
+            else => {},
+        }
+    }
+    try testing.expect(ready_offset.? < bytes.written().len);
+    try testing.expectEqual(@as(usize, 3), history_pages);
+
+    var reader: std.Io.Reader = .fixed(bytes.written());
+    var decoded = try decodeExact(
+        testing.allocator,
+        testing.io,
+        &reader,
+        test_decode_options,
+    );
+    defer decoded.deinit(testing.allocator);
+    try testing.expectEqual(
+        testTopLeftCodepoint(terminal_.screens.get(.primary).?),
+        testTopLeftCodepoint(decoded.terminal.?.screens.get(.primary).?),
+    );
 }
 
 test "complete snapshot round trip with history and alternate screen" {

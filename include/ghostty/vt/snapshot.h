@@ -117,6 +117,35 @@ extern "C" {
  * @{
  */
 
+/** Opaque bounded progressive snapshot capture. */
+typedef struct GhosttySnapshotCaptureImpl* GhosttySnapshotCapture;
+
+/** Limits fixed when a progressive capture is created. */
+typedef struct {
+  size_t size;
+  size_t max_record_bytes;
+  size_t max_pages;
+} GhosttySnapshotCaptureOptions;
+
+/** Boundary emitted by one progressive capture step. */
+typedef enum GHOSTTY_ENUM_TYPED {
+  GHOSTTY_SNAPSHOT_CAPTURE_EVENT_RECORD = 0,
+  GHOSTTY_SNAPSHOT_CAPTURE_EVENT_READY = 1,
+  GHOSTTY_SNAPSHOT_CAPTURE_EVENT_HISTORY_PAGE = 2,
+  GHOSTTY_SNAPSHOT_CAPTURE_EVENT_FINISH = 3,
+  GHOSTTY_SNAPSHOT_CAPTURE_EVENT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+} GhosttySnapshotCaptureEventKind;
+
+/** Metadata for bytes synchronously written by one capture step. */
+typedef struct {
+  size_t size;
+  GhosttySnapshotCaptureEventKind kind;
+  GhosttyTerminalScreen screen;
+  size_t rows;
+  uint32_t remaining;
+  size_t written;
+} GhosttySnapshotCaptureEvent;
+
 /**
  * Configurable snapshot decoder options.
  *
@@ -326,6 +355,29 @@ typedef enum GHOSTTY_ENUM_TYPED {
  */
 GHOSTTY_API GhosttyResult ghostty_snapshot_encode(GhosttyTerminal terminal,
                                                   GhosttyWriter writer);
+
+/**
+ * Create a record-at-a-time capture using the current GHOSTSNP format.
+ *
+ * The writer and terminal are borrowed until the capture is freed. Neither
+ * may be mutated or destroyed in that interval. The capture allocates exactly
+ * `max_record_bytes - 10` bytes of reusable payload scratch and never stages a
+ * complete snapshot.
+ */
+GHOSTTY_API GhosttyResult ghostty_snapshot_capture_new(
+    const GhosttyAllocator* allocator,
+    GhosttyTerminal terminal,
+    GhosttyWriter writer,
+    const GhosttySnapshotCaptureOptions* options,
+    GhosttySnapshotCapture* capture);
+
+/** Emit one complete envelope or record synchronously through the writer. */
+GHOSTTY_API GhosttyResult ghostty_snapshot_capture_next(
+    GhosttySnapshotCapture capture,
+    GhosttySnapshotCaptureEvent* event);
+
+/** Free capture state; NULL is a no-op. */
+GHOSTTY_API void ghostty_snapshot_capture_free(GhosttySnapshotCapture capture);
 
 /**
  * Encode a complete terminal snapshot to a caller-provided buffer.

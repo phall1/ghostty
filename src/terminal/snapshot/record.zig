@@ -148,13 +148,71 @@ pub const Checksum = struct {
     }
 };
 
+/// Reusable payload scratch: growable, or fixed at a caller-provided limit.
+const Scratch = union(enum) {
+    allocating: std.Io.Writer.Allocating,
+    fixed: struct {
+        alloc: Allocator,
+        bytes: []u8,
+        writer: std.Io.Writer,
+    },
+
+    fn init(alloc: Allocator) Scratch {
+        return .{ .allocating = .init(alloc) };
+    }
+
+    fn initLimited(alloc: Allocator, limit: usize) Allocator.Error!Scratch {
+        const bytes = try alloc.alloc(u8, limit);
+        return .{ .fixed = .{
+            .alloc = alloc,
+            .bytes = bytes,
+            .writer = .fixed(bytes),
+        } };
+    }
+
+    fn writer(self: *Scratch) *std.Io.Writer {
+        return switch (self.*) {
+            .allocating => |*value| &value.writer,
+            .fixed => |*value| &value.writer,
+        };
+    }
+
+    fn written(self: *Scratch) []const u8 {
+        return switch (self.*) {
+            .allocating => |*value| value.written(),
+            .fixed => |*value| value.writer.buffered(),
+        };
+    }
+
+    fn end(self: *const Scratch) usize {
+        return switch (self.*) {
+            .allocating => |value| value.writer.end,
+            .fixed => |value| value.writer.end,
+        };
+    }
+
+    fn reset(self: *Scratch) void {
+        switch (self.*) {
+            .allocating => |*value| value.shrinkRetainingCapacity(0),
+            .fixed => |*value| value.writer.end = 0,
+        }
+    }
+
+    fn deinit(self: *Scratch) void {
+        switch (self.*) {
+            .allocating => |*value| value.deinit(),
+            .fixed => |*value| value.alloc.free(value.bytes),
+        }
+    }
+};
+
 /// Streams complete records while retaining only one payload at a time.
 ///
 /// The scratch allocation is retained between records so a stream's peak
 /// memory is the largest record payload rather than the complete snapshot.
 pub const Writer = struct {
     destination: *std.Io.Writer,
-    scratch: std.Io.Writer.Allocating,
+    scratch: Scratch,
     active_tag: ?Tag,
 
     pub fn init(
@@ -168,9 +226,23 @@ pub const Writer = struct {
         };
     }
 
+    /// Initialize with a payload scratch buffer that can never grow beyond
+    /// `max_payload_bytes`.
+    pub fn initLimited(
+        alloc: Allocator,
+        destination: *std.Io.Writer,
+        max_payload_bytes: usize,
+    ) Allocator.Error!Writer {
+        return .{
+            .destination = destination,
+            .scratch = try .initLimited(alloc, max_payload_bytes),
+            .active_tag = null,
+        };
+    }
+
     pub fn deinit(self: *Writer) void {
         assert(self.active_tag == null);
-        assert(self.scratch.writer.end == 0);
+        assert(self.scratch.writer().end == 0);
         self.scratch.deinit();
         self.* = undefined;
     }
@@ -184,9 +256,9 @@ pub const Writer = struct {
     /// Begin one record and return its reusable payload writer.
     pub fn begin(self: *Writer, tag: Tag) *std.Io.Writer {
         assert(self.active_tag == null);
-        assert(self.scratch.writer.end == 0);
+        assert(self.scratch.writer().end == 0);
         self.active_tag = tag;
-        return &self.scratch.writer;
+        return self.scratch.writer();
     }
 
     pub const FinishError = std.Io.Writer.Error || error{
@@ -232,7 +304,7 @@ pub const Writer = struct {
     /// This is idempotent so an outer error cleanup may call it after `finish`
     /// has already cleared state following a destination failure.
     pub fn cancel(self: *Writer) void {
-        self.scratch.shrinkRetainingCapacity(0);
+        self.scratch.reset();
         self.active_tag = null;
     }
 };
@@ -561,13 +633,13 @@ test "record writer cancel preserves preceding bytes" {
     const partial = stream.begin(.page);
     errdefer stream.cancel();
     try partial.writeAll("partial");
-    const scratch_capacity = stream.scratch.writer.buffer.len;
+    const scratch_capacity = stream.scratch.writer().buffer.len;
     stream.cancel();
 
     try std.testing.expectEqualStrings("prefix", destination.written());
     try std.testing.expectEqual(
         scratch_capacity,
-        stream.scratch.writer.buffer.len,
+        stream.scratch.writer().buffer.len,
     );
 
     // Cancel retains the allocation but leaves it ready for the next record.
@@ -597,5 +669,5 @@ test "record writer clears active state after destination failure" {
     try payload.writeByte(0);
     try std.testing.expectError(error.WriteFailed, stream.finish());
     try std.testing.expectEqual(@as(?Tag, null), stream.active_tag);
-    try std.testing.expectEqual(@as(usize, 0), stream.scratch.writer.end);
+    try std.testing.expectEqual(@as(usize, 0), stream.scratch.end());
 }
