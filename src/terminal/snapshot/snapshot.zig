@@ -218,6 +218,10 @@ pub const Encoder = struct {
         return .{ .invalidated = reason };
     }
 
+    pub fn wrongTerminal(self: *Encoder) EncodeEvent {
+        return self.invalidate(.wrong_terminal);
+    }
+
     fn mapInvalidation(reason: history.Invalidation) CaptureInvalidation {
         return switch (reason) {
             .reset => .reset,

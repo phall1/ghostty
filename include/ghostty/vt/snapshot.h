@@ -301,10 +301,11 @@ GHOSTTY_API GhosttyResult ghostty_snapshot_encode(GhosttyTerminal terminal,
 /**
  * Create a record-at-a-time capture using the current GHOSTSNP format.
  *
- * The writer and terminal must remain alive until the capture is freed. The
- * terminal must remain immutable only through READY; after
- * ghostty_snapshot_capture_detach succeeds it may be mutated between history
- * calls but must not be destroyed or replaced. The capture allocates exactly
+ * The writer and any custom allocator backing it or the terminal must remain
+ * alive until the capture is freed. The terminal must remain alive and
+ * immutable only through READY; after ghostty_snapshot_capture_detach succeeds
+ * it may be mutated between history calls or destroyed. Detached capture
+ * destruction never dereferences the source. The capture allocates exactly
  * `max_record_bytes - 10` bytes of reusable payload scratch and never stages a
  * complete snapshot.
  */
@@ -332,7 +333,9 @@ GHOSTTY_API GhosttyResult ghostty_snapshot_capture_detach(
  * bytes and carries a typed tombstone; no FINISH can be produced afterward.
  * The terminal is borrowed immutably only for this synchronous call and may be
  * mutated between calls. It must be the original still-live terminal passed to
- * ghostty_snapshot_capture_new.
+ * ghostty_snapshot_capture_new. Every terminal receives a non-address identity;
+ * a replacement terminal is reported as WRONG_TERMINAL even if its allocation
+ * reuses the original address.
  */
 GHOSTTY_API GhosttyResult ghostty_snapshot_capture_next_history(
     GhosttySnapshotCapture capture,
