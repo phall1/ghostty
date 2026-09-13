@@ -4422,6 +4422,60 @@ test "Terminal: resize rejects zero dimensions before mutation" {
     try testing.expect(!t.flags.dirty.clear);
 }
 
+test "Terminal: interleaved reflow resize storm preserves storage" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{
+        .cols = 80,
+        .rows = 24,
+        .max_scrollback_lines = 100,
+    });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+
+    for (0..50) |i| {
+        var line: [64]u8 = undefined;
+        const value = try std.fmt.bufPrint(
+            &line,
+            "row-{d}-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n",
+            .{i},
+        );
+        stream.nextSlice(value);
+    }
+
+    const storm = [_][2]size.CellCountInt{
+        .{ 1, 1 },
+        .{ 1, 1 },
+        .{ 1, 200 },
+        .{ 200, 1 },
+        .{ 1, 1 },
+        .{ 1000, 1000 },
+        .{ 1, 1 },
+        .{ 3, 3 },
+        .{ 2, 2 },
+        .{ 1, 1 },
+        .{ 100, 30 },
+    };
+    for (storm) |dimensions| {
+        for (0..8) |i| {
+            var line: [64]u8 = undefined;
+            const value = try std.fmt.bufPrint(
+                &line,
+                "interleave-{d}-bbbbbbbbbbbbbbbbbbbbbbbbbbbb\r\n",
+                .{i},
+            );
+            stream.nextSlice(value);
+        }
+        try t.resize(alloc, .{
+            .cols = dimensions[0],
+            .rows = dimensions[1],
+        });
+    }
+
+    try testing.expectEqual(@as(size.CellCountInt, 100), t.cols);
+    try testing.expectEqual(@as(size.CellCountInt, 30), t.rows);
+}
+
 test "Terminal: resize preserves pixel dimensions when omitted" {
     const alloc = testing.allocator;
     const io_impl = testing.io;
