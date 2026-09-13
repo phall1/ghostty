@@ -133,6 +133,8 @@ pub const EncodeError = Allocator.Error ||
     error{
         /// The complete historical prefix has more pages than the header fits.
         PageCountOverflow,
+        /// The detached cut exceeds the caller-selected page budget.
+        PageLimitExceeded,
     };
 
 /// Incremental encoder for one HISTORY record and its PAGE sequence.
@@ -217,6 +219,216 @@ pub const Encoder = struct {
         try page.encode(preserved.page(), destination);
         self.next_node = current.prev;
         self.remaining_pages -= 1;
+    }
+};
+
+/// Why a detached point-in-time history cut can no longer be encoded.
+pub const Invalidation = enum {
+    reset,
+    resize,
+    mutation,
+    evicted,
+};
+
+/// One bounded step while scanning or encoding a detached history cut.
+pub const CutEvent = union(enum) {
+    scan,
+    record,
+    page: struct {
+        rows: usize,
+        remaining: u32,
+    },
+    done,
+    invalidated: Invalidation,
+};
+
+/// O(1)-storage cursor over the complete cold-page prefix present at READY.
+///
+/// The cursor traverses twice: first one node per call to determine the v1
+/// HISTORY page count, then one node per call to encode newest-to-oldest.
+/// Removal and structural generations are checked before a stored node pointer
+/// is dereferenced; the node's serial then validates in-place identity.
+pub const Cut = struct {
+    const Node = TerminalPageList.List.Node;
+    const NodeRef = struct {
+        node: *Node,
+        serial: u64,
+    };
+    const Phase = enum { scan, header, pages, done, invalidated };
+
+    key: TerminalScreenKey,
+    newest: ?NodeRef,
+    current: ?NodeRef,
+    serial_ceiling: u64,
+    history_revision: u64,
+    eviction_revision: u64,
+    expected_rows: usize,
+    scanned_rows: usize = 0,
+    page_count: u32 = 0,
+    remaining: u32 = 0,
+    cols: usize,
+    active_rows: usize,
+    phase: Phase = .scan,
+
+    /// Capture the cold-prefix boundary without traversing history.
+    pub fn init(
+        terminal_screen: *const TerminalScreen,
+        key: TerminalScreenKey,
+    ) Cut {
+        const active = terminal_screen.pages.getTopLeft(.active);
+        const newest = if (active.node.prev) |node|
+            NodeRef{ .node = node, .serial = node.serial }
+        else
+            null;
+        const history_rows = terminal_screen.pages.total_rows - terminal_screen.pages.rows;
+        return .{
+            .key = key,
+            .newest = newest,
+            .current = newest,
+            .serial_ceiling = terminal_screen.pages.page_serial,
+            .history_revision = terminal_screen.pages.snapshot_history_revision,
+            .eviction_revision = terminal_screen.pages.snapshot_history_eviction_revision,
+            // Rows before active within its boundary page are already carried
+            // by SCREEN and must not be counted again as deferred history.
+            .expected_rows = history_rows - active.y,
+            .cols = terminal_screen.pages.cols,
+            .active_rows = terminal_screen.pages.rows,
+        };
+    }
+
+    pub fn finished(self: *const Cut) bool {
+        return self.phase == .done;
+    }
+
+    pub fn invalid(self: *const Cut) bool {
+        return self.phase == .invalidated;
+    }
+
+    fn invalidate(self: *Cut, reason: Invalidation) CutEvent {
+        self.phase = .invalidated;
+        return .{ .invalidated = reason };
+    }
+
+    /// Validate one saved node identity without dereferencing stale storage.
+    fn validate(
+        self: *const Cut,
+        terminal_screen: *const TerminalScreen,
+        ref: NodeRef,
+    ) ?Invalidation {
+        if (terminal_screen.pages.cols != self.cols or
+            terminal_screen.pages.rows != self.active_rows) return .resize;
+        if (ref.serial < terminal_screen.pages.page_serial_epoch) return .reset;
+        // Any removal can free this pointer, so reject it before dereference.
+        // Non-append insertion/relinking changes the saved predecessor chain
+        // and is tracked separately. In-place page mutation keeps allocation
+        // alive and is detected by the node's own serial below. This avoids
+        // invalidating a cold cut for ordinary mutations in the active suffix.
+        if (terminal_screen.pages.snapshot_history_eviction_revision != self.eviction_revision)
+            return .evicted;
+        if (terminal_screen.pages.snapshot_history_revision != self.history_revision)
+            return .mutation;
+        if (ref.serial >= self.serial_ceiling or ref.node.serial != ref.serial)
+            return .mutation;
+        return null;
+    }
+
+    fn nextRef(node: *Node) ?NodeRef {
+        return if (node.prev) |prev|
+            .{ .node = prev, .serial = prev.serial }
+        else
+            null;
+    }
+
+    fn nextScan(
+        self: *Cut,
+        terminal_screen: *const TerminalScreen,
+        max_pages: usize,
+    ) EncodeError!CutEvent {
+        const ref = self.current orelse {
+            if (self.scanned_rows != self.expected_rows)
+                return self.invalidate(.evicted);
+            self.current = self.newest;
+            self.remaining = self.page_count;
+            self.phase = .header;
+            return .scan;
+        };
+        if (self.validate(terminal_screen, ref)) |reason|
+            return self.invalidate(reason);
+        if (self.page_count >= max_pages) return error.PageLimitExceeded;
+
+        self.scanned_rows = std.math.add(
+            usize,
+            self.scanned_rows,
+            ref.node.rows(),
+        ) catch return error.PageCountOverflow;
+        self.page_count = std.math.add(
+            u32,
+            self.page_count,
+            1,
+        ) catch return error.PageCountOverflow;
+        self.current = nextRef(ref.node);
+        return .scan;
+    }
+
+    fn nextHeader(
+        self: *Cut,
+        destination: *record.Writer,
+    ) EncodeError!CutEvent {
+        const payload = destination.begin(.history);
+        errdefer destination.cancel();
+        try (Header{
+            .key = self.key,
+            .page_count = self.page_count,
+        }).encode(payload);
+        try destination.finish();
+        self.phase = if (self.current == null) .done else .pages;
+        return .record;
+    }
+
+    fn nextPage(
+        self: *Cut,
+        terminal_screen: *const TerminalScreen,
+        destination: *record.Writer,
+    ) EncodeError!CutEvent {
+        const ref = self.current.?;
+        if (self.validate(terminal_screen, ref)) |reason|
+            return self.invalidate(reason);
+
+        const rows = ref.node.rows();
+        var preserved = try ref.node.pagePreservingState(terminal_screen.alloc);
+        defer preserved.deinit();
+        try page.encode(preserved.page(), destination);
+        self.current = nextRef(ref.node);
+        self.remaining -= 1;
+        if (self.remaining == 0) self.phase = .done;
+        return .{ .page = .{
+            .rows = rows,
+            .remaining = self.remaining,
+        } };
+    }
+
+    /// Perform one bounded scan/record step against the current source screen.
+    pub fn next(
+        self: *Cut,
+        terminal_screen: *const TerminalScreen,
+        destination: *record.Writer,
+        max_pages: usize,
+    ) EncodeError!CutEvent {
+        if (terminal_screen.pages.cols != self.cols or
+            terminal_screen.pages.rows != self.active_rows)
+            return self.invalidate(.resize);
+
+        return switch (self.phase) {
+            .scan => self.nextScan(terminal_screen, max_pages),
+            .header => self.nextHeader(destination),
+            .pages => self.nextPage(terminal_screen, destination),
+            .done => return .done,
+            .invalidated => unreachable,
+        };
+    }
+
+    pub fn pages(self: *const Cut) u32 {
+        return self.page_count;
     }
 };
 
