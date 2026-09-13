@@ -238,50 +238,81 @@ pub const EncodeError = Allocator.Error || PayloadEncodeError || page.EncodeErro
     PageCountOverflow,
 };
 
+/// Incremental encoder for one SCREEN record and its PAGE sequence.
+///
+/// Each call to `next` emits exactly one complete record. The source Screen
+/// must not be mutated until `finished` becomes true.
+pub const Encoder = struct {
+    screen: *const TerminalScreen,
+    key: TerminalScreenKey,
+    next_node: ?*TerminalPageList.List.Node,
+    page_count: u16,
+    header_pending: bool = true,
+
+    pub fn init(
+        terminal_screen: *const TerminalScreen,
+        key: TerminalScreenKey,
+    ) EncodeError!Encoder {
+        const first = terminal_screen.pages.getTopLeft(.active).node;
+        var page_count: usize = 0;
+        var node: ?*TerminalPageList.List.Node = first;
+        while (node) |current| : (node = current.next) page_count += 1;
+
+        return .{
+            .screen = terminal_screen,
+            .key = key,
+            .next_node = first,
+            .page_count = std.math.cast(
+                u16,
+                page_count,
+            ) orelse return error.PageCountOverflow,
+        };
+    }
+
+    pub fn finished(self: *const Encoder) bool {
+        return !self.header_pending and self.next_node == null;
+    }
+
+    /// Emit the next complete record in this sequence.
+    pub fn next(
+        self: *Encoder,
+        destination: *record.Writer,
+    ) EncodeError!void {
+        std.debug.assert(!self.finished());
+
+        if (self.header_pending) {
+            const payload = destination.begin(.screen);
+            errdefer destination.cancel();
+            try encodePayload(
+                self.screen,
+                self.key,
+                self.page_count,
+                payload,
+            );
+            try destination.finish();
+            self.header_pending = false;
+            return;
+        }
+
+        const current = self.next_node.?;
+        std.debug.assert(current.pageIfResident() != null);
+        try page.encode(current.pageAssumeResident(), destination);
+        self.next_node = current.next;
+    }
+};
+
 /// Encode one SCREEN and its minimal suffix of complete native pages.
 ///
 /// The suffix begins with the page containing the active area's first row and
 /// ends with the newest page. Completed records may already be emitted if a
 /// later record fails; the missing READY checkpoint makes that prefix invalid.
 pub fn encode(
-    screen: *const TerminalScreen,
+    terminal_screen: *const TerminalScreen,
     key: TerminalScreenKey,
     destination: *record.Writer,
 ) EncodeError!void {
-    // The active top may fall inside this page, leaving an incidental history
-    // prefix. Every earlier complete page is history and is omitted.
-    const first = screen.pages.getTopLeft(.active).node;
-    var page_count: usize = 0;
-    var node: ?@TypeOf(first) = first;
-    while (node) |current| : (node = current.next) page_count += 1;
-    const encoded_page_count = std.math.cast(
-        u16,
-        page_count,
-    ) orelse return error.PageCountOverflow;
-
-    // SCREEN declares exactly how many immediately following PAGE records
-    // belong to it.
-    {
-        const payload = destination.begin(.screen);
-        errdefer destination.cancel();
-        try encodePayload(
-            screen,
-            key,
-            encoded_page_count,
-            payload,
-        );
-        try destination.finish();
-    }
-
-    // Active pages are resident today, but use the representation-safe access
-    // path so a future PageList compression-policy change cannot turn this
-    // wire encoder's optimization invariant into undefined behavior.
-    node = first;
-    while (node) |current| : (node = current.next) {
-        var preserved = try current.pagePreservingState(screen.alloc);
-        defer preserved.deinit();
-        try page.encode(preserved.page(), destination);
-    }
+    var encoder = try Encoder.init(terminal_screen, key);
+    while (!encoder.finished()) try encoder.next(destination);
 }
 
 /// Errors possible while restoring a SCREEN and its declared PAGE sequence.

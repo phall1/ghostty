@@ -221,6 +221,9 @@ pub const terminal_grid_ref_track = terminal.grid_ref_track;
 pub const terminal_point_from_grid_ref = terminal.point_from_grid_ref;
 
 pub const snapshot_encode = snapshot.encode;
+pub const snapshot_capture_new = snapshot.capture_new;
+pub const snapshot_capture_next = snapshot.capture_next;
+pub const snapshot_capture_free = snapshot.capture_free;
 pub const snapshot_encode_buf = snapshot.encode_buf;
 pub const snapshot_encode_alloc = snapshot.encode_alloc;
 pub const snapshot_decoder_new = snapshot.decoder_new;

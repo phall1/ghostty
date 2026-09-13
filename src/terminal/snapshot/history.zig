@@ -135,56 +135,100 @@ pub const EncodeError = Allocator.Error ||
         PageCountOverflow,
     };
 
-/// Encode one screen's HISTORY and its complete historical pages.
+/// Incremental encoder for one HISTORY record and its PAGE sequence.
 ///
-/// Pages are encoded newest-to-oldest. Compressed source pages are inspected
-/// without changing their storage state. Completed records may already be
-/// emitted if a later page fails.
+/// Each call to `next` emits one complete record. Pages are emitted
+/// newest-to-oldest so a decoder can prepend each page immediately.
+pub const Encoder = struct {
+    terminal_screen: *const TerminalScreen,
+    key: TerminalScreenKey,
+    next_node: ?*TerminalPageList.List.Node,
+    page_count: u32,
+    remaining_pages: u32,
+    header_pending: bool = true,
+
+    pub fn init(
+        terminal_screen: *const TerminalScreen,
+        key: TerminalScreenKey,
+    ) EncodeError!Encoder {
+        const first = terminal_screen.pages.getTopLeft(.active).node.prev;
+        var page_count: usize = 0;
+        var node = first;
+        while (node) |current| : (node = current.prev) page_count += 1;
+
+        return .{
+            .terminal_screen = terminal_screen,
+            .key = key,
+            .next_node = first,
+            .page_count = std.math.cast(
+                u32,
+                page_count,
+            ) orelse return error.PageCountOverflow,
+            .remaining_pages = @intCast(page_count),
+        };
+    }
+
+    pub fn finished(self: *const Encoder) bool {
+        return !self.header_pending and self.next_node == null;
+    }
+
+    pub fn headerPending(self: *const Encoder) bool {
+        return self.header_pending;
+    }
+
+    pub fn screenKey(self: *const Encoder) TerminalScreenKey {
+        return self.key;
+    }
+
+    pub fn nextRows(self: *const Encoder) usize {
+        const node = self.next_node orelse return 0;
+        return node.rows();
+    }
+
+    pub fn remaining(self: *const Encoder) u32 {
+        return self.remaining_pages;
+    }
+
+    /// Emit the next complete record in the sequence.
+    pub fn next(
+        self: *Encoder,
+        destination: *record.Writer,
+    ) EncodeError!void {
+        std.debug.assert(!self.finished());
+
+        if (self.header_pending) {
+            const payload = destination.begin(.history);
+            errdefer destination.cancel();
+            const header: Header = .{
+                .key = self.key,
+                .page_count = self.page_count,
+            };
+            try header.encode(payload);
+            try destination.finish();
+            self.header_pending = false;
+            return;
+        }
+
+        const current = self.next_node.?;
+        var preserved = try current.pagePreservingState(
+            self.terminal_screen.alloc,
+        );
+        defer preserved.deinit();
+        try page.encode(preserved.page(), destination);
+        self.next_node = current.prev;
+        self.remaining_pages -= 1;
+    }
+};
+
+/// Encode one screen's HISTORY and its complete historical pages.
 pub fn encode(
     terminal_screen: *const TerminalScreen,
     key: TerminalScreenKey,
     destination: *record.Writer,
 ) EncodeError!void {
-    // SCREEN begins at the page containing the active area's first row. Its
-    // leading rows are already resident; every previous complete page belongs
-    // to this HISTORY sequence.
-    const first = terminal_screen.pages.getTopLeft(.active).node.prev;
-    const page_count: usize = count: {
-        var page_count: usize = 0;
-        var node = first;
-        while (node) |current| : (node = current.prev) {
-            page_count += 1;
-        }
-        break :count page_count;
-    };
-
-    const header: Header = .{
-        .key = key,
-        .page_count = std.math.cast(
-            u32,
-            page_count,
-        ) orelse return error.PageCountOverflow,
-    };
-
-    // HISTORY declares exactly how many PAGE records follow.
-    {
-        const payload = destination.begin(.history);
-        errdefer destination.cancel();
-        try header.encode(payload);
-        try destination.finish();
-    }
-
-    // Walk backward so each page can be prepended by the decoder immediately.
-    // PreservedPage borrows resident pages and clones compressed pages without
-    // changing the source node's representation.
-    var node = first;
-    while (node) |current| : (node = current.prev) {
-        var preserved = try current.pagePreservingState(terminal_screen.alloc);
-        defer preserved.deinit();
-        try page.encode(preserved.page(), destination);
-    }
+    var encoder = try Encoder.init(terminal_screen, key);
+    while (!encoder.finished()) try encoder.next(destination);
 }
-
 /// Errors possible while restoring one HISTORY and its PAGE sequence.
 pub const DecodeError = Decoder.InitError ||
     Decoder.RestoreError ||
