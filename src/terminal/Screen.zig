@@ -813,6 +813,20 @@ pub fn cursorCellEndOfPrev(self: *Screen) *pagepkg.Cell {
     return page_rac.cell;
 }
 
+/// If the previous row ends with a spacer_head for a wide glyph that
+/// wrapped onto this row, convert it to a narrow cell and mark that
+/// row dirty so a pooled RenderState copies the rewrite.
+pub fn narrowPrevWrapSpacerHead(self: *Screen) void {
+    assert(self.cursor.y > 0);
+    var page_pin = self.cursor.page_pin.up(1).?;
+    page_pin.x = page_pin.node.cols() - 1;
+    const page_rac = page_pin.rowAndCell();
+    if (page_rac.cell.wide == .spacer_head) {
+        page_rac.cell.wide = .narrow;
+        page_rac.row.dirty = true;
+    }
+}
+
 /// Move the cursor right. This is a specialized function that is very fast
 /// if the caller can guarantee we have space to move right (no wrapping).
 pub fn cursorRight(self: *Screen, n: size.CellCountInt) void {
