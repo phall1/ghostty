@@ -1698,8 +1698,7 @@ fn printCell(
                 // at the end of that row. Clear it so the previous row
                 // doesn't keep a stale spacer_head.
                 if (self.screens.active.cursor.y > 0 and self.screens.active.cursor.x <= 1) {
-                    const head_cell = self.screens.active.cursorCellEndOfPrev();
-                    if (head_cell.wide == .spacer_head) head_cell.wide = .narrow;
+                    self.screens.active.narrowPrevWrapSpacerHead();
                 }
             },
 
@@ -1723,8 +1722,7 @@ fn printCell(
                 // at the end of that row. Clear it so the previous row
                 // doesn't keep a stale spacer_head.
                 if (self.screens.active.cursor.y > 0 and self.screens.active.cursor.x <= 1) {
-                    const head_cell = self.screens.active.cursorCellEndOfPrev();
-                    if (head_cell.wide == .spacer_head) head_cell.wide = .narrow;
+                    self.screens.active.narrowPrevWrapSpacerHead();
                 }
             },
 
@@ -10064,6 +10062,34 @@ test "Terminal: eraseChars clearing wrapped wide char marks spacer head row dirt
     try testing.expect(t.isDirty(.{ .screen = .{ .x = 0, .y = 1 } }));
     try testing.expect(!t.isDirty(.{ .screen = .{ .x = 0, .y = 2 } }));
 
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 4, .y = 0 } }).?;
+        try testing.expectEqual(Cell.Wide.narrow, list_cell.cell.wide);
+    }
+}
+
+test "Terminal: print over wrapped wide char marks spacer head row dirty" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .rows = 3, .cols = 5 });
+    defer t.deinit(alloc);
+
+    // The wide char doesn't fit so it wraps, leaving a spacer head at
+    // the end of the first row.
+    try t.printString("ABCD\u{5B57}");
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 4, .y = 0 } }).?;
+        try testing.expectEqual(Cell.Wide.spacer_head, list_cell.cell.wide);
+    }
+
+    // Overwrite the wrapped wide char with a narrow one. printCell narrows
+    // the stale spacer head on the previous row, which must mark it dirty.
+    t.setCursorPos(2, 1);
+    t.clearDirty();
+    try t.print('X');
+
+    try testing.expect(t.isDirty(.{ .screen = .{ .x = 0, .y = 0 } }));
+    try testing.expect(t.isDirty(.{ .screen = .{ .x = 0, .y = 1 } }));
     {
         const list_cell = t.screens.active.pages.getCell(.{ .screen = .{ .x = 4, .y = 0 } }).?;
         try testing.expectEqual(Cell.Wide.narrow, list_cell.cell.wide);
