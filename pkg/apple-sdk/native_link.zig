@@ -29,9 +29,15 @@ pub fn addCommand(
 ) !*RunStep {
     if (!available(target)) return error.AppleNativeLinkerUnavailable;
 
+    // The xcrun on PATH, so a build that supplies its own toolchain (such
+    // as Nix's xcbuild, which resolves the SDK from DEVELOPER_DIR) links
+    // without the host's Xcode. A stock Mac finds /usr/bin/xcrun either way.
+    const xcrun = b.findProgram(&.{"xcrun"}, &.{"/usr/bin"}) catch
+        "/usr/bin/xcrun";
+
     const run = RunStep.create(b, name);
     run.addArgs(&.{
-        "/usr/bin/xcrun",
+        xcrun,
         "--sdk",
         try sdkName(target),
         "clang",
