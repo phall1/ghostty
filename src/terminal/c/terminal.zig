@@ -45,7 +45,33 @@ const log = std.log.scoped(.terminal_c);
 
 /// Process-unique identities prevent detached consumers from accepting a new
 /// terminal whose wrapper happens to reuse the original allocation address.
-var next_identity: std.atomic.Value(u64) = .init(1);
+var identity_counter: IdentityCounter = .{};
+
+/// Backing implementation for terminal identities, starting at 1. Like the
+/// kitty graphics generation counter, this is a lock-free atomic counter
+/// where the target supports 64-bit atomics and a mutex-protected counter
+/// otherwise (e.g. wasm32-freestanding, 32-bit ARM). The pointer-width check
+/// is a conservative proxy for 64-bit atomic support. Terminal construction
+/// is a cold path, so the mutex cost is irrelevant.
+const IdentityCounter = if (@bitSizeOf(usize) >= 64) struct {
+    value: std.atomic.Value(u64) = .init(1),
+
+    fn next(self: *@This(), io: std.Io) u64 {
+        _ = io;
+        return self.value.fetchAdd(1, .monotonic);
+    }
+} else struct {
+    mutex: std.Io.Mutex = .init,
+    value: u64 = 1,
+
+    fn next(self: *@This(), io: std.Io) u64 {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const identity = self.value;
+        self.value += 1;
+        return identity;
+    }
+};
 
 /// C terminals do not retain replay bytes unless the embedding application
 /// opts in through `GHOSTTY_TERMINAL_OPT_CONTINUATION_MAX_BYTES`.
@@ -890,7 +916,7 @@ fn wrap(
     };
 
     wrapper.* = .{
-        .identity = next_identity.fetchAdd(1, .monotonic),
+        .identity = identity_counter.next(io.io()),
         .terminal = t,
         .io = io,
         .terminfo_name_buf = undefined,
