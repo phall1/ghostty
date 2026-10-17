@@ -13,7 +13,6 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const size = @import("size.zig");
 const PageList = @import("PageList.zig");
-const PageChunk = PageList.PageIterator.Chunk;
 const Pin = PageList.Pin;
 const Screen = @import("Screen.zig");
 
@@ -143,7 +142,7 @@ pub const Flattened = struct {
         start: Pin,
         end: Pin,
     ) Allocator.Error!Flattened {
-        var result: std.MultiArrayList(PageChunk) = .empty;
+        var result: std.MultiArrayList(Chunk) = .empty;
         errdefer result.deinit(alloc);
         var it = start.pageIterator(.right_down, end);
         while (it.next()) |chunk| try result.append(alloc, .{
@@ -155,7 +154,7 @@ pub const Flattened = struct {
         return .{
             .chunks = result,
             .top_x = start.x,
-            .end_x = end.x,
+            .bot_x = end.x,
         };
     }
 
@@ -211,3 +210,73 @@ pub const Flattened = struct {
         };
     }
 };
+
+test "Flattened init single page" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try PageList.init(alloc, .{ .cols = 10, .rows = 10 });
+    defer s.deinit();
+
+    const start = s.pin(.{ .active = .{ .x = 2, .y = 1 } }).?;
+    const end = s.pin(.{ .active = .{ .x = 7, .y = 4 } }).?;
+
+    var hl: Flattened = try .init(alloc, start, end);
+    defer hl.deinit(alloc);
+
+    // A single page highlight is a single chunk covering rows [1, 5).
+    try testing.expectEqual(@as(usize, 1), hl.chunks.len);
+    const slice = hl.chunks.slice();
+    try testing.expectEqual(start.node, slice.items(.node)[0]);
+    try testing.expectEqual(start.node.serial, slice.items(.serial)[0]);
+    try testing.expectEqual(@as(size.CellCountInt, 1), slice.items(.start)[0]);
+    try testing.expectEqual(@as(size.CellCountInt, 5), slice.items(.end)[0]);
+
+    // The x bounds must round-trip. `bot_x` is the field the rest of this
+    // struct reads (clone, endPin, untracked), so init must populate it.
+    try testing.expectEqual(@as(size.CellCountInt, 2), hl.top_x);
+    try testing.expectEqual(@as(size.CellCountInt, 7), hl.bot_x);
+
+    try testing.expect(hl.startPin().eql(start));
+    try testing.expect(hl.endPin().eql(end));
+
+    const ut = hl.untracked();
+    try testing.expect(ut.start.eql(start));
+    try testing.expect(ut.end.eql(end));
+
+    // A clone must preserve both bounds.
+    var cloned = try hl.clone(alloc);
+    defer cloned.deinit(alloc);
+    try testing.expectEqual(hl.top_x, cloned.top_x);
+    try testing.expectEqual(hl.bot_x, cloned.bot_x);
+    try testing.expect(cloned.untracked().eql(ut));
+}
+
+test "Flattened init across pages" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try PageList.init(alloc, .{ .cols = 10, .rows = 10 });
+    defer s.deinit();
+
+    // Grow until we have at least two pages so the iterator yields
+    // more than one chunk.
+    while (s.pages.first == s.pages.last) _ = try s.grow();
+
+    var start = s.getTopLeft(.screen);
+    start.x = 3;
+    var end = s.getBottomRight(.screen).?;
+    end.x = 6;
+    try testing.expect(start.node != end.node);
+
+    var hl: Flattened = try .init(alloc, start, end);
+    defer hl.deinit(alloc);
+
+    try testing.expect(hl.chunks.len > 1);
+    try testing.expectEqual(@as(size.CellCountInt, 3), hl.top_x);
+    try testing.expectEqual(@as(size.CellCountInt, 6), hl.bot_x);
+
+    const ut = hl.untracked();
+    try testing.expect(ut.start.eql(start));
+    try testing.expect(ut.end.eql(end));
+}
