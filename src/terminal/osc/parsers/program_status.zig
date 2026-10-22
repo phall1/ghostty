@@ -356,7 +356,14 @@ fn validate(data: []const u8) error{
 
     // Every value is checked against its limit, even one a later pair
     // replaces, because any limit violation discards the whole report.
-    var ids: kitty_metadata.ValueIterator("id", value_bytes) = .init(data);
+    //
+    // Ids are read without the value alphabet. A pair like `id=a@b` or
+    // `id=my task` is malformed, but skipping it like other malformed
+    // pairs would leave a report with no id, which addresses the root
+    // record, and `state=clear` without an id removes every record. The
+    // specification ignores a report whose id doesn't match the grammar
+    // so that a malformed id can never fall back to the root record.
+    var ids: kitty_metadata.ValueIterator("id", null) = .init(data);
     while (ids.next()) |v| try validateId(v);
     inline for (.{
         .{ "app", max_app_bytes },
@@ -665,6 +672,13 @@ test "OSC 7501: ids" {
         "a//b",
         "a,b",
         "a=b",
+        // Bytes outside the value alphabet. Skipping the pair instead
+        // would address the root record.
+        "a@b",
+        "my task",
+        "a;b",
+        "caf\xc3\xa9",
+        "a\x00b",
         max_segment ++ "a",
         "a/b/c/d/e/f/g/h/i",
         ("a" ** 31 ++ "/") ** 4 ++ "a",
@@ -675,6 +689,35 @@ test "OSC 7501: ids" {
         p.nextSlice(id);
         try testing.expect(p.end('\x1b') == null);
     }
+}
+
+test "OSC 7501: a malformed id discards the whole report" {
+    const testing = std.testing;
+
+    var p: Parser = .init(testing.allocator);
+    defer p.deinit();
+
+    // Skipping the malformed id pair would leave a clear without an id,
+    // which removes every record.
+    const cases = [_][]const u8{
+        "7501;state=clear:id=a@b",
+        "7501;state=clear:id=my task",
+        "7501;state=working:app=cargo:id=a@b:progress=40",
+        // Even when another id pair is valid, before or after it.
+        "7501;state=clear:id=ok:id=a@b",
+        "7501;state=clear:id=a@b:id=ok",
+    };
+    for (cases) |input| {
+        p.reset();
+        p.nextSlice(input);
+        try testing.expect(p.end('\x1b') == null);
+    }
+
+    // A pair that only looks like an id is still just malformed.
+    p.reset();
+    p.nextSlice("7501;state=clear:id:ids=a@b");
+    const report = p.end('\x1b').?.program_status.report;
+    try testing.expect(report.readOption(.id) == null);
 }
 
 test "OSC 7501: text must decode to safe UTF-8" {
