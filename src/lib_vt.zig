@@ -398,6 +398,7 @@ comptime {
         if (features.kitty_graphics) {
             @export(&c.kitty_graphics_get, .{ .name = "ghostty_kitty_graphics_get" });
             @export(&c.kitty_graphics_image, .{ .name = "ghostty_kitty_graphics_image" });
+            @export(&c.kitty_graphics_image_ids, .{ .name = "ghostty_kitty_graphics_image_ids" });
             @export(&c.kitty_graphics_image_get, .{ .name = "ghostty_kitty_graphics_image_get" });
             @export(&c.kitty_graphics_image_get_multi, .{ .name = "ghostty_kitty_graphics_image_get_multi" });
             @export(&c.kitty_graphics_placement_iterator_new, .{ .name = "ghostty_kitty_graphics_placement_iterator_new" });

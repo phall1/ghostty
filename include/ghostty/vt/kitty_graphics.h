@@ -507,6 +507,33 @@ GHOSTTY_API GhosttyResult ghostty_kitty_graphics_get(
     void* out);
 
 /**
+ * Copy the IDs of all stored Kitty graphics images, including images without
+ * placements. The order is unspecified.
+ *
+ * This function does not allocate. On GHOSTTY_OUT_OF_SPACE, no IDs are written
+ * and out_len receives the required capacity. Pass NULL and zero capacity to
+ * query that count; an empty storage returns GHOSTTY_SUCCESS. The terminal must
+ * not be mutated between the size query and the copy.
+ *
+ * Returns GHOSTTY_NO_VALUE when Kitty graphics are disabled at build time,
+ * with out_len set to zero.
+ *
+ * @param graphics The kitty graphics handle
+ * @param ids Output array, or NULL for a zero-capacity size query
+ * @param capacity Capacity of ids, in uint32_t elements
+ * @param[out] out_len Required count, also the number written on success
+ * @return GHOSTTY_SUCCESS on success, GHOSTTY_OUT_OF_SPACE if capacity is too
+ * small, or GHOSTTY_INVALID_VALUE if ids is NULL with sufficient nonzero capacity
+ *
+ * @ingroup kitty_graphics
+ */
+GHOSTTY_API GhosttyResult ghostty_kitty_graphics_image_ids(
+    GhosttyKittyGraphics graphics,
+    uint32_t* ids,
+    size_t capacity,
+    size_t* out_len);
+
+/**
  * Look up a Kitty graphics image by its image ID.
  *
  * Returns NULL if no image with the given ID exists or if Kitty graphics

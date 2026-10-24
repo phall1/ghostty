@@ -14,6 +14,7 @@ pub const io = @import("io.zig");
 pub const kitty_graphics = @import("kitty_graphics.zig");
 pub const kitty_graphics_get = kitty_graphics.get;
 pub const kitty_graphics_image = kitty_graphics.image_get_handle;
+pub const kitty_graphics_image_ids = kitty_graphics.image_ids;
 pub const kitty_graphics_image_get = kitty_graphics.image_get;
 pub const kitty_graphics_image_get_multi = kitty_graphics.image_get_multi;
 pub const kitty_graphics_placement_iterator_new = kitty_graphics.placement_iterator_new;

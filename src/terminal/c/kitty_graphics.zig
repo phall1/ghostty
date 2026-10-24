@@ -137,6 +137,29 @@ fn getTyped(
     return .success;
 }
 
+/// Copy every stored image ID, even when no placement references the image.
+/// A size query or undersized output never partially writes the destination.
+pub fn image_ids(
+    graphics_: KittyGraphics,
+    ids: ?[*]u32,
+    capacity: usize,
+    out_len: *usize,
+) callconv(lib.calling_conv) Result {
+    out_len.* = 0;
+    if (comptime !build_options.kitty_graphics) return .no_value;
+
+    const count = graphics_.images.count();
+    out_len.* = count;
+    if (capacity < count) return .out_of_space;
+    if (count == 0) return .success;
+    const output = ids orelse return .invalid_value;
+
+    var it = graphics_.images.keyIterator();
+    var index: usize = 0;
+    while (it.next()) |id| : (index += 1) output[index] = id.*;
+    return .success;
+}
+
 /// C: GhosttyKittyPlacementLayer
 pub const PlacementLayer = enum(c_int) {
     all = 0,
@@ -666,6 +689,58 @@ fn computeViewportPos(
         right_col > 0 and vp_col < @as(i32, t.cols);
 
     return .{ .col = vp_col, .row = vp_row, .visible = visible };
+}
+
+test "image_ids includes unplaced images and respects output bounds" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var t: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &t,
+        10,
+        5,
+    ));
+    defer terminal_c.free(t);
+
+    var graphics: KittyGraphics = undefined;
+    try testing.expectEqual(Result.success, terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)));
+    var count: usize = 99;
+    try testing.expectEqual(Result.success, image_ids(graphics, null, 0, &count));
+    try testing.expectEqual(@as(usize, 0), count);
+
+    // Two payloads without placements and one Unicode-placeholder placement.
+    const commands =
+        "\x1b_Ga=t,f=32,s=1,v=1,i=1,q=2;AAECAw==\x1b\\" ++
+        "\x1b_Ga=t,f=32,s=1,v=1,i=7,q=2;AAECAw==\x1b\\" ++
+        "\x1b_Ga=T,f=32,s=1,v=1,i=10,p=1,U=1,c=1,r=1,q=2;AAECAw==\x1b\\";
+    terminal_c.vt_write(t, commands.ptr, commands.len);
+
+    try testing.expectEqual(Result.out_of_space, image_ids(graphics, null, 0, &count));
+    try testing.expectEqual(@as(usize, 3), count);
+    var output = [_]u32{ 99, 99, 99, 99 };
+    try testing.expectEqual(Result.out_of_space, image_ids(graphics, &output, 2, &count));
+    try testing.expectEqual(@as(usize, 3), count);
+    try testing.expectEqualSlices(u32, &.{ 99, 99, 99, 99 }, &output);
+    try testing.expectEqual(Result.invalid_value, image_ids(graphics, null, 3, &count));
+
+    try testing.expectEqual(Result.success, image_ids(graphics, &output, 3, &count));
+    try testing.expectEqual(@as(usize, 3), count);
+    try testing.expectEqual(@as(u32, 99), output[3]);
+    for ([_]u32{ 1, 7, 10 }) |id| {
+        try testing.expect(std.mem.indexOfScalar(u32, output[0..count], id) != null);
+    }
+
+    const deletion = "\x1b_Ga=d,d=I,i=7,q=2;\x1b\\";
+    terminal_c.vt_write(t, deletion.ptr, deletion.len);
+    try testing.expectEqual(Result.success, image_ids(graphics, &output, output.len, &count));
+    try testing.expectEqual(@as(usize, 2), count);
+    try testing.expect(std.mem.indexOfScalar(u32, output[0..count], 7) == null);
+
+    const clear = "\x1b_Ga=d,d=R,x=1,y=4294967295,q=2;\x1b\\";
+    terminal_c.vt_write(t, clear.ptr, clear.len);
+    try testing.expectEqual(Result.success, image_ids(graphics, null, 0, &count));
+    try testing.expectEqual(@as(usize, 0), count);
 }
 
 test "placement_iterator new/free" {
