@@ -260,6 +260,14 @@ typedef enum GHOSTTY_ENUM_TYPED {
    */
   GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_Z = 12,
 
+  /** Whether an unspecified Unicode placeholder placement ID selects this
+   * placement. Output type: bool. */
+  GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_IS_PLACEHOLDER_DEFAULT = 13,
+
+  /** Whether the placement ID is client-specified rather than internal.
+   * Output type: bool. */
+  GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_IS_EXTERNAL = 14,
+
   GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyKittyGraphicsPlacementData;
 

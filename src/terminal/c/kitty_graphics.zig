@@ -44,6 +44,7 @@ const PlacementIteratorWrapper = if (build_options.kitty_graphics)
         alloc: std.mem.Allocator,
         inner: PlacementMap.Iterator = undefined,
         entry: ?PlacementMap.Entry = null,
+        storage: ?*kitty_storage.ImageStorage = null,
         layer_filter: PlacementLayer = .all,
     }
 else
@@ -79,12 +80,14 @@ pub const PlacementData = enum(c_int) {
     columns = 10,
     rows = 11,
     z = 12,
+    is_placeholder_default = 13,
+    is_external = 14,
 
     pub fn OutType(comptime self: PlacementData) type {
         return switch (self) {
             .invalid => void,
             .image_id, .placement_id => u32,
-            .is_virtual => bool,
+            .is_virtual, .is_placeholder_default, .is_external => bool,
             .x_offset,
             .y_offset,
             .source_x,
@@ -130,6 +133,7 @@ fn getTyped(
                 .alloc = it.alloc,
                 .inner = storage.placements.iterator(),
                 .layer_filter = it.layer_filter,
+                .storage = storage,
             };
         },
         .generation => out.* = storage.generation,
@@ -423,6 +427,12 @@ fn placementGetTyped(
         .image_id => out.* = key.image_id,
         .placement_id => out.* = key.placement_id.id,
         .is_virtual => out.* = val.location == .virtual,
+        .is_external => out.* = key.placement_id.tag == .external,
+        .is_placeholder_default => {
+            const storage = iter.storage orelse return .invalid_value;
+            const target = storage.placeholderTarget(key.image_id, 0);
+            out.* = if (target) |selected| kitty_storage.ImageStorage.PlacementKey.eql(selected.key, key.*) else false;
+        },
         .x_offset => out.* = val.x_offset,
         .y_offset => out.* = val.y_offset,
         .source_x => out.* = val.source_x,
@@ -741,6 +751,41 @@ test "image_ids includes unplaced images and respects output bounds" {
     terminal_c.vt_write(t, clear.ptr, clear.len);
     try testing.expectEqual(Result.success, image_ids(graphics, null, 0, &count));
     try testing.expectEqual(@as(usize, 0), count);
+}
+
+test "placement default preserves external preference over anonymous IDs" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    var t: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(&lib.alloc.test_allocator, &t, 10, 5));
+    defer terminal_c.free(t);
+    const commands = "\x1b_Ga=T,f=32,s=1,v=1,i=42,p=9,U=1,c=1,r=1,q=2;/wAA/w==\x1b\\" ++
+        "\x1b_Ga=p,i=42,p=2,U=1,c=1,r=1,q=2;\x1b\\" ++
+        "\x1b_Ga=p,i=42,U=1,c=1,r=1,q=2;\x1b\\";
+    terminal_c.vt_write(t, commands.ptr, commands.len);
+    var graphics: KittyGraphics = undefined;
+    try testing.expectEqual(Result.success, terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)));
+    var iter: PlacementIterator = null;
+    try testing.expectEqual(Result.success, placement_iterator_new(&lib.alloc.test_allocator, &iter));
+    defer placement_iterator_free(iter);
+    try testing.expectEqual(Result.success, get(graphics, .placement_iterator, @ptrCast(&iter)));
+    var defaults: usize = 0;
+    var count: usize = 0;
+    while (placement_iterator_next(iter)) {
+        count += 1;
+        var selected: bool = false;
+        try testing.expectEqual(Result.success, placement_get(iter, .is_placeholder_default, @ptrCast(&selected)));
+        if (selected) {
+            defaults += 1;
+            var id: u32 = 0;
+            var external: bool = false;
+            try testing.expectEqual(Result.success, placement_get(iter, .placement_id, @ptrCast(&id)));
+            try testing.expectEqual(Result.success, placement_get(iter, .is_external, @ptrCast(&external)));
+            try testing.expectEqual(@as(u32, 2), id);
+            try testing.expect(external);
+        }
+    }
+    try testing.expectEqual(@as(usize, 3), count);
+    try testing.expectEqual(@as(usize, 1), defaults);
 }
 
 test "placement_iterator new/free" {
