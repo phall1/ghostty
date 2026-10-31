@@ -91,9 +91,10 @@ pub const Options = struct {
     unwrap: bool = false,
 
     /// Trim trailing whitespace on lines with other text. Trailing blank
-    /// lines are always trimmed. This only affects trailing whitespace
-    /// on rows that have at least one other cell with text. Whitespace
-    /// is currently only space characters (0x20).
+    /// lines are always trimmed, except in VT output without trimming,
+    /// where they are part of the layout. This only affects trailing
+    /// whitespace on rows that have at least one other cell with text.
+    /// Whitespace is currently only space characters (0x20).
     trim: bool = true,
 
     /// Replace matching Unicode codepoints with some other values.
@@ -973,6 +974,35 @@ pub const PageListFormatter = struct {
             }
 
             page_state = try formatter.formatWithState(writer);
+        }
+
+        // VT output without trimming keeps the blank rows at the end:
+        // they are part of the layout, and a replay without them scrolls
+        // less, so the rows above them end up too low on the screen.
+        if (self.opts.emit == .vt and !self.opts.trim) {
+            const state = page_state orelse return;
+            if (state.rows <= 1) return;
+
+            // The last row needs no newline after it.
+            const count = state.rows - 1;
+            try writer.splatBytesAll("\r\n", count);
+
+            // Each newline maps to the row it ends, as between pages:
+            // the first one to the end of the last row with text.
+            if (self.pin_map) |*m| {
+                for (0..count) |i| {
+                    const row = br.up(count - i) orelse tl;
+                    const pin = if (i == 0)
+                        m.map.get(m.map.count() -| 1) orelse row
+                    else
+                        row;
+                    m.map.append(m.alloc, .{
+                        .node = pin.node,
+                        .x = if (i == 0) pin.x else 0,
+                        .y = pin.y,
+                    }, 2) catch return error.WriteFailed;
+                }
+            }
         }
     }
 };
@@ -4790,6 +4820,131 @@ test "PageList plain with end_x only" {
     }
 }
 
+test "PageList VT without trim keeps trailing blank rows" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 10,
+        .rows = 6,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("one\r\ntwo");
+
+    const pages = &t.screens.active.pages;
+    var pin_map: PinMap.Map = .empty;
+    defer pin_map.deinit(alloc);
+
+    var formatter: PageListFormatter = .init(pages, .vt);
+    formatter.opts.trim = false;
+    formatter.pin_map = .{ .alloc = alloc, .map = &pin_map };
+    try formatter.format(&builder.writer);
+    const output = builder.writer.buffered();
+
+    // Six rows, two with text, so five newlines.
+    try testing.expectEqualStrings("one\r\ntwo\r\n\r\n\r\n\r\n", output);
+
+    // Each newline maps to the row it ends: the first to the end of
+    // the text, the others to the start of a blank row.
+    try testing.expectEqual(output.len, pin_map.count());
+    const trailing = "one\r\ntwo".len;
+    for (0..4) |i| {
+        const pin = pin_map.get(trailing + i * 2).?;
+        try testing.expectEqual(pin, pin_map.get(trailing + i * 2 + 1).?);
+        try testing.expectEqual(@as(size.CellCountInt, if (i == 0) 2 else 0), pin.x);
+        try testing.expectEqual(@as(size.CellCountInt, @intCast(1 + i)), pin.y);
+    }
+
+    // Trimmed output and other formats still drop them.
+    var trimmed: std.Io.Writer.Allocating = .init(alloc);
+    defer trimmed.deinit();
+    var trimming: PageListFormatter = .init(pages, .vt);
+    try trimming.format(&trimmed.writer);
+    try testing.expectEqualStrings("one\r\ntwo", trimmed.writer.buffered());
+
+    var plain: std.Io.Writer.Allocating = .init(alloc);
+    defer plain.deinit();
+    var plain_formatter: PageListFormatter = .init(pages, .{
+        .emit = .plain,
+        .trim = false,
+    });
+    try plain_formatter.format(&plain.writer);
+    try testing.expectEqualStrings("one\ntwo", plain.writer.buffered());
+}
+
+test "PageList VT without trim keeps a blank screen" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 10,
+        .rows = 4,
+    });
+    defer t.deinit(alloc);
+
+    var formatter: PageListFormatter = .init(&t.screens.active.pages, .vt);
+    formatter.opts.trim = false;
+    try formatter.format(&builder.writer);
+    try testing.expectEqualStrings("\r\n\r\n\r\n", builder.writer.buffered());
+}
+
+test "PageList VT without trim keeps trailing blank rows across pages" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 10,
+        .rows = 3,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // Text on the last row of the first page, then two blank rows on
+    // the next one.
+    const pages = &t.screens.active.pages;
+    const first_page_rows = pages.pages.first.?.capacity().rows;
+    for (0..first_page_rows - 1) |_| s.nextSlice("\r\n");
+    s.nextSlice("x\r\n\r\n");
+    try testing.expect(pages.pages.first != pages.pages.last);
+
+    var pin_map: PinMap.Map = .empty;
+    defer pin_map.deinit(alloc);
+
+    var formatter: PageListFormatter = .init(pages, .vt);
+    formatter.opts.trim = false;
+    formatter.pin_map = .{ .alloc = alloc, .map = &pin_map };
+    try formatter.format(&builder.writer);
+    const output = builder.writer.buffered();
+    try testing.expect(std.mem.endsWith(u8, output, "x\r\n\r\n"));
+    try testing.expectEqual(output.len, pin_map.count());
+
+    // The first newline ends the row with text on the first page, the
+    // second the first blank row on the next page.
+    const first = pin_map.get(output.len - 4).?;
+    try testing.expectEqual(pages.pages.first.?, first.node);
+    try testing.expectEqual(first_page_rows - 1, first.y);
+    const second = pin_map.get(output.len - 2).?;
+    try testing.expectEqual(pages.pages.last.?, second.node);
+    try testing.expectEqual(@as(size.CellCountInt, 0), second.x);
+}
+
 test "PageList plain rectangle basic" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -6132,6 +6287,67 @@ test "Screen vt with charsets" {
     for (0..output.len) |i| {
         try testing.expectEqual(node, pin_map.get(i).?.node);
     }
+}
+
+test "Terminal vt without trim keeps blank rows at the bottom" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var source = try Terminal.init(io, alloc, .{
+        .cols = 10,
+        .rows = 5,
+    });
+    defer source.deinit(alloc);
+
+    // Scroll three lines into the scrollback, then erase the bottom of
+    // the screen, as clearing below a prompt does.
+    var source_stream = source.vtStream();
+    defer source_stream.deinit();
+    source_stream.nextSlice("1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\r\n8");
+    source_stream.nextSlice("\x1b[3;1H\x1b[J");
+
+    var pin_map: PinMap.Map = .empty;
+    defer pin_map.deinit(alloc);
+
+    var formatter: TerminalFormatter = .init(&source, .vt);
+    formatter.opts.trim = false;
+    formatter.extra = .none;
+    formatter.extra.screen.cursor = true;
+    formatter.pin_map = .{ .alloc = alloc, .map = &pin_map };
+    try formatter.format(&builder.writer);
+    try testing.expectEqual(builder.writer.buffered().len, pin_map.count());
+
+    var target = try Terminal.init(io, alloc, .{
+        .cols = 10,
+        .rows = 5,
+    });
+    defer target.deinit(alloc);
+
+    var target_stream = target.vtStream();
+    defer target_stream.deinit();
+    target_stream.nextSlice(builder.writer.buffered());
+
+    // The blank rows are part of the layout: without them, the replay
+    // scrolls less and the rows above them end up too low.
+    const source_contents = try source.screens.active.dumpStringAlloc(
+        alloc,
+        .{ .active = .{} },
+    );
+    defer alloc.free(source_contents);
+    const target_contents = try target.screens.active.dumpStringAlloc(
+        alloc,
+        .{ .active = .{} },
+    );
+    defer alloc.free(target_contents);
+    try testing.expectEqualStrings(source_contents, target_contents);
+    try testing.expectEqual(
+        source.screens.active.cursor.y,
+        target.screens.active.cursor.y,
+    );
 }
 
 test "Terminal vt with scrolling region" {

@@ -45,7 +45,45 @@ const log = std.log.scoped(.terminal_c);
 
 /// Process-unique identities prevent detached consumers from accepting a new
 /// terminal whose wrapper happens to reuse the original allocation address.
-var next_identity: std.atomic.Value(u64) = .init(1);
+var next_identity: IdentityCounter = .{};
+
+/// Single-threaded targets (including baseline wasm32) use a plain u64.
+/// Threaded 64-bit targets retain lock-free allocation; threaded 32-bit targets
+/// protect the full u64 with a short 32-bit spin lock, without requiring I/O.
+/// In particular, threaded wasm requires only its supported 32-bit atomics.
+/// Zero marks exhaustion after issuing every nonzero u64, so identities never
+/// wrap around and make a detached consumer accept a replacement terminal.
+const IdentityCounter = struct {
+    value: std.atomic.Value(u64) = .init(1),
+    lock: std.atomic.Value(u32) = .init(0),
+
+    fn next(self: *IdentityCounter) ?u64 {
+        if (comptime builtin.single_threaded or @bitSizeOf(usize) < 64) {
+            if (!builtin.single_threaded) {
+                while (self.lock.swap(1, .acquire) != 0) {
+                    std.atomic.spinLoopHint();
+                }
+            }
+            defer if (!builtin.single_threaded) self.lock.store(0, .release);
+
+            const value = self.value.raw;
+            if (value == 0) return null;
+            self.value.raw +%= 1;
+            return value;
+        } else {
+            var value = self.value.load(.monotonic);
+            while (true) {
+                if (value == 0) return null;
+                value = self.value.cmpxchgWeak(
+                    value,
+                    value +% 1,
+                    .monotonic,
+                    .monotonic,
+                ) orelse return value;
+            }
+        }
+    }
+};
 
 /// C terminals do not retain replay bytes unless the embedding application
 /// opts in through `GHOSTTY_TERMINAL_OPT_CONTINUATION_MAX_BYTES`.
@@ -890,7 +928,7 @@ fn wrap(
     };
 
     wrapper.* = .{
-        .identity = next_identity.fetchAdd(1, .monotonic),
+        .identity = next_identity.next() orelse @panic("terminal identity space exhausted"),
         .terminal = t,
         .io = io,
         .terminfo_name_buf = undefined,
@@ -2180,6 +2218,23 @@ fn testEnableContinuation(terminal: Terminal) !void {
         Result.success,
         set(terminal, .continuation_max_bytes, &limit),
     );
+}
+
+test "terminal identity counter preserves all 64 bits" {
+    var counter: IdentityCounter = .{
+        .value = .init(std.math.maxInt(u32)),
+    };
+    try testing.expectEqual(@as(?u64, std.math.maxInt(u32)), counter.next());
+    try testing.expectEqual(@as(?u64, @as(u64, std.math.maxInt(u32)) + 1), counter.next());
+}
+
+test "terminal identity counter never repeats after exhaustion" {
+    var counter: IdentityCounter = .{
+        .value = .init(std.math.maxInt(u64)),
+    };
+    try testing.expectEqual(@as(?u64, std.math.maxInt(u64)), counter.next());
+    try testing.expectEqual(@as(?u64, null), counter.next());
+    try testing.expectEqual(@as(?u64, null), counter.next());
 }
 
 test "new/free" {
