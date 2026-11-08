@@ -1311,70 +1311,6 @@
         }
       }
     },
-    "GhosttySnapshotCaptureEvent": {
-      "kind": "struct",
-      "size": 48,
-      "align": 8,
-      "fields": {
-        "size": {
-          "offset": 0,
-          "size": 8,
-          "type": "u64"
-        },
-        "kind": {
-          "offset": 8,
-          "size": 4,
-          "type": "GhosttySnapshotCaptureEventKind"
-        },
-        "screen": {
-          "offset": 12,
-          "size": 4,
-          "type": "GhosttyTerminalScreen"
-        },
-        "rows": {
-          "offset": 16,
-          "size": 8,
-          "type": "u64"
-        },
-        "remaining": {
-          "offset": 24,
-          "size": 4,
-          "type": "u32"
-        },
-        "written": {
-          "offset": 32,
-          "size": 8,
-          "type": "u64"
-        },
-        "invalidation": {
-          "offset": 40,
-          "size": 4,
-          "type": "GhosttySnapshotCaptureInvalidation"
-        }
-      }
-    },
-    "GhosttySnapshotCaptureOptions": {
-      "kind": "struct",
-      "size": 24,
-      "align": 8,
-      "fields": {
-        "size": {
-          "offset": 0,
-          "size": 8,
-          "type": "u64"
-        },
-        "max_record_bytes": {
-          "offset": 8,
-          "size": 8,
-          "type": "u64"
-        },
-        "max_pages": {
-          "offset": 16,
-          "size": 8,
-          "type": "u64"
-        }
-      }
-    },
     "GhosttyString": {
       "kind": "struct",
       "size": 16,
@@ -4161,39 +4097,6 @@
         "STYLE_MAX_VALUE": 2147483647
       }
     },
-    "GhosttySnapshotCaptureEventKind": {
-      "kind": "enum",
-      "size": 4,
-      "align": 4,
-      "underlying": "i32",
-      "prefix": "GHOSTTY_SNAPSHOT_CAPTURE_EVENT_",
-      "values": {
-        "RECORD": 0,
-        "READY": 1,
-        "HISTORY_PAGE": 2,
-        "FINISH": 3,
-        "SCAN": 4,
-        "INVALIDATED": 5,
-        "IMAGE": 6,
-        "MAX_VALUE": 2147483647
-      }
-    },
-    "GhosttySnapshotCaptureInvalidation": {
-      "kind": "enum",
-      "size": 4,
-      "align": 4,
-      "underlying": "i32",
-      "prefix": "GHOSTTY_SNAPSHOT_CAPTURE_INVALIDATION_",
-      "values": {
-        "NONE": 0,
-        "WRONG_TERMINAL": 1,
-        "RESET": 2,
-        "RESIZE": 3,
-        "MUTATION": 4,
-        "EVICTED": 5,
-        "MAX_VALUE": 2147483647
-      }
-    },
     "GhosttySnapshotDecoderData": {
       "kind": "enum",
       "size": 4,
@@ -5312,11 +5215,6 @@
       "align": 8
     },
     "GhosttySgrParser": {
-      "kind": "opaque",
-      "size": 8,
-      "align": 8
-    },
-    "GhosttySnapshotCapture": {
       "kind": "opaque",
       "size": 8,
       "align": 8

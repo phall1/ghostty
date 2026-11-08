@@ -988,15 +988,6 @@ pub const ScreenPlan = struct {
         }
     }
 
-    /// Emit one planned pixel record for a progressive snapshot capture.
-    pub fn encodePayloadAt(
-        self: *const ScreenPlan,
-        index: usize,
-        destination: *record.Writer,
-    ) EncodeError!void {
-        try encodePayload(destination, self.key, self.payloads[index]);
-    }
-
     /// Encode the KITTY_IMAGE_PAGE_PLACEMENTS record for one history page, if
     /// any placement is pinned to it, and nothing otherwise. Then encode the
     /// KITTY_IMAGE_PAYLOAD records of the images that are first placed on
@@ -1004,21 +995,6 @@ pub const ScreenPlan = struct {
     /// after the page's PAGE record. Pages must be visited newest first, in
     /// the same order HISTORY encodes them.
     pub fn encodePagePlacements(
-        self: *ScreenPlan,
-        node: *const Node,
-        destination: *record.Writer,
-    ) EncodeError!void {
-        try self.encodePagePlacementsRecord(node, destination);
-
-        while (self.payload_next < self.history_payloads.end and
-            self.payloads[self.payload_next].node == node) : (self.payload_next += 1)
-        {
-            try encodePayload(destination, self.key, self.payloads[self.payload_next]);
-        }
-    }
-
-    /// Emit only this page's placement record, leaving pixels for later calls.
-    pub fn encodePagePlacementsRecord(
         self: *ScreenPlan,
         node: *const Node,
         destination: *record.Writer,
@@ -1038,6 +1014,12 @@ pub const ScreenPlan = struct {
                 try encodePlacement(writer, planned, .page);
             }
             try destination.finish();
+        }
+
+        while (self.payload_next < self.history_payloads.end and
+            self.payloads[self.payload_next].node == node) : (self.payload_next += 1)
+        {
+            try encodePayload(destination, self.key, self.payloads[self.payload_next]);
         }
     }
 };

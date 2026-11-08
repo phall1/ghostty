@@ -43,54 +43,6 @@ extern "C" {
  * @{
  */
 
-/** Opaque bounded progressive snapshot capture. */
-typedef struct GhosttySnapshotCaptureImpl* GhosttySnapshotCapture;
-
-/** Limits fixed when a progressive capture is created. */
-typedef struct {
-  size_t size;
-  /** Maximum encoded bytes of any capture event, including grouped records. */
-  size_t max_record_bytes;
-  size_t max_pages;
-} GhosttySnapshotCaptureOptions;
-
-/** Boundary emitted by one progressive capture step. */
-typedef enum GHOSTTY_ENUM_TYPED {
-  GHOSTTY_SNAPSHOT_CAPTURE_EVENT_RECORD = 0,
-  GHOSTTY_SNAPSHOT_CAPTURE_EVENT_READY = 1,
-  GHOSTTY_SNAPSHOT_CAPTURE_EVENT_HISTORY_PAGE = 2,
-  GHOSTTY_SNAPSHOT_CAPTURE_EVENT_FINISH = 3,
-  /** One cold-page descriptor was scanned; no bytes were written. */
-  GHOSTTY_SNAPSHOT_CAPTURE_EVENT_SCAN = 4,
-  /** The READY cut can no longer be read safely; no bytes were written. */
-  GHOSTTY_SNAPSHOT_CAPTURE_EVENT_INVALIDATED = 5,
-  /** One complete Kitty pixel payload; not a history page or FINISH. */
-  GHOSTTY_SNAPSHOT_CAPTURE_EVENT_IMAGE = 6,
-  GHOSTTY_SNAPSHOT_CAPTURE_EVENT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
-} GhosttySnapshotCaptureEventKind;
-
-/** Typed reason a detached READY history cut became unusable. */
-typedef enum GHOSTTY_ENUM_TYPED {
-  GHOSTTY_SNAPSHOT_CAPTURE_INVALIDATION_NONE = 0,
-  GHOSTTY_SNAPSHOT_CAPTURE_INVALIDATION_WRONG_TERMINAL = 1,
-  GHOSTTY_SNAPSHOT_CAPTURE_INVALIDATION_RESET = 2,
-  GHOSTTY_SNAPSHOT_CAPTURE_INVALIDATION_RESIZE = 3,
-  GHOSTTY_SNAPSHOT_CAPTURE_INVALIDATION_MUTATION = 4,
-  GHOSTTY_SNAPSHOT_CAPTURE_INVALIDATION_EVICTED = 5,
-  GHOSTTY_SNAPSHOT_CAPTURE_INVALIDATION_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
-} GhosttySnapshotCaptureInvalidation;
-
-/** Metadata for bytes synchronously written by one capture step. */
-typedef struct {
-  size_t size;
-  GhosttySnapshotCaptureEventKind kind;
-  GhosttyTerminalScreen screen;
-  size_t rows;
-  uint32_t remaining;
-  size_t written;
-  GhosttySnapshotCaptureInvalidation invalidation;
-} GhosttySnapshotCaptureEvent;
-
 /**
  * Configurable snapshot decoder options.
  *
@@ -465,62 +417,6 @@ typedef enum GHOSTTY_ENUM_TYPED {
  */
 GHOSTTY_API GhosttyResult ghostty_snapshot_encode(GhosttyTerminal terminal,
                                                   GhosttyWriter writer);
-
-/**
- * Create a record-at-a-time capture using the current GHOSTSNP format.
- *
- * The writer and any custom allocator backing it or the terminal must remain
- * alive until the capture is freed. The terminal must remain alive and
- * immutable until READY and successful ghostty_snapshot_capture_detach;
- * after detachment it may be mutated between history calls or destroyed.
- * Detached capture destruction never dereferences the source.
- * The capture allocates exactly
- * `max_record_bytes - 10` bytes of reusable payload scratch and never stages a
- * complete snapshot. A history step includes a PAGE's optional Kitty placement
- * record as the same decoder unit. max_record_bytes bounds the complete group;
- * an oversized group writes no bytes. Kitty-bearing captures allocate one
- * additional max_record_bytes buffer for grouping and reuse upstream's image
- * planning (which walks pages and placements); text-only capture creation
- * and detachment do not traverse history. Changing Kitty storage after READY
- * invalidates the capture before any borrowed image pointers are accessed.
- * After an encoding or writer error, free the capture; it cannot be resumed.
- */
-GHOSTTY_API GhosttyResult ghostty_snapshot_capture_new(
-    const GhosttyAllocator* allocator,
-    GhosttyTerminal terminal,
-    GhosttyWriter writer,
-    const GhosttySnapshotCaptureOptions* options,
-    GhosttySnapshotCapture* capture);
-
-/** Emit one complete prefix envelope or record through READY. */
-GHOSTTY_API GhosttyResult ghostty_snapshot_capture_next(
-    GhosttySnapshotCapture capture,
-    GhosttySnapshotCaptureEvent* event);
-
-/** Detach the O(1) history cut after READY and release the terminal borrow. */
-GHOSTTY_API GhosttyResult ghostty_snapshot_capture_detach(
-    GhosttySnapshotCapture capture);
-
-/**
- * Perform one bounded detached-history step against the original terminal.
- *
- * SCAN writes no bytes and inspects one cold page. RECORD, IMAGE, and FINISH
- * each write one complete GHOSTSNP v1 record. HISTORY_PAGE writes a PAGE and
- * its optional Kitty placement record as one bounded unit. INVALIDATED writes no
- * bytes and carries a typed tombstone; no FINISH can be produced afterward.
- * The terminal is borrowed immutably only for this synchronous call and may be
- * mutated between calls. It must be the original still-live terminal passed to
- * ghostty_snapshot_capture_new. Every terminal receives a non-address identity;
- * a replacement terminal is reported as WRONG_TERMINAL even if its allocation
- * reuses the original address.
- */
-GHOSTTY_API GhosttyResult ghostty_snapshot_capture_next_history(
-    GhosttySnapshotCapture capture,
-    GhosttyTerminal terminal,
-    GhosttySnapshotCaptureEvent* event);
-
-/** Free capture state; NULL is a no-op. */
-GHOSTTY_API void ghostty_snapshot_capture_free(GhosttySnapshotCapture capture);
 
 /**
  * Encode a complete terminal snapshot to a caller-provided buffer.
