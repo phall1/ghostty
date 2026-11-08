@@ -214,6 +214,7 @@ comptime {
         @export(&c.key_encoder_free, .{ .name = "ghostty_key_encoder_free" });
         @export(&c.key_encoder_set, .{ .name = "ghostty_key_encoder_set" });
         @export(&c.key_encoder_set_from_terminal, .{ .name = "ghostty_key_encoder_set_from_terminal" });
+        @export(&c.key_encoder_terminal_options, .{ .name = "ghostty_key_encoder_terminal_options" });
         @export(&c.key_encoder_encode, .{ .name = "ghostty_key_encoder_encode" });
         @export(&c.focus_encode, .{ .name = "ghostty_focus_encode" });
         @export(&c.paste_is_safe, .{ .name = "ghostty_paste_is_safe" });
@@ -234,6 +235,7 @@ comptime {
         @export(&c.mouse_encoder_free, .{ .name = "ghostty_mouse_encoder_free" });
         @export(&c.mouse_encoder_set, .{ .name = "ghostty_mouse_encoder_set" });
         @export(&c.mouse_encoder_set_from_terminal, .{ .name = "ghostty_mouse_encoder_set_from_terminal" });
+        @export(&c.mouse_encoder_terminal_options, .{ .name = "ghostty_mouse_encoder_terminal_options" });
         @export(&c.mouse_encoder_reset, .{ .name = "ghostty_mouse_encoder_reset" });
         @export(&c.mouse_encoder_encode, .{ .name = "ghostty_mouse_encoder_encode" });
         @export(&c.osc_new, .{ .name = "ghostty_osc_new" });
@@ -314,6 +316,7 @@ comptime {
         @export(&c.terminal_new, .{ .name = "ghostty_terminal_new" });
         @export(&c.terminal_free, .{ .name = "ghostty_terminal_free" });
         @export(&c.terminal_reset, .{ .name = "ghostty_terminal_reset" });
+        @export(&c.terminal_clear_presentation, .{ .name = "ghostty_terminal_clear_presentation" });
         @export(&c.terminal_resize, .{ .name = "ghostty_terminal_resize" });
         @export(&c.terminal_set, .{ .name = "ghostty_terminal_set" });
         @export(&c.terminal_vt_write, .{ .name = "ghostty_terminal_vt_write" });
@@ -359,6 +362,12 @@ comptime {
         @export(&c.terminal_point_from_grid_ref, .{ .name = "ghostty_terminal_point_from_grid_ref" });
         @export(&c.terminal_grid_ref_track, .{ .name = "ghostty_terminal_grid_ref_track" });
         @export(&c.snapshot_encode, .{ .name = "ghostty_snapshot_encode" });
+        @export(&c.snapshot_validate_records, .{ .name = "ghostty_snapshot_validate_records" });
+        @export(&c.snapshot_capture_new, .{ .name = "ghostty_snapshot_capture_new" });
+        @export(&c.snapshot_capture_next, .{ .name = "ghostty_snapshot_capture_next" });
+        @export(&c.snapshot_capture_detach, .{ .name = "ghostty_snapshot_capture_detach" });
+        @export(&c.snapshot_capture_next_history, .{ .name = "ghostty_snapshot_capture_next_history" });
+        @export(&c.snapshot_capture_free, .{ .name = "ghostty_snapshot_capture_free" });
         @export(&c.snapshot_encode_buf, .{ .name = "ghostty_snapshot_encode_buf" });
         @export(&c.snapshot_encode_alloc, .{ .name = "ghostty_snapshot_encode_alloc" });
         @export(&c.snapshot_decoder_new, .{ .name = "ghostty_snapshot_decoder_new" });
@@ -369,8 +378,10 @@ comptime {
         @export(&c.snapshot_decoder_get_multi, .{ .name = "ghostty_snapshot_decoder_get_multi" });
         @export(&c.snapshot_decoder_ready, .{ .name = "ghostty_snapshot_decoder_ready" });
         @export(&c.snapshot_decoder_next, .{ .name = "ghostty_snapshot_decoder_next" });
+        @export(&c.snapshot_decoder_next_staged, .{ .name = "ghostty_snapshot_decoder_next_staged" });
         @export(&c.snapshot_decoder_decode, .{ .name = "ghostty_snapshot_decoder_decode" });
         @export(&c.kitty_graphics_get, .{ .name = "ghostty_kitty_graphics_get" });
+        @export(&c.kitty_graphics_image_ids, .{ .name = "ghostty_kitty_graphics_image_ids" });
         @export(&c.kitty_graphics_animation_tick, .{ .name = "ghostty_kitty_graphics_animation_tick" });
         @export(&c.kitty_graphics_image, .{ .name = "ghostty_kitty_graphics_image" });
         @export(&c.kitty_graphics_image_get, .{ .name = "ghostty_kitty_graphics_image_get" });

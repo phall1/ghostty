@@ -45,6 +45,20 @@ const max_path_bytes = if (builtin.target.os.tag == .freestanding) 4096 else std
 
 const log = std.log.scoped(.terminal_c);
 
+/// Process-unique identities prevent detached consumers from accepting a new
+/// terminal whose wrapper happens to reuse the original allocation address.
+var next_identity: if (builtin.single_threaded) u64 else std.atomic.Value(u64) =
+    if (builtin.single_threaded) 1 else .init(1);
+
+fn nextTerminalIdentity() u64 {
+    if (comptime builtin.single_threaded) {
+        const identity = next_identity;
+        next_identity += 1;
+        return identity;
+    }
+    return next_identity.fetchAdd(1, .monotonic);
+}
+
 /// C terminals do not retain replay bytes unless the embedding application
 /// opts in through `GHOSTTY_TERMINAL_OPT_CONTINUATION_MAX_BYTES`.
 pub const default_continuation_max_bytes: usize = 0;
@@ -74,6 +88,7 @@ pub const Io = struct {
 /// such as the persistent VT stream needed to handle escape sequences split
 /// across multiple vt_write calls.
 const TerminalWrapper = struct {
+    identity: u64,
     terminal: *ZigTerminal,
     /// C construction has no I/O argument, so the wrapper retains the owner
     /// created by `new` or transferred from snapshot decoding until `free`.
@@ -849,6 +864,10 @@ pub fn zigTerminal(terminal_: Terminal) ?*ZigTerminal {
     return (terminal_ orelse return null).terminal;
 }
 
+pub fn terminalIdentity(terminal_: Terminal) ?u64 {
+    return (terminal_ orelse return null).identity;
+}
+
 /// Attach the persistent C stream and I/O owner to a heap-stable terminal.
 /// The caller retains ownership of both inputs if wrapper allocation fails.
 fn wrap(
@@ -892,6 +911,7 @@ fn wrap(
     handler.apc_handler.enable(.glyph, false);
 
     wrapper.* = .{
+        .identity = nextTerminalIdentity(),
         .terminal = t,
         .io = io,
         .terminfo_name_buf = undefined,
@@ -1869,6 +1889,18 @@ pub fn reset(terminal_: Terminal) callconv(lib.calling_conv) void {
     const sync = t.modes.get(.synchronized_output);
     t.fullReset();
     if (sync) Effects.renderHoldTrampoline(&wrapper.stream.handler, false);
+}
+
+/// Client-local Clear, without feeding control bytes into the live stream.
+/// In particular, do not reset or replace wrapper.stream: it may own a partial
+/// CSI, OSC, DCS, or UTF-8 codepoint received from the remote process.
+pub fn clear_presentation(terminal_: Terminal) callconv(lib.calling_conv) void {
+    const t: *ZigTerminal = (terminal_ orelse return).terminal;
+    t.screens.active.clearSelection();
+    t.setCursorPos(1, 1);
+    t.eraseDisplay(.complete, false);
+    t.eraseDisplay(.scrollback, false);
+    t.scrollViewport(.bottom);
 }
 
 /// C: GhosttyKittyGraphics
@@ -3344,6 +3376,51 @@ test "reset" {
 
 test "reset null" {
     reset(null);
+}
+
+test "clear presentation preserves exact stream continuation" {
+    const prefixes = [_][]const u8{
+        "\x1b[3",
+        "\x1b]2;pending title",
+        "\x1bP$q",
+        "\xe2",
+        "\xe2\x82",
+        "\xf0\x9f\x98",
+    };
+    for (prefixes) |prefix| {
+        var t: Terminal = null;
+        try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 10, 2));
+        defer free(t);
+        try testEnableContinuation(t);
+        const old = "old\r\nhistory\r\nvisible";
+        vt_write(t, old, old.len);
+        vt_write(t, prefix.ptr, prefix.len);
+
+        var before: [64]u8 = undefined;
+        var before_len: usize = 0;
+        try testing.expectEqual(
+            Result.success,
+            continuation_buf(t, &before, before.len, &before_len),
+        );
+        try testing.expect(before_len > 0);
+
+        clear_presentation(t);
+
+        var after: [64]u8 = undefined;
+        var after_len: usize = 0;
+        try testing.expectEqual(
+            Result.success,
+            continuation_buf(t, &after, after.len, &after_len),
+        );
+        try testing.expectEqualSlices(u8, before[0..before_len], after[0..after_len]);
+        const text = try t.?.terminal.plainString(testing.allocator);
+        defer testing.allocator.free(text);
+        try testing.expectEqualStrings("", text);
+    }
+}
+
+test "clear presentation null" {
+    clear_presentation(null);
 }
 
 test "resize" {

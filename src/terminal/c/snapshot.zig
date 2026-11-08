@@ -16,6 +16,76 @@ const apc = @import("../apc.zig");
 const default_max_continuation_bytes = apc.Protocol.maxDefaultBytes();
 const terminal_c = @import("terminal.zig");
 
+pub const CaptureOptions = extern struct {
+    pub const sized_base = "max_pages";
+    size: usize,
+    max_record_bytes: usize,
+    max_pages: usize,
+};
+
+pub const CaptureEventKind = enum(c_int) {
+    record = 0,
+    ready = 1,
+    history_page = 2,
+    finish = 3,
+    scan = 4,
+    invalidated = 5,
+    image = 6,
+    _,
+};
+
+pub const CaptureInvalidation = enum(c_int) {
+    none = 0,
+    wrong_terminal = 1,
+    reset = 2,
+    resize = 3,
+    mutation = 4,
+    evicted = 5,
+    _,
+};
+
+pub const CaptureEvent = extern struct {
+    pub const sized_base = "invalidation";
+    size: usize,
+    kind: CaptureEventKind,
+    screen: terminal_c.TerminalScreen,
+    rows: usize,
+    remaining: u32,
+    written: usize,
+    invalidation: CaptureInvalidation,
+};
+
+const CaptureWrapper = struct {
+    alloc: std.mem.Allocator,
+    terminal_alloc: std.mem.Allocator,
+    continuation: []u8,
+    adapter: io_c.WriterAdapter,
+    encoder: snapshot_core.Encoder,
+    terminal_identity: u64,
+    failed: bool,
+};
+
+pub const Capture = ?*CaptureWrapper;
+
+/// Validate all framing and CRCs of a staged unit before terminal mutation.
+/// Semantic ordering is still validated by the normal decoder.
+pub fn validate_records(
+    ptr: ?[*]const u8,
+    len: usize,
+) callconv(lib.calling_conv) Result {
+    if (comptime !lib.feature(.snapshot)) return .unsupported;
+    const bytes = if (ptr) |p| p[0..len] else if (len == 0) &.{} else return .invalid_value;
+    var source: std.Io.Reader = .fixed(bytes);
+    while (source.seek < bytes.len) {
+        const header = snapshot_core.record.Header.decode(&source) catch return .invalid_value;
+        var reader: snapshot_core.record.Reader = undefined;
+        reader.initHeader(&source, header);
+        reader.payloadReader().discardAll(header.payload_len) catch return .invalid_value;
+        reader.finish() catch return .invalid_value;
+    }
+    return .success;
+}
+
 /// C: GhosttySnapshotDecoderOption.
 ///
 /// Options configure validation and returned-terminal policy before snapshot
@@ -521,6 +591,18 @@ pub fn decoder_ready(
 pub fn decoder_next(
     decoder_: Decoder,
 ) callconv(lib.calling_conv) Result {
+    return decoderNext(decoder_, null);
+}
+
+/// Decode one pre-framed unit without speculative reads into the next unit.
+pub fn decoder_next_staged(
+    decoder_: Decoder,
+    page_placements: bool,
+) callconv(lib.calling_conv) Result {
+    return decoderNext(decoder_, page_placements);
+}
+
+fn decoderNext(decoder_: Decoder, page_placements: ?bool) Result {
     if (comptime !lib.feature(.snapshot)) return .unsupported;
     // FINISH is idempotent; every other non-history state rejects `next`.
     const decoder = decoder_ orelse return .invalid_value;
@@ -537,7 +619,10 @@ pub fn decoder_next(
     history.progress = null;
 
     // Consume one validated record and preserve READY metadata on failure.
-    const progress = decoder.decoder.next(decoder.alloc, native) catch |err| {
+    const progress = (if (page_placements) |present|
+        decoder.decoder.nextStaged(decoder.alloc, native, present)
+    else
+        decoder.decoder.next(decoder.alloc, native)) catch |err| {
         const metadata = history.metadata;
         decoder.state = .{ .failed = metadata };
         return decoderMapError(decoder, err);
@@ -698,6 +783,167 @@ fn continuationValue(bytes: []const u8) snapshot_core.Continuation {
     return if (bytes.len == 0) .ground else .{ .bytes = bytes };
 }
 
+/// Create a bounded record-at-a-time capture over the current snapshot codec.
+pub fn capture_new(
+    alloc_: ?*const CAllocator,
+    terminal: terminal_c.Terminal,
+    writer: io_c.Writer,
+    options_: ?*const CaptureOptions,
+    out_: ?*Capture,
+) callconv(lib.calling_conv) Result {
+    if (comptime !lib.feature(.snapshot)) {
+        if (out_) |out| out.* = null;
+        return .unsupported;
+    }
+    const out = out_ orelse return .invalid_value;
+    out.* = null;
+    const options = options_ orelse return .invalid_value;
+    if (!validCaptureOptions(options, writer)) return .invalid_value;
+    const native = terminal_c.zigTerminal(terminal) orelse return .invalid_value;
+    const continuation = continuationOwned(terminal);
+    if (continuation.result != .success) return continuation.result;
+
+    const alloc = lib.alloc.default(alloc_);
+    const capture = alloc.create(CaptureWrapper) catch {
+        native.gpa().free(continuation.bytes);
+        return .out_of_memory;
+    };
+    capture.* = undefined;
+    capture.alloc = alloc;
+    capture.terminal_alloc = native.gpa();
+    capture.continuation = continuation.bytes;
+    capture.adapter = .init(writer);
+    capture.terminal_identity = terminal_c.terminalIdentity(terminal).?;
+    capture.failed = false;
+    capture.encoder = snapshot_core.Encoder.initLimited(
+        alloc,
+        &capture.adapter.interface,
+        native,
+        .{ .continuation = continuationValue(capture.continuation) },
+        options.max_record_bytes,
+        options.max_pages,
+    ) catch |err| {
+        const result = mapEncodeError(err, &capture.adapter);
+        alloc.destroy(capture);
+        native.gpa().free(continuation.bytes);
+        return result;
+    };
+    out.* = capture;
+    return .success;
+}
+
+fn validCaptureOptions(options: *const CaptureOptions, writer: io_c.Writer) bool {
+    if (!lib.sizedCheck(.input, options)) return false;
+    if (options.max_record_bytes < @max(snapshot_core.record.Header.len, snapshot_core.envelope.encoded_len)) return false;
+    if (options.max_pages == 0) return false;
+    return writer.write != null;
+}
+
+/// Emit exactly one complete envelope or record from a bounded capture.
+pub fn capture_next(
+    capture_: Capture,
+    out_: ?*CaptureEvent,
+) callconv(lib.calling_conv) Result {
+    if (comptime !lib.feature(.snapshot)) return .unsupported;
+    const capture = capture_ orelse return .invalid_value;
+    const out = out_ orelse return .invalid_value;
+    if (capture.failed or !lib.sizedCheck(.output, out) or
+        capture.encoder.finished() or capture.encoder.prefixFinished())
+        return .invalid_value;
+
+    const before = capture.adapter.offset;
+    const event = capture.encoder.nextPrefix() catch |err| {
+        capture.failed = true;
+        return mapEncodeError(err, &capture.adapter);
+    };
+    publishCaptureEvent(out, event, capture.adapter.offset - before);
+    return .success;
+}
+
+/// Release the source borrow after READY without traversing its history.
+pub fn capture_detach(capture_: Capture) callconv(lib.calling_conv) Result {
+    if (comptime !lib.feature(.snapshot)) return .unsupported;
+    const capture = capture_ orelse return .invalid_value;
+    if (capture.failed) return .invalid_value;
+    capture.encoder.detach() catch |err|
+        return mapEncodeError(err, &capture.adapter);
+    return .success;
+}
+
+/// Perform one bounded detached-history step against the same live terminal.
+pub fn capture_next_history(
+    capture_: Capture,
+    terminal: terminal_c.Terminal,
+    out_: ?*CaptureEvent,
+) callconv(lib.calling_conv) Result {
+    if (comptime !lib.feature(.snapshot)) return .unsupported;
+    const capture = capture_ orelse return .invalid_value;
+    const out = out_ orelse return .invalid_value;
+    if (capture.failed or !lib.sizedCheck(.output, out) or !capture.encoder.detached() or
+        capture.encoder.finished())
+        return .invalid_value;
+    const before = capture.adapter.offset;
+    if (terminal_c.terminalIdentity(terminal) != capture.terminal_identity) {
+        publishCaptureEvent(out, capture.encoder.wrongTerminal(), 0);
+        return .success;
+    }
+    const native = terminal_c.zigTerminal(terminal).?;
+    const event = capture.encoder.nextHistory(native) catch |err| {
+        capture.failed = true;
+        return mapEncodeError(err, &capture.adapter);
+    };
+    publishCaptureEvent(out, event, capture.adapter.offset - before);
+    return .success;
+}
+
+fn publishCaptureEvent(
+    out: *CaptureEvent,
+    event: snapshot_core.EncodeEvent,
+    written: usize,
+) void {
+    out.screen = .primary;
+    out.rows = 0;
+    out.remaining = 0;
+    out.invalidation = .none;
+    out.kind = switch (event) {
+        .scan => .scan,
+        .record => .record,
+        .image => .image,
+        .ready => .ready,
+        .finish => .finish,
+        .history_page => |page_event| event: {
+            out.screen = @fromBackingInt(@intCast(@backingInt(page_event.key)));
+            out.rows = page_event.rows;
+            out.remaining = page_event.remaining;
+            break :event .history_page;
+        },
+        .invalidated => |reason| event: {
+            out.invalidation = captureInvalidation(reason);
+            break :event .invalidated;
+        },
+    };
+    out.written = written;
+}
+
+fn captureInvalidation(reason: snapshot_core.CaptureInvalidation) CaptureInvalidation {
+    return switch (reason) {
+        .wrong_terminal => .wrong_terminal,
+        .reset => .reset,
+        .resize => .resize,
+        .mutation => .mutation,
+        .evicted => .evicted,
+    };
+}
+
+pub fn capture_free(capture_: Capture) callconv(lib.calling_conv) void {
+    if (comptime !lib.feature(.snapshot)) return;
+    const capture = capture_ orelse return;
+    const alloc = capture.alloc;
+    capture.encoder.deinit();
+    capture.terminal_alloc.free(capture.continuation);
+    alloc.destroy(capture);
+}
+
 /// Encode a terminal snapshot to a synchronous C writer callback.
 pub fn encode(
     terminal: terminal_c.Terminal,
@@ -819,6 +1065,10 @@ fn mapEncodeError(
     if (adapter) |value| {
         if (value.invalid_write) return .limit_exceeded;
         if (value.callback_failed) return .io_error;
+        // A bounded capture's destination is still healthy here, so a write
+        // failure came from its fixed record-payload scratch reaching the
+        // caller-selected limit rather than from allocation.
+        if (err == error.WriteFailed) return .limit_exceeded;
     }
 
     // Fixed and allocating writers surface only core allocation or size errors.
@@ -827,9 +1077,11 @@ fn mapEncodeError(
         error.Overflow,
         error.PayloadTooLarge,
         error.PageCountOverflow,
+        error.PageLimitExceeded,
         error.ScrollbackLimitOverflow,
         error.StringTooLong,
         => .limit_exceeded,
+        error.CaptureNotReady => .invalid_value,
         else => .invalid_value,
     };
 }
@@ -956,6 +1208,120 @@ test "decoder option and empty source" {
         &terminal,
     ));
     try testing.expectEqual(null, terminal);
+}
+
+test "snapshot capture constructor releases every failed allocation" {
+    var source_failing = testing.FailingAllocator.init(testing.allocator, .{});
+    const source_zig = source_failing.allocator();
+    const source_c: CAllocator = .fromZig(&source_zig);
+    var source: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &source_c,
+        &source,
+        20,
+        4,
+    ));
+    defer terminal_c.free(source);
+    try testEnableContinuation(source);
+    terminal_c.vt_write(source, "hello\x1b[31", "hello\x1b[31".len);
+
+    const Writer = struct {
+        fn write(_: ?*anyopaque, _: [*]const u8, _: usize) callconv(lib.calling_conv) bool {
+            return true;
+        }
+    };
+    const writer: io_c.Writer = .{ .write = &Writer.write };
+    const options: CaptureOptions = .{
+        .size = @sizeOf(CaptureOptions),
+        .max_record_bytes = 1024 * 1024,
+        .max_pages = 1000,
+    };
+    const source_outstanding = source_failing.allocated_bytes - source_failing.freed_bytes;
+
+    for (0..2) |fail_index| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = fail_index,
+        });
+        const failing_zig = failing.allocator();
+        const failing_c: CAllocator = .fromZig(&failing_zig);
+        var capture: Capture = null;
+        try testing.expectEqual(Result.out_of_memory, capture_new(
+            &failing_c,
+            source,
+            writer,
+            &options,
+            &capture,
+        ));
+        try testing.expectEqual(null, capture);
+        try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        try testing.expectEqual(
+            source_outstanding,
+            source_failing.allocated_bytes - source_failing.freed_bytes,
+        );
+    }
+
+    var short = options;
+    short.max_record_bytes = snapshot_core.envelope.encoded_len - 1;
+    var capture: Capture = null;
+    try testing.expectEqual(Result.invalid_value, capture_new(
+        &lib.alloc.test_allocator,
+        source,
+        writer,
+        &short,
+        &capture,
+    ));
+    try testing.expectEqual(null, capture);
+}
+
+test "snapshot record prevalidation checks complete groups and unknown CRCs" {
+    var bytes: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer bytes.deinit();
+    var records: snapshot_core.record.Writer = .init(testing.allocator, &bytes.writer);
+    defer records.deinit();
+    try records.begin(.page).writeAll("framing only, not semantic validation");
+    try records.finish();
+    try records.begin(@fromBackingInt(4242)).writeAll("unknown optional record");
+    try records.finish();
+    try testing.expectEqual(Result.success, validate_records(bytes.written().ptr, bytes.written().len));
+    try testing.expectEqual(Result.success, validate_records(null, 0));
+    try testing.expectEqual(Result.invalid_value, validate_records(null, 1));
+    try testing.expectEqual(Result.invalid_value, validate_records(bytes.written().ptr, 1));
+    try testing.expectEqual(Result.invalid_value, validate_records(bytes.written().ptr, bytes.written().len - 1));
+    const len = bytes.written().len;
+    bytes.writer.buffer[len - 1] ^= 1;
+    try testing.expectEqual(Result.invalid_value, validate_records(bytes.written().ptr, len));
+}
+
+test "snapshot capture constructor releases Kitty plan allocation failures" {
+    if (comptime !@import("terminal_options").kitty_graphics) return error.SkipZigTest;
+    var source: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(&lib.alloc.test_allocator, &source, 20, 4));
+    defer terminal_c.free(source);
+    const image = "\x1b_Ga=T,f=32,s=1,v=1,i=42,p=1,U=1,c=1,r=1,q=2;AAECAw==\x1b\\";
+    terminal_c.vt_write(source, image, image.len);
+    const Sink = struct {
+        fn write(_: ?*anyopaque, _: [*]const u8, _: usize) callconv(lib.calling_conv) bool {
+            return true;
+        }
+    };
+    const options: CaptureOptions = .{
+        .size = @sizeOf(CaptureOptions),
+        .max_record_bytes = 2048,
+        .max_pages = 100,
+    };
+    for (0..64) |index| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = index });
+        const alloc = failing.allocator();
+        const c_alloc: CAllocator = .fromZig(&alloc);
+        var capture: Capture = null;
+        const result = capture_new(&c_alloc, source, .{ .write = &Sink.write }, &options, &capture);
+        capture_free(capture);
+        try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        if (result == .success) return;
+        try testing.expectEqual(Result.out_of_memory, result);
+        try testing.expectEqual(@as(Capture, null), capture);
+    }
+    return error.TestExpectedSuccessfulCapture;
 }
 
 test "snapshot C API full round trip restores continuation" {

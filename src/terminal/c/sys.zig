@@ -82,7 +82,7 @@ pub const Option = enum(c_int) {
 /// callbacks from Zig.
 const Global = struct {
     userdata: ?*anyopaque = null,
-    decode_png: ?DecodePngFn = null,
+    decode_png: std.atomic.Value(?DecodePngFn) = .init(null),
     log: ?LogFn = null,
     random_secure: ?RandomSecureFn = null,
 };
@@ -100,7 +100,7 @@ fn decodePngWrapper(
     alloc: std.mem.Allocator,
     data: []const u8,
 ) terminal_sys.DecodeError!terminal_sys.Image {
-    const func = global.decode_png orelse return error.InvalidData;
+    const func = global.decode_png.load(.acquire) orelse return error.InvalidData;
 
     const c_alloc = CAllocator.fromZig(&alloc);
 
@@ -148,8 +148,8 @@ fn setTyped(
     switch (option) {
         .userdata => global.userdata = @constCast(value),
         .decode_png => {
-            global.decode_png = value;
-            terminal_sys.decode_png = if (value != null) &decodePngWrapper else null;
+            global.decode_png.store(value, .release);
+            terminal_sys.decode_png.store(if (value != null) &decodePngWrapper else null, .release);
         },
         .log => global.log = value,
         .random_secure => {
@@ -298,11 +298,11 @@ pub fn logStderr(
 
 test "set decode_png with null clears" {
     // Start from a known state.
-    global.decode_png = null;
-    terminal_sys.decode_png = null;
+    global.decode_png.store(null, .release);
+    terminal_sys.decode_png.store(null, .release);
 
     try std.testing.expectEqual(Result.success, set(.decode_png, null));
-    try std.testing.expect(terminal_sys.decode_png == null);
+    try std.testing.expect(terminal_sys.decode_png.load(.acquire) == null);
 }
 
 test "set decode_png installs wrapper" {
@@ -317,11 +317,11 @@ test "set decode_png installs wrapper" {
         .decode_png,
         @ptrCast(&S.decode),
     ));
-    try std.testing.expect(terminal_sys.decode_png != null);
+    try std.testing.expect(terminal_sys.decode_png.load(.acquire) != null);
 
     // Clear it again.
     try std.testing.expectEqual(Result.success, set(.decode_png, null));
-    try std.testing.expect(terminal_sys.decode_png == null);
+    try std.testing.expect(terminal_sys.decode_png.load(.acquire) == null);
 }
 
 test "decode_png output is zeroed before the callback" {
@@ -349,6 +349,29 @@ test "decode_png output is zeroed before the callback" {
 
     // The callback saw an all-zero struct.
     try std.testing.expectEqual(std.mem.zeroes(Image), S.seen.?);
+}
+
+test "decode_png hook may be replaced while another thread reads it" {
+    if (comptime builtin.single_threaded) return error.SkipZigTest;
+    const S = struct {
+        fn decode(_: ?*anyopaque, _: *const CAllocator, _: [*]const u8, _: usize, _: *Image) callconv(lib.calling_conv) bool {
+            return false;
+        }
+        fn replace() void {
+            for (0..1000) |_| {
+                std.debug.assert(set(.decode_png, @ptrCast(&decode)) == .success);
+                std.debug.assert(set(.decode_png, null) == .success);
+            }
+        }
+    };
+    defer _ = set(.decode_png, null);
+    const thread = try std.Thread.spawn(.{}, S.replace, .{});
+    defer thread.join();
+    for (0..1000) |_| {
+        if (terminal_sys.decode_png.load(.acquire)) |decode| {
+            try std.testing.expectError(error.InvalidData, decode(std.testing.allocator, "invalid"));
+        }
+    }
 }
 
 test "set log with null clears" {

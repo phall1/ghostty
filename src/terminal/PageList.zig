@@ -430,6 +430,20 @@ page_serial: u64,
 /// checked against the live list before its coordinates are used.
 page_serial_epoch: u64,
 
+/// Changes whenever an existing page can no longer be followed safely by a
+/// detached snapshot history cursor. Appending new active pages deliberately
+/// does not change this: it cannot alter the cold prefix captured at READY.
+snapshot_history_revision: u64 = 0,
+
+/// Revision of the most recent removal. This lets detached cursors distinguish
+/// scrollback loss from an in-place or adjacency mutation.
+snapshot_history_eviction_revision: u64 = 0,
+
+/// Any dimension change permanently invalidates detached cold-page cuts, even
+/// if the caller restores the original dimensions before the next read. A cold
+/// node may have become active and been replaced in the intervening resize.
+snapshot_resize_revision: u64 = 0,
+
 /// Byte size of the raw backing mappings owned by active page nodes. This is
 /// logical scrollback accounting and does not change while a mapping is
 /// decommitted. It excludes encoded storage and unused preheated pool items.
@@ -1277,6 +1291,10 @@ pub const Resize = struct {
 /// TODO: docs
 pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
     defer self.assertIntegrity();
+
+    if ((opts.cols orelse self.cols) != self.cols or
+        (opts.rows orelse self.rows) != self.rows)
+        self.snapshot_resize_revision +%= 1;
 
     // Resizing forces all nodes to be decompressed today so we need to
     // reschedule compression.
@@ -3163,6 +3181,7 @@ fn resizeWithoutReflowGrowCols(
         const y_end = copied;
 
         // Insert our new page
+        self.invalidateSnapshotHistoryMutation();
         self.pages.insertBefore(chunk.node, new_node);
 
         // Update our tracked pins that pointed to this previous page.
@@ -3665,6 +3684,32 @@ pub fn invalidateNodeLayout(self: *PageList, node: *List.Node) void {
     self.page_serial += 1;
 }
 
+fn invalidateSnapshotHistoryMutation(self: *PageList) void {
+    self.snapshot_history_revision +%= 1;
+}
+
+fn invalidateSnapshotHistoryEviction(self: *PageList) void {
+    self.invalidateSnapshotHistoryMutation();
+    self.snapshot_history_eviction_revision = self.snapshot_history_revision;
+}
+
+/// Whether a live node is wholly before the active suffix.
+///
+/// Resize temporarily permits fewer list rows than `self.rows`, so this must
+/// not call `getTopLeft(.active)`, whose steady-state contract requires enough
+/// rows. Walking backward also bounds normal work by active-screen pages. If a
+/// transient list cannot yet fill the active height, every live node is active.
+fn nodeIsSnapshotHistory(self: *const PageList, target: *List.Node) bool {
+    var remaining = self.rows;
+    var node_: ?*List.Node = self.pages.last;
+    while (node_) |node| : (node_ = node.prev) {
+        if (node == target) return false;
+        if (remaining <= node.rows()) return true;
+        remaining -= node.rows();
+    }
+    return false;
+}
+
 /// Compact a page to use the minimum required memory for the contents
 /// it stores. Returns the new node pointer if compaction occurred, or null
 /// if the page was already compact or compaction would not provide any
@@ -3704,7 +3749,7 @@ pub fn compact(self: *PageList, node: *List.Node) Allocator.Error!?*List.Node {
         .cap = req_cap,
         .exact_size = true,
     });
-    errdefer self.destroyNode(new_node);
+    errdefer self.destroyNodeStorage(new_node);
     const new_page: *Page = new_node.page();
     new_page.size = page.size;
     new_page.dirty = page.dirty;
@@ -3721,7 +3766,7 @@ pub fn compact(self: *PageList, node: *List.Node) Allocator.Error!?*List.Node {
 
         // In this case, let's gracefully degrade by pretending we
         // didn't need to compact.
-        self.destroyNode(new_node);
+        self.destroyNodeStorage(new_node);
         return null;
     };
 
@@ -3733,9 +3778,11 @@ pub fn compact(self: *PageList, node: *List.Node) Allocator.Error!?*List.Node {
     }
 
     // Insert the new page and destroy the old one
+    if (self.nodeIsSnapshotHistory(node))
+        self.invalidateSnapshotHistoryEviction();
     self.pages.insertBefore(node, new_node);
     self.pages.remove(node);
-    self.destroyNode(node);
+    self.destroyNodeStorage(node);
     self.page_compression.markActivity();
 
     new_page.assertIntegrity();
@@ -3784,7 +3831,7 @@ pub fn split(
 
     // Create a new node with the same capacity of managed memory.
     const target = try self.createPage(.{ .cap = page.capacity });
-    errdefer self.destroyNode(target);
+    errdefer self.destroyNodeStorage(target);
 
     // Determine how many rows we're copying
     const y_start = p.y;
@@ -3832,6 +3879,8 @@ pub fn split(
     }
     page.size.rows -= y_end - y_start;
 
+    if (self.nodeIsSnapshotHistory(original_node))
+        self.invalidateSnapshotHistoryMutation();
     self.pages.insertAfter(original_node, target);
 }
 
@@ -4160,6 +4209,7 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
         first.data = .{ .resident = .initBuf(.init(item), layout) };
         const page = first.page();
         page.size.rows = 1;
+        self.invalidateSnapshotHistoryEviction();
         self.pages.insertAfter(last, first);
         self.total_rows += 1;
         self.pushGrowHint(grow_cap.need, grow_cap.used);
@@ -4847,7 +4897,7 @@ pub fn increaseCapacity(
 
     // Create our new page and clone the old page into it.
     const new_node = try self.createPage(.{ .cap = cap });
-    errdefer self.destroyNode(new_node);
+    errdefer self.destroyNodeStorage(new_node);
     const new_page: *Page = new_node.page();
     assert(new_page.capacity.rows >= page.capacity.rows);
     assert(new_page.capacity.cols >= page.capacity.cols);
@@ -4880,10 +4930,13 @@ pub fn increaseCapacity(
         p.node = new_node;
     }
 
-    // Insert this page and destroy the old page
+    // Replacing an active page leaves every detached cold prefix unchanged.
+    // A historical replacement frees a retained identity and must invalidate.
+    if (self.nodeIsSnapshotHistory(node))
+        self.invalidateSnapshotHistoryEviction();
     self.pages.insertBefore(node, new_node);
     self.pages.remove(node);
-    self.destroyNode(node);
+    self.destroyNodeStorage(node);
     self.page_compression.markActivity();
 
     new_page.assertIntegrity();
@@ -5020,6 +5073,7 @@ pub const PageAllocation = struct {
         // No fallible work remains. Publish the page and update every cached
         // quantity affected by inserting rows above the existing first page.
         errdefer comptime unreachable;
+        destination.invalidateSnapshotHistoryMutation();
         destination.pages.prepend(node);
         destination.page_size = page_size;
         destination.total_rows = total_rows;
@@ -5603,6 +5657,16 @@ fn compressPage(self: *PageList, node: *List.Node) bool {
 /// responsible for accounting for the removed rows. This function only
 /// updates `page_size` (byte accounting), not row accounting.
 fn destroyNode(self: *PageList, node: *List.Node) void {
+    // This is the conservative destruction path for nodes that may have been
+    // visible to a detached history cut. Advance the fence before freeing so
+    // validation never dereferences reclaimed node storage.
+    self.invalidateSnapshotHistoryEviction();
+    self.destroyNodeStorage(node);
+}
+
+/// Free storage known either never to have entered the list or to have been
+/// covered by an explicit pre-removal fence/classification at the call site.
+fn destroyNodeStorage(self: *PageList, node: *List.Node) void {
     destroyNodeExt(&self.pool, node, &self.page_size);
 }
 
@@ -6219,9 +6283,12 @@ fn erasePage(self: *PageList, node: *List.Node) void {
         // movement is sensical.
     }
 
+    if (self.nodeIsSnapshotHistory(node))
+        self.invalidateSnapshotHistoryEviction();
+
     // Remove the page from the linked list
     self.pages.remove(node);
-    self.destroyNode(node);
+    self.destroyNodeStorage(node);
 }
 
 /// Returns the pin for the given point. The pin is NOT tracked so it
@@ -9082,6 +9149,38 @@ test "PageList replacements preserve compression continuation and mark activity"
     s.page_compression = state;
     _ = (try s.compact(replacement)).?;
     try testing.expectEqual(expected, s.page_compression);
+}
+
+test "PageList snapshot revision ignores active replacement" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+    try growColdPagesForTest(&s, 2);
+
+    const revision = s.snapshot_history_revision;
+    const eviction = s.snapshot_history_eviction_revision;
+    _ = try s.increaseCapacity(s.pages.last.?, .styles);
+    try testing.expectEqual(revision, s.snapshot_history_revision);
+    try testing.expectEqual(eviction, s.snapshot_history_eviction_revision);
+
+    _ = try s.increaseCapacity(s.pages.first.?, .styles);
+    try testing.expect(s.snapshot_history_revision != revision);
+    try testing.expect(s.snapshot_history_eviction_revision != eviction);
+}
+
+test "PageList snapshot classification tolerates transient short active list" {
+    const testing = std.testing;
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+
+    // Resize can publish the new active height before it has grown enough rows
+    // to satisfy that height. Every currently live node is active in this
+    // transient state, and classification must not invoke steady-state active
+    // coordinate lookup or mistake one for captured history.
+    const steady_rows = s.rows;
+    s.rows = steady_rows + 1;
+    defer s.rows = steady_rows;
+    try testing.expect(!s.nodeIsSnapshotHistory(s.pages.first.?));
 }
 
 test "PageList incremental compression bounds inspected pages" {

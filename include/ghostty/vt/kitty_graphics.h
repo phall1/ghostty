@@ -179,6 +179,14 @@ typedef enum GHOSTTY_ENUM_TYPED {
    */
   GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_Z = 12,
 
+  /** Whether an unspecified Unicode placeholder placement ID selects this
+   * placement. Output type: bool. */
+  GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_IS_PLACEHOLDER_DEFAULT = 13,
+
+  /** Whether the placement ID is client-specified rather than internal.
+   * Output type: bool. */
+  GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_IS_EXTERNAL = 14,
+
   GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyKittyGraphicsPlacementData;
 
@@ -480,6 +488,19 @@ GHOSTTY_API GhosttyResult ghostty_kitty_graphics_get(
     GhosttyKittyGraphics graphics,
     GhosttyKittyGraphicsData data,
     void* out);
+
+/**
+ * Copy all resident image IDs, including unplaced images, without allocating.
+ * An undersized buffer returns GHOSTTY_OUT_OF_SPACE, sets out_len to the
+ * required capacity, and writes no IDs. NULL with zero capacity queries size.
+ * The order is unspecified. Do not mutate the terminal between query and copy.
+ * Without Kitty graphics, returns GHOSTTY_NO_VALUE and sets out_len to zero.
+ */
+GHOSTTY_API GhosttyResult ghostty_kitty_graphics_image_ids(
+    GhosttyKittyGraphics graphics,
+    uint32_t* ids,
+    size_t capacity,
+    size_t* out_len);
 
 /**
  * Advance playing animations and get the time of the next frame.

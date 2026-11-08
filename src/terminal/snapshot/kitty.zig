@@ -988,6 +988,15 @@ pub const ScreenPlan = struct {
         }
     }
 
+    /// Emit one planned pixel record for a progressive snapshot capture.
+    pub fn encodePayloadAt(
+        self: *const ScreenPlan,
+        index: usize,
+        destination: *record.Writer,
+    ) EncodeError!void {
+        try encodePayload(destination, self.key, self.payloads[index]);
+    }
+
     /// Encode the KITTY_IMAGE_PAGE_PLACEMENTS record for one history page, if
     /// any placement is pinned to it, and nothing otherwise. Then encode the
     /// KITTY_IMAGE_PAYLOAD records of the images that are first placed on
@@ -995,6 +1004,21 @@ pub const ScreenPlan = struct {
     /// after the page's PAGE record. Pages must be visited newest first, in
     /// the same order HISTORY encodes them.
     pub fn encodePagePlacements(
+        self: *ScreenPlan,
+        node: *const Node,
+        destination: *record.Writer,
+    ) EncodeError!void {
+        try self.encodePagePlacementsRecord(node, destination);
+
+        while (self.payload_next < self.history_payloads.end and
+            self.payloads[self.payload_next].node == node) : (self.payload_next += 1)
+        {
+            try encodePayload(destination, self.key, self.payloads[self.payload_next]);
+        }
+    }
+
+    /// Emit only this page's placement record, leaving pixels for later calls.
+    pub fn encodePagePlacementsRecord(
         self: *ScreenPlan,
         node: *const Node,
         destination: *record.Writer,
@@ -1014,12 +1038,6 @@ pub const ScreenPlan = struct {
                 try encodePlacement(writer, planned, .page);
             }
             try destination.finish();
-        }
-
-        while (self.payload_next < self.history_payloads.end and
-            self.payloads[self.payload_next].node == node) : (self.payload_next += 1)
-        {
-            try encodePayload(destination, self.key, self.payloads[self.payload_next]);
         }
     }
 };
@@ -1827,6 +1845,25 @@ pub const Payload = struct {
     /// payload was dropped.
     bytes: usize,
 };
+
+/// Validate and skip one framed image unit in a build without Kitty graphics.
+/// This follows decodePayload's dropped-image behavior without accessing storage.
+pub fn discardPayload(source: *std.Io.Reader, header: record.Header) DecodeError!Payload {
+    if (header.tag != .kitty_image_payload) return error.UnexpectedRecordTag;
+    var record_reader: record.Reader = undefined;
+    record_reader.initHeader(source, header);
+    const reader = record_reader.payloadReader();
+    const result: Payload = .{
+        .key = try decodeKey(reader),
+        .image_id = try io.readInt(reader, u32),
+        .frame = try io.readInt(reader, u32),
+        .bytes = 0,
+    };
+    _ = try io.readInt(reader, u64);
+    _ = try reader.discardRemaining();
+    try record_reader.finish();
+    return result;
+}
 
 /// Decode one KITTY_IMAGE_PAYLOAD record and attach its pixels to the pending
 /// image or animation frame they belong to.

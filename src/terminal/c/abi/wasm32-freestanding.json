@@ -532,6 +532,53 @@
         }
       }
     },
+    "GhosttyKeyEncoderTerminalOptions": {
+      "kind": "struct",
+      "size": 12,
+      "align": 4,
+      "fields": {
+        "size": {
+          "offset": 0,
+          "size": 4,
+          "type": "u32"
+        },
+        "cursor_key_application": {
+          "offset": 4,
+          "size": 1,
+          "type": "bool"
+        },
+        "keypad_key_application": {
+          "offset": 5,
+          "size": 1,
+          "type": "bool"
+        },
+        "ignore_keypad_with_numlock": {
+          "offset": 6,
+          "size": 1,
+          "type": "bool"
+        },
+        "alt_esc_prefix": {
+          "offset": 7,
+          "size": 1,
+          "type": "bool"
+        },
+        "modify_other_keys_state_2": {
+          "offset": 8,
+          "size": 1,
+          "type": "bool"
+        },
+        "kitty_flags": {
+          "offset": 9,
+          "size": 1,
+          "type": "u8"
+        },
+        "backarrow_key_mode": {
+          "offset": 10,
+          "size": 1,
+          "type": "bool"
+        }
+      }
+    },
     "GhosttyKittyGraphicsPlacementRenderInfo": {
       "kind": "struct",
       "size": 48,
@@ -671,6 +718,28 @@
           "offset": 32,
           "size": 4,
           "type": "u32"
+        }
+      }
+    },
+    "GhosttyMouseEncoderTerminalOptions": {
+      "kind": "struct",
+      "size": 12,
+      "align": 4,
+      "fields": {
+        "size": {
+          "offset": 0,
+          "size": 4,
+          "type": "u32"
+        },
+        "event": {
+          "offset": 4,
+          "size": 4,
+          "type": "GhosttyMouseTrackingMode"
+        },
+        "format": {
+          "offset": 8,
+          "size": 4,
+          "type": "GhosttyMouseFormat"
         }
       }
     },
@@ -1236,6 +1305,70 @@
           "type": "u32"
         },
         "cell_height": {
+          "offset": 8,
+          "size": 4,
+          "type": "u32"
+        }
+      }
+    },
+    "GhosttySnapshotCaptureEvent": {
+      "kind": "struct",
+      "size": 28,
+      "align": 4,
+      "fields": {
+        "size": {
+          "offset": 0,
+          "size": 4,
+          "type": "u32"
+        },
+        "kind": {
+          "offset": 4,
+          "size": 4,
+          "type": "GhosttySnapshotCaptureEventKind"
+        },
+        "screen": {
+          "offset": 8,
+          "size": 4,
+          "type": "GhosttyTerminalScreen"
+        },
+        "rows": {
+          "offset": 12,
+          "size": 4,
+          "type": "u32"
+        },
+        "remaining": {
+          "offset": 16,
+          "size": 4,
+          "type": "u32"
+        },
+        "written": {
+          "offset": 20,
+          "size": 4,
+          "type": "u32"
+        },
+        "invalidation": {
+          "offset": 24,
+          "size": 4,
+          "type": "GhosttySnapshotCaptureInvalidation"
+        }
+      }
+    },
+    "GhosttySnapshotCaptureOptions": {
+      "kind": "struct",
+      "size": 12,
+      "align": 4,
+      "fields": {
+        "size": {
+          "offset": 0,
+          "size": 4,
+          "type": "u32"
+        },
+        "max_record_bytes": {
+          "offset": 4,
+          "size": 4,
+          "type": "u32"
+        },
+        "max_pages": {
           "offset": 8,
           "size": 4,
           "type": "u32"
@@ -2730,6 +2863,8 @@
         "COLUMNS": 10,
         "ROWS": 11,
         "Z": 12,
+        "IS_PLACEHOLDER_DEFAULT": 13,
+        "IS_EXTERNAL": 14,
         "MAX_VALUE": 2147483647
       },
       "keys": {
@@ -2780,6 +2915,14 @@
         "Z": {
           "direction": "out",
           "type": "i32"
+        },
+        "IS_PLACEHOLDER_DEFAULT": {
+          "direction": "out",
+          "type": "bool"
+        },
+        "IS_EXTERNAL": {
+          "direction": "out",
+          "type": "bool"
         }
       }
     },
@@ -4018,6 +4161,39 @@
         "STYLE_MAX_VALUE": 2147483647
       }
     },
+    "GhosttySnapshotCaptureEventKind": {
+      "kind": "enum",
+      "size": 4,
+      "align": 4,
+      "underlying": "i32",
+      "prefix": "GHOSTTY_SNAPSHOT_CAPTURE_EVENT_",
+      "values": {
+        "RECORD": 0,
+        "READY": 1,
+        "HISTORY_PAGE": 2,
+        "FINISH": 3,
+        "SCAN": 4,
+        "INVALIDATED": 5,
+        "IMAGE": 6,
+        "MAX_VALUE": 2147483647
+      }
+    },
+    "GhosttySnapshotCaptureInvalidation": {
+      "kind": "enum",
+      "size": 4,
+      "align": 4,
+      "underlying": "i32",
+      "prefix": "GHOSTTY_SNAPSHOT_CAPTURE_INVALIDATION_",
+      "values": {
+        "NONE": 0,
+        "WRONG_TERMINAL": 1,
+        "RESET": 2,
+        "RESIZE": 3,
+        "MUTATION": 4,
+        "EVICTED": 5,
+        "MAX_VALUE": 2147483647
+      }
+    },
     "GhosttySnapshotDecoderData": {
       "kind": "enum",
       "size": 4,
@@ -5136,6 +5312,11 @@
       "align": 4
     },
     "GhosttySgrParser": {
+      "kind": "opaque",
+      "size": 4,
+      "align": 4
+    },
+    "GhosttySnapshotCapture": {
       "kind": "opaque",
       "size": 4,
       "align": 4
