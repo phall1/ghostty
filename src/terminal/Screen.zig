@@ -44,6 +44,11 @@ alloc: Allocator,
 /// The list of pages in the screen.
 pages: PageList,
 
+/// Wrapping generation of explicit history erasures and screen resets.
+/// Deferred snapshot history must not restore rows cleared since READY,
+/// even when no historical rows had arrived at the time of the clear.
+history_clear_generation: u64 = 0,
+
 /// Special-case where we want no scrollback whatsoever. We have to flag
 /// this because max_size 0 in PageList gets rounded up to two pages so
 /// we can always have an active screen.
@@ -439,6 +444,8 @@ pub fn memoryUsage(self: *const Screen) MemoryUsage {
 /// - Disables protection mode
 ///
 pub fn reset(self: *Screen) void {
+    self.history_clear_generation +%= 1;
+
     // Reset our pages
     self.pages.reset();
 
@@ -1830,6 +1837,10 @@ pub inline fn eraseHistory(
     bl: ?point.Point,
 ) void {
     defer self.assertIntegrity();
+
+    // Record the clear intent even if the resident history is empty: older
+    // snapshot pages may still be in flight and must remain discarded.
+    self.history_clear_generation +%= 1;
 
     // Placements anchored in the erased rows are removed first, while
     // their pins still identify those rows. Erasing marks those pins as
@@ -4072,6 +4083,17 @@ test "Screen forwards optional scrollback limits" {
     );
     try testing.expectEqual(max_lines, s.pages.limits.lines.explicit);
     try testing.expect(!s.no_scrollback);
+}
+
+test "Screen history clear generation advances without resident history and wraps" {
+    var s = try Screen.init(std.testing.io, std.testing.allocator, .{ .cols = 2, .rows = 3 });
+    defer s.deinit();
+    try std.testing.expectEqual(s.pages.rows, s.pages.total_rows);
+    s.history_clear_generation = std.math.maxInt(u64);
+    s.eraseHistory(null);
+    try std.testing.expectEqual(@as(u64, 0), s.history_clear_generation);
+    s.reset();
+    try std.testing.expectEqual(@as(u64, 1), s.history_clear_generation);
 }
 
 test "Screen reset cursor pin is not garbage" {
