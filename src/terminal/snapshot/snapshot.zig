@@ -347,6 +347,10 @@ pub const Decoder = struct {
         /// use between calls.
         generations: std.EnumMap(TerminalScreenKey, usize),
 
+        /// Explicit history erasures and resets since READY invalidate only
+        /// history pages, not pending pixels for still-live active images.
+        history_clear_generations: std.EnumMap(TerminalScreenKey, u64),
+
         /// Keys whose HISTORY sequence was already consumed.
         routed: std.EnumSet(TerminalScreenKey),
 
@@ -547,6 +551,7 @@ pub const Decoder = struct {
         // that live terminal use destroys or replaces before their history
         // arrives.
         var generations: std.EnumMap(TerminalScreenKey, usize) = .init(.{});
+        var history_clear_generations: std.EnumMap(TerminalScreenKey, u64) = .init(.{});
         var kitty_generations: std.EnumMap(TerminalScreenKey, u64) = .init(.{});
         var kitty_counts: std.EnumArray(TerminalScreenKey, kitty.Counts) = .initFill(.{});
         var it = result.screens.all.iterator();
@@ -555,6 +560,7 @@ pub const Decoder = struct {
                 entry.key,
                 result.screens.generation(entry.key),
             );
+            history_clear_generations.put(entry.key, entry.value.*.history_clear_generation);
             if (comptime build_options.kitty_graphics) {
                 const storage = &entry.value.*.kitty_images;
                 kitty_generations.put(entry.key, storage.generation);
@@ -564,6 +570,7 @@ pub const Decoder = struct {
 
         self.state = .{ .history = .{
             .generations = generations,
+            .history_clear_generations = history_clear_generations,
             .routed = .empty,
             .pending = screen_count,
             .current = null,
@@ -668,6 +675,8 @@ pub const Decoder = struct {
     ///
     ///   * its screen was removed, or removed and recreated, since READY
     ///     (detected through ScreenSet generations);
+    ///   * its screen's history was explicitly erased or reset since READY,
+    ///     even if no resident history existed when it was cleared;
     ///   * the terminal was resized since READY, since encoded pages assume
     ///     the encoded width;
     ///   * prepending it would exceed the screen's scrollback limits, e.g.
@@ -829,6 +838,48 @@ pub const Decoder = struct {
         return restored;
     }
 
+    /// A history destination must also preserve the READY history lifetime.
+    /// Keep this separate from restoredScreen: a scrollback clear does not
+    /// invalidate pending pixels for images still placed in the active area.
+    fn historyScreen(
+        self: *const Decoder,
+        t: *Terminal,
+        sequence: *const Sequence,
+    ) ?*TerminalScreen {
+        if (!sequence.apply) return null;
+        const state = &self.state.history;
+        if (t.cols != state.cols) return null;
+        const restored = self.restoredScreen(t, sequence.key) orelse return null;
+        if (restored.history_clear_generation != state.history_clear_generations.get(sequence.key).?)
+            return null;
+        return restored;
+    }
+
+    /// Attach placements only when their history page was applied. Staged
+    /// decoding must still validate the record in builds without Kitty.
+    fn restorePagePlacements(
+        self: *Decoder,
+        alloc: Allocator,
+        t: *Terminal,
+        key: TerminalScreenKey,
+        applied: ?*TerminalScreen,
+        header: record.Header,
+    ) NextError!void {
+        if (comptime !build_options.kitty_graphics) return discardRecord(self.source, header);
+        try kitty.decodePagePlacements(
+            self.source,
+            header,
+            t.screens.active.io,
+            alloc,
+            key,
+            if (applied) |s| .{
+                .screen = s,
+                .page = s.pages.pages.first.?,
+                .ready_generation = self.state.history.kitty_generations.get(key).?,
+            } else null,
+        );
+    }
+
     /// Consume one KITTY_IMAGE_PAYLOAD record, attaching its pixels to their
     /// image when it is still the one restored at READY and dropping them
     /// otherwise.
@@ -887,11 +938,7 @@ pub const Decoder = struct {
 
         // Application is re-decided on every page so live terminal changes
         // between calls degrade to discarding instead of failing decoding.
-        const destination: ?*TerminalScreen = destination: {
-            if (!sequence.apply) break :destination null;
-            if (t.cols != state.cols) break :destination null;
-            break :destination self.restoredScreen(t, sequence.key);
-        };
+        const destination = self.historyScreen(t, sequence);
 
         sequence.remaining -= 1;
         const applied: ?*TerminalScreen, const rows: usize = rows: {
@@ -905,7 +952,7 @@ pub const Decoder = struct {
             // The one-shot history decoder rejects a Screen which already has
             // complete history. This incremental path intentionally bypasses
             // that guard: the terminal has been live since READY and may have
-            // accumulated new history. Generation and width checks above keep
+            // accumulated new history. Lifetime and width checks above keep
             // the destination compatible, while per-page finalization enforces
             // its current scrollback limits.
             const rows = history.decodePage(
@@ -940,22 +987,7 @@ pub const Decoder = struct {
             if (!present) return progress;
             const following = try stagedHeader(self.source);
             if (following.tag != .kitty_image_page_placements) return error.UnexpectedRecordTag;
-            if (comptime !build_options.kitty_graphics) {
-                try discardRecord(self.source, following);
-                return progress;
-            }
-            try kitty.decodePagePlacements(
-                self.source,
-                following,
-                t.screens.active.io,
-                alloc,
-                sequence.key,
-                if (applied) |s| .{
-                    .screen = s,
-                    .page = s.pages.pages.first.?,
-                    .ready_generation = state.kitty_generations.get(sequence.key).?,
-                } else null,
-            );
+            try self.restorePagePlacements(alloc, t, sequence.key, applied, following);
             return progress;
         }
 
@@ -969,20 +1001,7 @@ pub const Decoder = struct {
         };
         if (comptime build_options.kitty_graphics) {
             if (following.tag == .kitty_image_page_placements) {
-                // The page was just added at the top of the screen, which
-                // makes it the first page of the screen's page list.
-                try kitty.decodePagePlacements(
-                    self.source,
-                    following,
-                    t.screens.active.io,
-                    alloc,
-                    sequence.key,
-                    if (applied) |s| .{
-                        .screen = s,
-                        .page = s.pages.pages.first.?,
-                        .ready_generation = state.kitty_generations.get(sequence.key).?,
-                    } else null,
-                );
+                try self.restorePagePlacements(alloc, t, sequence.key, applied, following);
                 return progress;
             }
         }
@@ -2459,6 +2478,173 @@ test "incremental decode applies history below live PTY output" {
         @as(u21, '1'),
         newest_history.next.?.page().getRowAndCell(0, 0).cell.codepoint(),
     );
+}
+
+const TestHistoryDecodeMode = enum { stream, staged };
+
+fn testHistoryNext(
+    decoder: *Decoder,
+    t: *Terminal,
+    mode: TestHistoryDecodeMode,
+) !?Decoder.Progress {
+    return switch (mode) {
+        .stream => decoder.next(std.testing.allocator, t),
+        .staged => decoder.nextStaged(std.testing.allocator, t, false),
+    };
+}
+
+fn testBothHistoryScreens() !Terminal {
+    var t = try testHistoryTerminal(3);
+    errdefer t.deinit(std.testing.allocator);
+    var other = try testHistoryTerminal(3);
+    defer other.deinit(std.testing.allocator);
+    const alternate = try t.screens.getInit(std.testing.io, std.testing.allocator, .alternate, .{
+        .cols = t.cols,
+        .rows = t.rows,
+    });
+    std.mem.swap(TerminalScreen, alternate, other.screens.active);
+    return t;
+}
+
+fn testLiveHistoryClear(
+    mode: TestHistoryDecodeMode,
+    key: TerminalScreenKey,
+    reset: bool,
+    applied_pages: usize,
+) !void {
+    const testing = std.testing;
+    var t = try testBothHistoryScreens();
+    defer t.deinit(testing.allocator);
+    var encoded: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer encoded.deinit();
+    try encode(testing.allocator, &encoded.writer, &t, test_encode_options);
+    const snapshot_len = encoded.written().len;
+    try encoded.writer.writeAll("following transport bytes");
+
+    var source: std.Io.Reader = .fixed(encoded.written());
+    var decoder: Decoder = .init(&source);
+    var decoded = try decoder.ready(testing.allocator, testing.io, test_decode_options);
+    defer decoded.deinit(testing.allocator);
+    const restored = &decoded.terminal.?;
+    // Alternate screens normally have no history budget. The format permits
+    // their HISTORY sequences, so let this crafted fixture retain them too.
+    restored.screens.get(.alternate).?.pages.setMaxBytes(null);
+    restored.screens.get(.alternate).?.pages.setMaxLines(null);
+    const target = restored.screens.get(key).?;
+    // No incidental resident history can act as an anchor for a clear.
+    try testing.expectEqual(target.pages.rows, target.pages.total_rows);
+
+    var applied: usize = 0;
+    while (applied < applied_pages) {
+        const progress = (try testHistoryNext(&decoder, restored, mode)).?.page;
+        if (progress.key == key) applied += 1;
+    }
+    restored.screens.switchTo(key);
+    var live = restored.vtStream();
+    defer live.deinit();
+    live.nextSlice(if (reset) "\x1bc" else "\x1b[3J");
+
+    var dropped: usize = 0;
+    while (try testHistoryNext(&decoder, restored, mode)) |progress| {
+        const cleared = reset or progress.page.key == key;
+        try testing.expectEqual(@as(usize, if (cleared) 0 else 2), progress.page.rows);
+        if (cleared) dropped += 1;
+    }
+    try testing.expect(dropped > 0);
+    try testing.expect(decoder.state == .finished);
+    try testing.expectEqual(snapshot_len, source.seek);
+    try testClearedHistoryRows(restored, key, reset);
+}
+
+fn testClearedHistoryRows(t: *Terminal, key: TerminalScreenKey, reset: bool) !void {
+    var it = t.screens.all.iterator();
+    while (it.next()) |entry| {
+        const s = entry.value.*;
+        const expected: usize = if (reset or entry.key == key) 0 else 6;
+        try std.testing.expectEqual(expected, s.pages.total_rows - s.pages.rows);
+    }
+}
+
+test "live history clear never resurrects deferred snapshot rows" {
+    for (std.enums.values(TestHistoryDecodeMode)) |mode| {
+        for (std.enums.values(TerminalScreenKey)) |key| {
+            for ([_]bool{ false, true }) |reset| {
+                for (0..2) |applied_pages|
+                    try testLiveHistoryClear(mode, key, reset, applied_pages);
+            }
+        }
+    }
+}
+
+test "live history clear still validates discarded records and FINISH" {
+    for (std.enums.values(TestHistoryDecodeMode)) |mode| {
+        for ([_]bool{ false, true }) |corrupt_page|
+            try testHistoryClearCorruption(mode, corrupt_page);
+    }
+}
+
+fn testHistoryClearCorruption(mode: TestHistoryDecodeMode, corrupt_page: bool) !void {
+    const testing = std.testing;
+    var t = try testHistoryTerminal(3);
+    defer t.deinit(testing.allocator);
+    var encoded: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer encoded.deinit();
+    try encode(testing.allocator, &encoded.writer, &t, test_encode_options);
+    var source: std.Io.Reader = .fixed(encoded.written());
+    var decoder: Decoder = .init(&source);
+    var decoded = try decoder.ready(testing.allocator, testing.io, test_decode_options);
+    defer decoded.deinit(testing.allocator);
+    const corrupt_offset = if (corrupt_page) offset: {
+        var records: std.Io.Reader = .fixed(encoded.written()[source.seek..]);
+        const manifest = try record.Header.decode(&records);
+        try records.discardAll(manifest.payload_len);
+        const header = try record.Header.decode(&records);
+        try testing.expectEqual(record.Tag.page, header.tag);
+        break :offset source.seek + records.seek - 1;
+    } else encoded.written().len - 1;
+    encoded.writer.buffer[corrupt_offset] ^= 1;
+    const restored = &decoded.terminal.?;
+    restored.eraseDisplay(.scrollback, false);
+    const valid_pages: usize = if (corrupt_page) 0 else 3;
+    for (0..valid_pages) |_| {
+        const progress = (try testHistoryNext(&decoder, restored, mode)).?.page;
+        try testing.expectEqual(@as(usize, 0), progress.rows);
+    }
+    try testing.expectError(error.InvalidChecksum, testHistoryNext(&decoder, restored, mode));
+    try testing.expect(decoder.state == .failed);
+}
+
+test "live history clear preserves pending active image pixels" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    const testing = std.testing;
+    for (std.enums.values(TestHistoryDecodeMode)) |mode| {
+        var t = try testHistoryTerminal(3);
+        defer t.deinit(testing.allocator);
+        var vt = t.vtStream();
+        defer vt.deinit();
+        vt.nextSlice("\x1b_Ga=T,f=32,s=1,v=1,i=42,p=1,q=2;AAECAw==\x1b\\");
+        var encoded: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer encoded.deinit();
+        try encode(testing.allocator, &encoded.writer, &t, test_encode_options);
+        var source: std.Io.Reader = .fixed(encoded.written());
+        var decoder: Decoder = .init(&source);
+        var decoded = try decoder.ready(testing.allocator, testing.io, test_decode_options);
+        defer decoded.deinit(testing.allocator);
+        const restored = &decoded.terminal.?;
+        const storage = &restored.screens.active.kitty_images;
+        try testing.expect(storage.imageById(42).?.data.isPending());
+        restored.eraseDisplay(.scrollback, false);
+        const image = (try testHistoryNext(&decoder, restored, mode)).?.image;
+        try testing.expectEqual(@as(usize, 4), image.bytes);
+        try testing.expectEqualSlices(u8, &.{ 0, 1, 2, 3 }, storage.imageById(42).?.data.bytes().?);
+        var pages: usize = 0;
+        while (try testHistoryNext(&decoder, restored, mode)) |progress| {
+            try testing.expectEqual(@as(usize, 0), progress.page.rows);
+            pages += 1;
+        }
+        try testing.expectEqual(@as(usize, 3), pages);
+        try testing.expect(decoder.state == .finished);
+    }
 }
 
 test "incremental decode discards history for screens changed since READY" {
