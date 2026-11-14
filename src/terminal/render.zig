@@ -6082,3 +6082,33 @@ test "render update retries rows after OOM" {
     const cells = state.row_data.items(.cells)[0].slice();
     try testing.expectEqualSlices(u21, &.{0x301}, cells.items(.grapheme)[1]);
 }
+
+test "render update retries grouped and page-dirty rows after OOM" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    for ([_]bool{ false, true }) |page_dirty| {
+        var t = try Terminal.init(io, alloc, .{ .cols = 2, .rows = 9 });
+        defer t.deinit(alloc);
+        var stream = t.vtStream();
+        defer stream.deinit();
+        stream.nextSlice("x");
+
+        var state: RenderState = .empty;
+        defer state.deinit(alloc);
+        try state.update(alloc, &t);
+        state.clean();
+        stream.nextSlice("\x1b[9;1HT\x1b[1;2He\xcc\x81");
+        t.screens.active.pages.getTopLeft(.active).node.page().dirty = page_dirty;
+
+        var failing = testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+        try testing.expectError(error.OutOfMemory, state.update(failing.allocator(), &t));
+        try state.update(alloc, &t);
+
+        const first = state.row_data.items(.cells)[0].slice();
+        try testing.expectEqualSlices(u21, &.{0x301}, first.items(.grapheme)[1]);
+        const last = state.row_data.items(.cells)[8].slice();
+        try testing.expectEqual('T', last.items(.raw)[0].content.codepoint.data);
+    }
+}

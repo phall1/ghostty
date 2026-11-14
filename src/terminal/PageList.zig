@@ -1375,21 +1375,26 @@ pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
         .lt => {
             // We first change our row count so that we have the proper amount
             // we can use when shrinking our cols.
-            const old_active_top = self.total_rows - self.rows;
+            //
+            // Row growth can evict a historical page, so absolute row offsets
+            // taken before the resize do not survive it. Track the cursor
+            // itself and read its active row back afterwards.
+            const cursor_pin = if (opts.cursor) |c|
+                c.pin orelse try self.trackPin(self.pin(.{ .active = .{ .x = c.x, .y = c.y } }).?)
+            else
+                null;
+            defer if (cursor_pin) |p| {
+                if (opts.cursor.?.pin == null) self.untrackPin(p);
+            };
             try self.resizeWithoutReflow(opts: {
                 var copy = opts;
                 copy.cols = self.cols;
                 break :opts copy;
             });
 
-            // Changing the row count doesn't move any content, only the top of
-            // the active area (e.g. when pulling down scrollback), so the
-            // cursor's row in the active area moves by the opposite amount.
             var cols_opts = opts;
             if (cols_opts.cursor) |*c| {
-                const screen_y = old_active_top + c.y;
-                const new_active_top = self.total_rows - self.rows;
-                if (screen_y >= new_active_top) c.y = @intCast(screen_y - new_active_top);
+                if (self.pointFromPin(.active, cursor_pin.?.*)) |pt| c.y = @intCast(pt.active.y);
             }
 
             try self.resizeCols(cols, cols_opts);
@@ -22666,4 +22671,34 @@ test "PageList grow shrinks a mostly unused capacity to its headroom" {
         next.styles < 16 * standard.styles);
     try testing.expect(next.string_bytes > standard.string_bytes and
         next.string_bytes < 16 * standard.string_bytes);
+}
+
+test "PageList combined resize keeps cursor when row growth prunes history" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    for ([_]bool{ false, true }) |supplied_pin| {
+        var s = try init(alloc, .{ .cols = 5, .rows = 2, .max_size = 2 * std_size });
+        defer s.deinit();
+        while (s.totalPages() < 2 or s.pages.last.?.rows() < s.pages.last.?.capacity().rows) {
+            _ = try s.grow();
+        }
+        const cursor = try s.trackPin(s.getTopLeft(.active));
+        defer s.untrackPin(cursor);
+        const cell = cursor.rowAndCell().cell;
+        cell.* = .{
+            .content_tag = .codepoint,
+            .content = .{ .codepoint = .{ .data = 'C' } },
+        };
+
+        try s.resize(.{
+            .cols = 4,
+            .rows = 3,
+            .cursor = .{ .x = 0, .y = 0, .pin = if (supplied_pin) cursor else null },
+        });
+
+        const active = s.pointFromPin(.active, cursor.*).?;
+        try testing.expectEqual(0, active.active.y);
+        try testing.expectEqual('C', cursor.rowAndCell().cell.content.codepoint.data);
+    }
 }
