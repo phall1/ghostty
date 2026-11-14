@@ -697,6 +697,27 @@ pub const Decoder = struct {
         alloc: Allocator,
         t: *Terminal,
     ) NextError!?Progress {
+        return self.nextWithBoundary(alloc, t, null);
+    }
+
+    /// Decode a caller-framed unit without reading the next unit's header.
+    /// `page_placements` declares whether this unit includes the optional
+    /// KITTY_IMAGE_PAGE_PLACEMENTS immediately after its PAGE.
+    pub fn nextStaged(
+        self: *Decoder,
+        alloc: Allocator,
+        t: *Terminal,
+        page_placements: bool,
+    ) NextError!?Progress {
+        return self.nextWithBoundary(alloc, t, page_placements);
+    }
+
+    fn nextWithBoundary(
+        self: *Decoder,
+        alloc: Allocator,
+        t: *Terminal,
+        page_placements: ?bool,
+    ) NextError!?Progress {
         switch (self.state) {
             // `ready` must succeed before history exists to decode, and a
             // failed decoder no longer knows its stream position.
@@ -711,7 +732,7 @@ pub const Decoder = struct {
         while (true) {
             // Read the next header before deciding how to decode the
             // record. Unknown records before it were skipped.
-            const header = try self.takeHeader();
+            const header = try self.takeHeaderStaged(page_placements != null);
 
             // Kitty graphics pixels may come anywhere after READY, even
             // between the pages of a HISTORY sequence, in any screen order.
@@ -719,12 +740,21 @@ pub const Decoder = struct {
                 if (header.tag == .kitty_image_payload) {
                     return try self.nextPayload(alloc, t, header);
                 }
+            } else if (page_placements != null and header.tag == .kitty_image_payload) {
+                const payload = try kitty.discardPayload(self.source, header);
+                if (state.generations.get(payload.key) == null) return error.UnexpectedKittyKey;
+                return .{ .image = .{
+                    .key = payload.key,
+                    .image_id = payload.image_id,
+                    .frame = payload.frame,
+                    .bytes = 0,
+                } };
             }
 
             // Stream the current sequence's next PAGE if one remains.
             if (state.current) |*sequence| {
                 if (sequence.remaining > 0) {
-                    return try self.nextPage(alloc, t, sequence, header);
+                    return try self.nextPage(alloc, t, sequence, header, page_placements);
                 }
                 state.current = null;
             }
@@ -769,14 +799,18 @@ pub const Decoder = struct {
     /// Return the next record header: the one a previous call read ahead,
     /// or else the next one from the source. A failure from reading ahead
     /// is returned here.
-    fn takeHeader(self: *Decoder) NextError!record.Header {
+    fn takeHeaderStaged(self: *Decoder, staged: bool) NextError!record.Header {
         const state = &self.state.history;
         if (state.pending_error) |err| return err;
         if (state.pending_header) |header| {
             state.pending_header = null;
             return header;
         }
-        return try record.nextHeader(self.source);
+        if (comptime build_options.kitty_graphics) return try record.nextHeader(self.source);
+        if (!staged) return try record.nextHeader(self.source);
+        // Disabled Kitty is normally an unknown record. A staged image is
+        // nevertheless a complete progress unit, not a reason to read ahead.
+        return try stagedHeader(self.source);
     }
 
     /// The screen for `key` in `t`, if it is still the screen restored at
@@ -847,6 +881,7 @@ pub const Decoder = struct {
         t: *Terminal,
         sequence: *Sequence,
         header: record.Header,
+        page_placements: ?bool,
     ) NextError!Progress {
         const state = &self.state.history;
 
@@ -901,6 +936,29 @@ pub const Decoder = struct {
             .remaining = sequence.remaining,
         } };
 
+        if (page_placements) |present| {
+            if (!present) return progress;
+            const following = try stagedHeader(self.source);
+            if (following.tag != .kitty_image_page_placements) return error.UnexpectedRecordTag;
+            if (comptime !build_options.kitty_graphics) {
+                try discardRecord(self.source, following);
+                return progress;
+            }
+            try kitty.decodePagePlacements(
+                self.source,
+                following,
+                t.screens.active.io,
+                alloc,
+                sequence.key,
+                if (applied) |s| .{
+                    .screen = s,
+                    .page = s.pages.pages.first.?,
+                    .ready_generation = state.kitty_generations.get(sequence.key).?,
+                } else null,
+            );
+            return progress;
+        }
+
         // The page's Kitty graphics placements, if any, follow it. Read the
         // next header to find out. Anything else waits for the next call,
         // and so does a failure to read it, because this page is already
@@ -933,6 +991,26 @@ pub const Decoder = struct {
         return progress;
     }
 };
+
+fn discardRecord(source: *std.Io.Reader, header: record.Header) !void {
+    var reader: record.Reader = undefined;
+    reader.initHeader(source, header);
+    try reader.payloadReader().discardAll(header.payload_len);
+    try reader.finish();
+}
+
+/// Keep explicit Kitty unit boundaries even when that feature is disabled,
+/// while preserving upstream's validation and skipping of unknown records.
+fn stagedHeader(source: *std.Io.Reader) !record.Header {
+    while (true) {
+        const header = try record.Header.decode(source);
+        switch (header.tag) {
+            .kitty_image_storage, .kitty_image_payload, .kitty_image_page_placements => return header,
+            else => if (header.tag.known()) return header,
+        }
+        try discardRecord(source, header);
+    }
+}
 
 /// Restore one complete snapshot into a native Terminal and continuation.
 ///
@@ -1058,6 +1136,63 @@ fn testHistoryTerminal(history_pages: u8) !Terminal {
 fn testTopLeftCodepoint(terminal_screen: *const TerminalScreen) u21 {
     return terminal_screen.pages.getTopLeft(.screen).node
         .page().getRowAndCell(0, 0).cell.codepoint();
+}
+
+/// Exercise exactly the transport's byte boundary, not an always-full reader.
+fn testStagedUnits(bytes: []const u8) !void {
+    const testing = std.testing;
+    var reader: std.Io.Reader = .fixed(bytes);
+    var decoder: Decoder = .init(&reader);
+    var decoded = try decoder.ready(testing.allocator, testing.io, test_decode_options);
+    defer decoded.deinit(testing.allocator);
+    var offset = reader.seek;
+    var pages: usize = 0;
+    while (offset < bytes.len) {
+        const start = offset;
+        var framing: std.Io.Reader = .fixed(bytes[offset..]);
+        var placements = false;
+        var tag: record.Tag = undefined;
+        while (true) {
+            const header = try record.Header.decode(&framing);
+            try framing.discardAll(header.payload_len);
+            tag = header.tag;
+            if (tag != .history) break;
+        }
+        if (tag == .page and bytes.len - offset - framing.seek >= record.Header.len) {
+            var peek: std.Io.Reader = .fixed(bytes[offset + framing.seek ..]);
+            const following = try record.Header.decode(&peek);
+            if (following.tag == .kitty_image_page_placements) {
+                try framing.discardAll(record.Header.len + following.payload_len);
+                placements = true;
+            }
+        }
+        offset += framing.seek;
+        reader = .fixed(bytes[start..offset]);
+        const progress = try decoder.nextStaged(testing.allocator, &decoded.terminal.?, placements);
+        try testing.expectEqual(offset - start, reader.seek);
+        if (tag == .finish) {
+            try testing.expectEqual(@as(?Decoder.Progress, null), progress);
+        } else {
+            try testing.expect(progress != null);
+            if (tag == .page) pages += 1;
+        }
+    }
+    try testing.expect(pages >= 2);
+    try testing.expectEqual(@as(?Decoder.Progress, null), try decoder.nextStaged(testing.allocator, &decoded.terminal.?, false));
+}
+
+test "staged decoder preserves EOF boundaries across pages and FINISH" {
+    var t = try testHistoryTerminal(3);
+    defer t.deinit(std.testing.allocator);
+    var bytes: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer bytes.deinit();
+    try encode(std.testing.allocator, &bytes.writer, &t, test_encode_options);
+    try testStagedUnits(bytes.written());
+}
+
+test "staged decoder preserves Kitty page placement and pixel units" {
+    const bytes = comptime test_fixture.parse(@embedFile("testdata/kitty-history-v1.hex"));
+    try testStagedUnits(&bytes);
 }
 
 test "complete snapshot round trip with history and alternate screen" {

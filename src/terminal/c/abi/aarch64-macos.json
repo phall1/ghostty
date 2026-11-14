@@ -532,6 +532,53 @@
         }
       }
     },
+    "GhosttyKeyEncoderTerminalOptions": {
+      "kind": "struct",
+      "size": 16,
+      "align": 8,
+      "fields": {
+        "size": {
+          "offset": 0,
+          "size": 8,
+          "type": "u64"
+        },
+        "cursor_key_application": {
+          "offset": 8,
+          "size": 1,
+          "type": "bool"
+        },
+        "keypad_key_application": {
+          "offset": 9,
+          "size": 1,
+          "type": "bool"
+        },
+        "ignore_keypad_with_numlock": {
+          "offset": 10,
+          "size": 1,
+          "type": "bool"
+        },
+        "alt_esc_prefix": {
+          "offset": 11,
+          "size": 1,
+          "type": "bool"
+        },
+        "modify_other_keys_state_2": {
+          "offset": 12,
+          "size": 1,
+          "type": "bool"
+        },
+        "kitty_flags": {
+          "offset": 13,
+          "size": 1,
+          "type": "u8"
+        },
+        "backarrow_key_mode": {
+          "offset": 14,
+          "size": 1,
+          "type": "bool"
+        }
+      }
+    },
     "GhosttyKittyGraphicsPlacementRenderInfo": {
       "kind": "struct",
       "size": 56,
@@ -671,6 +718,28 @@
           "offset": 36,
           "size": 4,
           "type": "u32"
+        }
+      }
+    },
+    "GhosttyMouseEncoderTerminalOptions": {
+      "kind": "struct",
+      "size": 16,
+      "align": 8,
+      "fields": {
+        "size": {
+          "offset": 0,
+          "size": 8,
+          "type": "u64"
+        },
+        "event": {
+          "offset": 8,
+          "size": 4,
+          "type": "GhosttyMouseTrackingMode"
+        },
+        "format": {
+          "offset": 12,
+          "size": 4,
+          "type": "GhosttyMouseFormat"
         }
       }
     },
@@ -2730,6 +2799,8 @@
         "COLUMNS": 10,
         "ROWS": 11,
         "Z": 12,
+        "IS_PLACEHOLDER_DEFAULT": 13,
+        "IS_EXTERNAL": 14,
         "MAX_VALUE": 2147483647
       },
       "keys": {
@@ -2780,6 +2851,14 @@
         "Z": {
           "direction": "out",
           "type": "i32"
+        },
+        "IS_PLACEHOLDER_DEFAULT": {
+          "direction": "out",
+          "type": "bool"
+        },
+        "IS_EXTERNAL": {
+          "direction": "out",
+          "type": "bool"
         }
       }
     },

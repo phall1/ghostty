@@ -158,7 +158,7 @@ pub const LoadingImage = struct {
             // is a PNG we can save a lot of memory/effort buffering the
             // data but failing up front.
             if (t.format == .png and
-                sys.decode_png == null)
+                sys.decode_png.load(.acquire) == null)
             {
                 return error.UnsupportedMedium;
             }
@@ -678,7 +678,7 @@ pub const LoadingImage = struct {
     fn decodePng(self: *LoadingImage, alloc: Allocator) !void {
         assert(self.image.format == .png);
 
-        const decode_png_fn = sys.decode_png orelse
+        const decode_png_fn = sys.decode_png.load(.acquire) orelse
             return error.UnsupportedFormat;
 
         var limited: LimitedAllocator = .init(alloc, max_size);
@@ -2089,7 +2089,7 @@ test "image load: windows canonical path check rejects a file reached through a 
 }
 
 test "image load: png, not compressed, regular file" {
-    if (sys.decode_png == null) return error.SkipZigTest;
+    if (sys.decode_png.load(.acquire) == null) return error.SkipZigTest;
 
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -2134,7 +2134,7 @@ test "image load: png, not compressed, regular file" {
 }
 
 test "image load: png, zlib compressed, direct" {
-    if (sys.decode_png == null) return error.SkipZigTest;
+    if (sys.decode_png.load(.acquire) == null) return error.SkipZigTest;
 
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -2179,9 +2179,9 @@ test "image load: png rejects oversized decoder allocation" {
         }
     }.decode;
 
-    const original_decode_png = sys.decode_png;
-    defer sys.decode_png = original_decode_png;
-    sys.decode_png = &oversized_decoder;
+    const original_decode_png = sys.decode_png.load(.acquire);
+    defer sys.decode_png.store(original_decode_png, .release);
+    sys.decode_png.store(&oversized_decoder, .release);
 
     // Fail any allocation which reaches the underlying allocator. The size
     // limiter should reject the decoder's request before it gets that far.
@@ -2202,7 +2202,7 @@ test "image load: png rejects oversized decoder allocation" {
 }
 
 test "image load: png rejects oversized Wuffs image before allocation" {
-    if (sys.decode_png == null) return error.SkipZigTest;
+    if (sys.decode_png.load(.acquire) == null) return error.SkipZigTest;
 
     const testing = std.testing;
     const alloc = testing.allocator;

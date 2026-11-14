@@ -26,6 +26,16 @@ const MouseEncoderWrapper = struct {
 /// C: GhosttyMouseEncoder
 pub const Encoder = ?*MouseEncoderWrapper;
 
+/// Terminal-derived mouse encoder options, after the terminal has resolved
+/// tracking and format precedence.
+/// C: GhosttyMouseEncoderTerminalOptions
+pub const TerminalOptions = extern struct {
+    pub const sized_base = "format";
+    size: usize = @sizeOf(TerminalOptions),
+    event: TrackingMode,
+    format: Format,
+};
+
 /// C: GhosttyMouseTrackingMode
 pub const TrackingMode = terminal_mouse.Event;
 
@@ -218,6 +228,21 @@ fn setTyped(
     return .success;
 }
 
+pub fn terminal_options(
+    terminal_: Terminal,
+    out: ?*TerminalOptions,
+) callconv(lib.calling_conv) Result {
+    if (comptime !lib.feature(.input_encode)) return .unsupported;
+    const t: *ZigTerminal = (terminal_ orelse return .invalid_value).terminal;
+    const result = out orelse return .invalid_value;
+    if (!lib.sizedCheck(.output, result)) return .invalid_value;
+    lib.sizedWrite(result, .{
+        .event = t.flags.mouse_event,
+        .format = t.flags.mouse_format,
+    });
+    return .success;
+}
+
 pub fn set_from_terminal(
     encoder_: Encoder,
     terminal_: Terminal,
@@ -367,6 +392,27 @@ test "set" {
     const track_last_cell = true;
     try testing.expectEqual(Result.success, set(e, .track_last_cell, &track_last_cell));
     try testing.expect(e.?.track_last_cell);
+}
+
+test "terminal_options exactly captures effective state" {
+    const terminal_c = @import("terminal.zig");
+    var handle: Terminal = undefined;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &handle,
+        80,
+        24,
+    ));
+    defer terminal_c.free(handle);
+    const terminal = terminal_c.zigTerminal(handle).?;
+    terminal.flags.mouse_event = .any;
+    terminal.flags.mouse_format = .sgr_pixels;
+
+    var out: TerminalOptions = undefined;
+    out.size = @sizeOf(TerminalOptions);
+    try testing.expectEqual(Result.success, terminal_options(handle, &out));
+    try testing.expectEqual(terminal.flags.mouse_event, out.event);
+    try testing.expectEqual(terminal.flags.mouse_format, out.format);
 }
 
 test "set_from_terminal" {

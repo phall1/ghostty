@@ -21,8 +21,16 @@
  * Setting one enables the feature that depends on it. For example, setting a
  * PNG decoder enables PNG image support in the Kitty Graphics Protocol. Set
  * them at startup with ghostty_sys_set() and a `GhosttySysOption`. It is not
- * thread-safe, so call it before any other thread uses the library, never while
- * one does. Passing NULL clears an implementation and disables the feature.
+ * generally thread-safe, so call it before any other thread uses the library,
+ * never while one does. Passing NULL clears an implementation and disables
+ * the feature.
+ *
+ * The DECODE_PNG function pointer is an exception: publication and reads are
+ * atomic, so it may be replaced concurrently with library calls. The callback
+ * must remain callable after replacement until every in-flight call finishes.
+ * This does not synchronize USERDATA or any state owned by the callback; those
+ * remain the embedder's responsibility. Other options retain the startup-only
+ * requirement.
  *
  * ## Example
  *
@@ -270,7 +278,8 @@ typedef enum GHOSTTY_ENUM_TYPED {
  *
  * Configures a process-global implementation function. These should be
  * set once at startup before using any terminal functionality that
- * depends on them.
+ * depends on them. DECODE_PNG supports concurrent pointer replacement under
+ * the callback lifetime and USERDATA conditions documented above.
  *
  * @param option The option to set
  * @param value  Pointer to the value (type depends on the option),

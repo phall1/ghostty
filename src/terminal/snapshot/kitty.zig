@@ -1828,6 +1828,25 @@ pub const Payload = struct {
     bytes: usize,
 };
 
+/// Validate and skip one framed image unit in a build without Kitty graphics.
+/// This follows decodePayload's dropped-image behavior without accessing storage.
+pub fn discardPayload(source: *std.Io.Reader, header: record.Header) DecodeError!Payload {
+    if (header.tag != .kitty_image_payload) return error.UnexpectedRecordTag;
+    var record_reader: record.Reader = undefined;
+    record_reader.initHeader(source, header);
+    const reader = record_reader.payloadReader();
+    const result: Payload = .{
+        .key = try decodeKey(reader),
+        .image_id = try io.readInt(reader, u32),
+        .frame = try io.readInt(reader, u32),
+        .bytes = 0,
+    };
+    _ = try io.readInt(reader, u64);
+    _ = try reader.discardRemaining();
+    try record_reader.finish();
+    return result;
+}
+
 /// Decode one KITTY_IMAGE_PAYLOAD record and attach its pixels to the pending
 /// image or animation frame they belong to.
 ///

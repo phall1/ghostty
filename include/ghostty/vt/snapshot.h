@@ -684,6 +684,34 @@ GHOSTTY_API GhosttyResult ghostty_snapshot_decoder_next(
     GhosttySnapshotDecoder decoder);
 
 /**
+ * Decode one caller-framed progressive unit without reading the following
+ * unit's header. The unit is HISTORY records followed by one PAGE (and its
+ * optional KITTY_IMAGE_PAGE_PLACEMENTS), one KITTY_IMAGE_PAYLOAD, or FINISH.
+ * Set page_placements only when this unit includes that placement record.
+ * Unknown records may precede a unit. The caller must validate complete unit
+ * framing before calling and keep the reader's storage alive throughout.
+ * Return values and progress getters are identical to decoder_next. An image
+ * in a Kitty-disabled build is validated and discarded, with image progress
+ * reporting zero attached bytes. Normal decoder_next lookahead is unchanged.
+ */
+GHOSTTY_API GhosttyResult ghostty_snapshot_decoder_next_staged(
+    GhosttySnapshotDecoder decoder,
+    bool page_placements);
+
+/**
+ * Prevalidate the framing and CRC32C of every record in a bounded staged unit.
+ * The bytes do not include a snapshot envelope. Unknown records are validated
+ * too. A partial header, partial payload, or bad CRC returns INVALID_VALUE.
+ * This does not allocate or mutate any terminal. Call it before next_staged
+ * when a rejected multi-record unit must not partially change scrollback.
+ * Semantic record ordering is still the decoder's responsibility. NULL with
+ * zero length is an empty valid sequence; NULL with nonzero length is invalid.
+ */
+GHOSTTY_API GhosttyResult ghostty_snapshot_validate_records(
+    const uint8_t* bytes,
+    size_t len);
+
+/**
  * Decode and validate one complete snapshot.
  *
  * This is the one-shot form of READY followed by all history pages through
