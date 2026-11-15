@@ -958,6 +958,11 @@ pub const Decoder = struct {
             .remaining = sequence.remaining,
         } };
 
+        // Without Kitty graphics there are no placements to attach to this
+        // page. Leave optional records for the next call to skip and validate,
+        // rather than waiting for another header before reporting progress.
+        if (comptime !build_options.kitty_graphics) return progress;
+
         // The page's Kitty graphics placements, if any, follow it. Read the
         // next header to find out. Anything else waits for the next call,
         // and so does a failure to read it, because this page is already
@@ -966,11 +971,9 @@ pub const Decoder = struct {
             state.pending_error = err;
             return progress;
         };
-        if (comptime build_options.kitty_graphics) {
-            if (following.tag == .kitty_image_page_placements) {
-                try self.restorePagePlacements(alloc, t, sequence.key, applied, following);
-                return progress;
-            }
+        if (following.tag == .kitty_image_page_placements) {
+            try self.restorePagePlacements(alloc, t, sequence.key, applied, following);
+            return progress;
         }
 
         state.pending_header = following;
@@ -2317,6 +2320,49 @@ test "incremental next reports invalid decoder states" {
         error.DecoderNotReady,
         decoder.next(testing.allocator, &terminal_value),
     );
+}
+
+test "incremental decode without Kitty stops at each history page boundary" {
+    if (comptime build_options.kitty_graphics) return error.SkipZigTest;
+    const testing = std.testing;
+    var t = try testHistoryTerminal(3);
+    defer t.deinit(testing.allocator);
+    var encoded: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer encoded.deinit();
+    try encode(testing.allocator, &encoded.writer, &t, test_encode_options);
+
+    var source: std.Io.Reader = .fixed(encoded.written());
+    var decoder: Decoder = .init(&source);
+    var decoded = try decoder.ready(testing.allocator, testing.io, test_decode_options);
+    defer decoded.deinit(testing.allocator);
+    const restored = &decoded.terminal.?;
+    const history_start = source.seek;
+    var records: std.Io.Reader = .fixed(encoded.written()[history_start..]);
+    const manifest = try record.Header.decode(&records);
+    try testing.expectEqual(record.Tag.history, manifest.tag);
+    try records.discardAll(manifest.payload_len);
+
+    for (0..3) |index| {
+        // The first call also consumes HISTORY; subsequent calls begin at PAGE.
+        const start = if (index == 0) 0 else records.seek;
+        const header = try record.Header.decode(&records);
+        try testing.expectEqual(record.Tag.page, header.tag);
+        try records.discardAll(header.payload_len);
+        source = .fixed(encoded.written()[history_start + start .. history_start + records.seek]);
+        const progress = (try decoder.next(testing.allocator, restored)).?.page;
+        try testing.expectEqual(@as(usize, 2), progress.rows);
+        try testing.expectEqual(@as(u32, @intCast(2 - index)), progress.remaining);
+        try testing.expectEqual(source.buffer.len, source.seek);
+        try testing.expectEqual(null, decoder.state.history.pending_header);
+        try testing.expectEqual(null, decoder.state.history.pending_error);
+    }
+
+    // FINISH arrives separately. No failed speculative read may poison it.
+    source = .fixed(encoded.written()[history_start + records.seek ..]);
+    try testing.expectEqual(@as(?Decoder.Progress, null), try decoder.next(testing.allocator, restored));
+    try testing.expectEqual(source.buffer.len, source.seek);
+    try testing.expectEqual(@as(?Decoder.Progress, null), try decoder.next(testing.allocator, restored));
+    try testing.expectEqual(@as(u21, 'A'), testTopLeftCodepoint(restored.screens.active));
 }
 
 test "incremental decode applies history below live PTY output" {
