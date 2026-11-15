@@ -79,8 +79,8 @@ typedef enum GHOSTTY_ENUM_TYPED {
 /**
  * Key encoder option identifiers.
  *
- * These values are used with ghostty_key_encoder_set() to configure
- * the behavior of the key encoder.
+ * These values are used with ghostty_key_encoder_set() and
+ * ghostty_key_encoder_get(). Each getter writes the same type the setter reads.
  *
  * @ingroup key
  */
@@ -129,25 +129,6 @@ typedef enum GHOSTTY_ENUM_TYPED {
     GHOSTTY_KEY_ENCODER_OPT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyKeyEncoderOption;
 
-/** Terminal-derived key encoder options. */
-typedef struct {
-    size_t size;
-    bool cursor_key_application;
-    bool keypad_key_application;
-    bool ignore_keypad_with_numlock;
-    bool alt_esc_prefix;
-    bool modify_other_keys_state_2;
-    GhosttyKittyKeyFlags kitty_flags;
-    bool backarrow_key_mode;
-} GhosttyKeyEncoderTerminalOptions;
-
-/**
- * Capture exactly the options ghostty_key_encoder_set_from_terminal applies.
- */
-GHOSTTY_API GhosttyResult ghostty_key_encoder_terminal_options(
-    GhosttyTerminal terminal,
-    GhosttyKeyEncoderTerminalOptions *options);
-
 /**
  * Create a new key encoder instance.
  *
@@ -175,6 +156,21 @@ GHOSTTY_API GhosttyResult ghostty_key_encoder_new(const GhosttyAllocator *alloca
  * @ingroup key
  */
 GHOSTTY_API void ghostty_key_encoder_free(GhosttyKeyEncoder encoder);
+
+/**
+ * Read an encoder option, including effective terminal-derived options after
+ * ghostty_key_encoder_set_from_terminal(). The output type is the value type
+ * documented on GhosttyKeyEncoderOption.
+ *
+ * NULL encoder or out, or OPT_INVALID, returns GHOSTTY_INVALID_VALUE.
+ * An unknown option or disabled input encoding returns GHOSTTY_UNSUPPORTED.
+ *
+ * @ingroup key
+ */
+GHOSTTY_API GhosttyResult ghostty_key_encoder_get(
+    GhosttyKeyEncoder encoder,
+    GhosttyKeyEncoderOption option,
+    void *out);
 
 /**
  * Set an option on the key encoder.

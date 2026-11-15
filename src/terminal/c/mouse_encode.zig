@@ -26,16 +26,6 @@ const MouseEncoderWrapper = struct {
 /// C: GhosttyMouseEncoder
 pub const Encoder = ?*MouseEncoderWrapper;
 
-/// Terminal-derived mouse encoder options, after the terminal has resolved
-/// tracking and format precedence.
-/// C: GhosttyMouseEncoderTerminalOptions
-pub const TerminalOptions = extern struct {
-    pub const sized_base = "format";
-    size: usize = @sizeOf(TerminalOptions),
-    event: TrackingMode,
-    format: Format,
-};
-
 /// C: GhosttyMouseTrackingMode
 pub const TrackingMode = terminal_mouse.Event;
 
@@ -228,18 +218,47 @@ fn setTyped(
     return .success;
 }
 
-pub fn terminal_options(
-    terminal_: Terminal,
-    out: ?*TerminalOptions,
+pub fn get(
+    encoder_: Encoder,
+    option: Option,
+    out: ?*anyopaque,
 ) callconv(lib.calling_conv) Result {
     if (comptime !lib.feature(.input_encode)) return .unsupported;
-    const t: *ZigTerminal = (terminal_ orelse return .invalid_value).terminal;
-    const result = out orelse return .invalid_value;
-    if (!lib.sizedCheck(.output, result)) return .invalid_value;
-    lib.sizedWrite(result, .{
-        .event = t.flags.mouse_event,
-        .format = t.flags.mouse_format,
-    });
+    return switch (option) {
+        .invalid => .invalid_value,
+        _ => .unsupported,
+        inline else => |comptime_option| getTyped(
+            encoder_ orelse return .invalid_value,
+            comptime_option,
+            @ptrCast(@alignCast(out orelse return .invalid_value)),
+        ),
+    };
+}
+
+fn getTyped(
+    encoder: *const MouseEncoderWrapper,
+    comptime option: Option,
+    out: *option.InType(),
+) Result {
+    switch (option) {
+        .size => {
+            if (!lib.sizedCheck(.output, out)) return .invalid_value;
+            const size = encoder.opts.size;
+            lib.sizedWrite(out, .{
+                .screen_width = size.screen.width,
+                .screen_height = size.screen.height,
+                .cell_width = size.cell.width,
+                .cell_height = size.cell.height,
+                .padding_top = size.padding.top,
+                .padding_bottom = size.padding.bottom,
+                .padding_right = size.padding.right,
+                .padding_left = size.padding.left,
+            });
+        },
+        .track_last_cell => out.* = encoder.track_last_cell,
+        .event, .format, .any_button_pressed => out.* = @field(encoder.opts, @tagName(option)),
+        .invalid, _ => comptime unreachable,
+    }
     return .success;
 }
 
@@ -394,7 +413,7 @@ test "set" {
     try testing.expect(e.?.track_last_cell);
 }
 
-test "terminal_options exactly captures effective state" {
+test "get exactly captures set_from_terminal effective state" {
     const terminal_c = @import("terminal.zig");
     var handle: Terminal = undefined;
     try testing.expectEqual(Result.success, terminal_c.new(
@@ -408,11 +427,45 @@ test "terminal_options exactly captures effective state" {
     terminal.flags.mouse_event = .any;
     terminal.flags.mouse_format = .sgr_pixels;
 
-    var out: TerminalOptions = undefined;
-    out.size = @sizeOf(TerminalOptions);
-    try testing.expectEqual(Result.success, terminal_options(handle, &out));
-    try testing.expectEqual(terminal.flags.mouse_event, out.event);
-    try testing.expectEqual(terminal.flags.mouse_format, out.format);
+    var encoder: Encoder = null;
+    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &encoder));
+    defer free(encoder);
+    try testing.expectEqual(Result.success, set_from_terminal(encoder, handle));
+    var event: TrackingMode = undefined;
+    var format: Format = undefined;
+    try testing.expectEqual(Result.success, get(encoder, .event, @ptrCast(&event)));
+    try testing.expectEqual(Result.success, get(encoder, .format, @ptrCast(&format)));
+    try testing.expectEqual(terminal.flags.mouse_event, event);
+    try testing.expectEqual(terminal.flags.mouse_format, format);
+}
+
+test "get options and invalid arguments" {
+    var encoder: Encoder = null;
+    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &encoder));
+    defer free(encoder);
+    var size = testSize();
+    try testing.expectEqual(Result.success, set(encoder, .size, &size));
+    var out: Size = undefined;
+    out.size = @sizeOf(Size);
+    try testing.expectEqual(Result.success, get(encoder, .size, @ptrCast(&out)));
+    try testing.expectEqualDeep(size, out);
+    out.size = 0;
+    try testing.expectEqual(Result.invalid_value, get(encoder, .size, @ptrCast(&out)));
+    const yes = true;
+    inline for (.{ Option.any_button_pressed, Option.track_last_cell }) |option| {
+        try testing.expectEqual(Result.success, set(encoder, option, &yes));
+        var value = false;
+        try testing.expectEqual(Result.success, get(encoder, option, @ptrCast(&value)));
+        try testing.expect(value);
+        try testing.expectEqual(Result.success, set(encoder, option, null));
+        try testing.expectEqual(Result.success, get(encoder, option, @ptrCast(&value)));
+        try testing.expect(!value);
+    }
+    var value: bool = false;
+    try testing.expectEqual(Result.invalid_value, get(null, .track_last_cell, @ptrCast(&value)));
+    try testing.expectEqual(Result.invalid_value, get(encoder, .track_last_cell, null));
+    try testing.expectEqual(Result.invalid_value, get(null, .invalid, null));
+    try testing.expectEqual(Result.unsupported, get(null, @fromBackingInt(999), null));
 }
 
 test "set_from_terminal" {

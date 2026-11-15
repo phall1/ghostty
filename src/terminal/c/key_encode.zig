@@ -22,21 +22,6 @@ const KeyEncoderWrapper = struct {
 /// C: GhosttyKeyEncoder
 pub const Encoder = ?*KeyEncoderWrapper;
 
-/// Terminal-derived key encoder options, suitable for crossing thread or
-/// process boundaries without carrying a Terminal pointer.
-/// C: GhosttyKeyEncoderTerminalOptions
-pub const TerminalOptions = extern struct {
-    pub const sized_base = "backarrow_key_mode";
-    size: usize = @sizeOf(TerminalOptions),
-    cursor_key_application: bool,
-    keypad_key_application: bool,
-    ignore_keypad_with_numlock: bool,
-    alt_esc_prefix: bool,
-    modify_other_keys_state_2: bool,
-    kitty_flags: u8,
-    backarrow_key_mode: bool,
-};
-
 pub fn new(
     alloc_: ?*const CAllocator,
     result_: ?*Encoder,
@@ -150,24 +135,33 @@ fn setTyped(
     return .success;
 }
 
-pub fn terminal_options(
-    terminal_: Terminal,
-    out: ?*TerminalOptions,
+pub fn get(
+    encoder_: Encoder,
+    option: Option,
+    out: ?*anyopaque,
 ) callconv(lib.calling_conv) Result {
     if (comptime !lib.feature(.input_encode)) return .unsupported;
-    const t: *ZigTerminal = (terminal_ orelse return .invalid_value).terminal;
-    const result = out orelse return .invalid_value;
-    if (!lib.sizedCheck(.output, result)) return .invalid_value;
-    const opts: key_encode.Options = .fromTerminal(t);
-    lib.sizedWrite(result, .{
-        .cursor_key_application = opts.cursor_key_application,
-        .keypad_key_application = opts.keypad_key_application,
-        .ignore_keypad_with_numlock = opts.ignore_keypad_with_numlock,
-        .alt_esc_prefix = opts.alt_esc_prefix,
-        .modify_other_keys_state_2 = opts.modify_other_keys_state_2,
-        .kitty_flags = @intCast(@as(u5, @bitCast(opts.kitty_flags))),
-        .backarrow_key_mode = opts.backarrow_key_mode,
-    });
+    return switch (option) {
+        .invalid => .invalid_value,
+        _ => .unsupported,
+        inline else => |comptime_option| getTyped(
+            encoder_ orelse return .invalid_value,
+            comptime_option,
+            @ptrCast(@alignCast(out orelse return .invalid_value)),
+        ),
+    };
+}
+
+fn getTyped(
+    encoder: *const KeyEncoderWrapper,
+    comptime option: Option,
+    out: *option.InType(),
+) Result {
+    const value = @field(encoder.opts, @tagName(option));
+    out.* = if (option == .kitty_flags)
+        @intCast(@as(u5, @bitCast(value)))
+    else
+        value;
     return .success;
 }
 
@@ -273,6 +267,9 @@ test "set kitty flags" {
     try testing.expect(e.?.opts.kitty_flags.disambiguate);
     try testing.expect(e.?.opts.kitty_flags.report_events);
     try testing.expect(!e.?.opts.kitty_flags.report_alternates);
+    var actual: u8 = 0;
+    try testing.expectEqual(Result.success, get(e, .kitty_flags, @ptrCast(&actual)));
+    try testing.expectEqual(flags_int, actual);
 }
 
 test "set macos option as alt" {
@@ -288,13 +285,16 @@ test "set macos option as alt" {
     const opt_left: OptionAsAlt = .left;
     try testing.expectEqual(Result.success, set(e, .macos_option_as_alt, &opt_left));
     try testing.expectEqual(OptionAsAlt.left, e.?.opts.macos_option_as_alt);
+    var actual: OptionAsAlt = .false;
+    try testing.expectEqual(Result.success, get(e, .macos_option_as_alt, @ptrCast(&actual)));
+    try testing.expectEqual(opt_left, actual);
 
     const opt_true: OptionAsAlt = .true;
     try testing.expectEqual(Result.success, set(e, .macos_option_as_alt, &opt_true));
     try testing.expectEqual(OptionAsAlt.true, e.?.opts.macos_option_as_alt);
 }
 
-test "terminal_options exactly captures fromTerminal" {
+test "get exactly captures set_from_terminal" {
     const testing = std.testing;
     const terminal_c = @import("terminal.zig");
     var handle: Terminal = undefined;
@@ -313,17 +313,41 @@ test "terminal_options exactly captures fromTerminal" {
     terminal.flags.modify_other_keys_2 = true;
     terminal.modes.set(.backarrow_key_mode, true);
 
-    var out: TerminalOptions = undefined;
-    out.size = @sizeOf(TerminalOptions);
-    try testing.expectEqual(Result.success, terminal_options(handle, &out));
+    var encoder: Encoder = null;
+    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &encoder));
+    defer free(encoder);
+    try testing.expectEqual(Result.success, set_from_terminal(encoder, handle));
     const expected: key_encode.Options = .fromTerminal(terminal);
-    try testing.expectEqual(expected.cursor_key_application, out.cursor_key_application);
-    try testing.expectEqual(expected.keypad_key_application, out.keypad_key_application);
-    try testing.expectEqual(expected.ignore_keypad_with_numlock, out.ignore_keypad_with_numlock);
-    try testing.expectEqual(expected.alt_esc_prefix, out.alt_esc_prefix);
-    try testing.expectEqual(expected.modify_other_keys_state_2, out.modify_other_keys_state_2);
-    try testing.expectEqual(@as(u8, @intCast(@as(u5, @bitCast(expected.kitty_flags)))), out.kitty_flags);
-    try testing.expectEqual(expected.backarrow_key_mode, out.backarrow_key_mode);
+    inline for (@typeInfo(Option).@"enum".field_names) |name| {
+        const option = @field(Option, name);
+        if (option == .invalid) continue;
+        var out: option.InType() = undefined;
+        try testing.expectEqual(Result.success, get(encoder, option, @ptrCast(&out)));
+        const value = @field(expected, name);
+        try testing.expectEqual(if (option == .kitty_flags) @as(u8, @intCast(@as(u5, @bitCast(value)))) else value, out);
+    }
+}
+
+test "get options and invalid arguments" {
+    var encoder: Encoder = null;
+    try std.testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &encoder));
+    defer free(encoder);
+    inline for (@typeInfo(Option).@"enum".field_names) |name| {
+        const option = @field(Option, name);
+        if (option == .invalid) continue;
+        var value: option.InType() = undefined;
+        try std.testing.expectEqual(Result.success, get(encoder, option, @ptrCast(&value)));
+        try std.testing.expectEqual(Result.success, set(encoder, option, &value));
+        try std.testing.expectEqual(Result.success, set(encoder, option, null));
+        var reset_value: option.InType() = undefined;
+        try std.testing.expectEqual(Result.success, get(encoder, option, @ptrCast(&reset_value)));
+        try std.testing.expectEqual(value, reset_value);
+    }
+    var value: bool = false;
+    try std.testing.expectEqual(Result.invalid_value, get(null, .cursor_key_application, @ptrCast(&value)));
+    try std.testing.expectEqual(Result.invalid_value, get(encoder, .cursor_key_application, null));
+    try std.testing.expectEqual(Result.invalid_value, get(null, .invalid, null));
+    try std.testing.expectEqual(Result.unsupported, get(null, @fromBackingInt(999), null));
 }
 
 test "set_from_terminal" {

@@ -26,6 +26,12 @@ pub const ImageHandle = if (build_options.kitty_graphics)
 else
     ?*const anyopaque;
 
+/// C: GhosttyKittyGraphicsImageIterator
+pub const ImageIterator = if (build_options.kitty_graphics)
+    ?*ImageIteratorWrapper
+else
+    ?*DisabledImageIterator;
+
 /// C: GhosttyKittyGraphicsPlacementIterator
 pub const PlacementIterator = if (build_options.kitty_graphics)
     ?*PlacementIteratorWrapper
@@ -38,6 +44,16 @@ else
 /// and describe them the same way in every build.
 const DisabledGraphics = opaque {};
 const DisabledPlacementIterator = opaque {};
+const DisabledImageIterator = opaque {};
+
+const ImageIteratorWrapper = if (build_options.kitty_graphics)
+    struct {
+        alloc: std.mem.Allocator,
+        inner: ?std.AutoHashMapUnmanaged(u32, Image).ValueIterator = null,
+        image: ImageHandle = null,
+    }
+else
+    void;
 
 const PlacementMap = if (build_options.kitty_graphics)
     std.AutoHashMapUnmanaged(
@@ -63,6 +79,7 @@ pub const Data = enum(c_int) {
     invalid = 0,
     placement_iterator = 1,
     generation = 2,
+    image_iterator = 3,
 
     _,
 
@@ -71,6 +88,7 @@ pub const Data = enum(c_int) {
             .invalid => void,
             .placement_iterator => PlacementIterator,
             .generation => u64,
+            .image_iterator => ImageIterator,
             _ => void,
         };
     }
@@ -152,6 +170,13 @@ fn getTyped(
             };
         },
         .generation => out.* = storage.generation,
+        .image_iterator => {
+            const it = out.* orelse return .invalid_value;
+            it.* = .{
+                .alloc = it.alloc,
+                .inner = storage.images.valueIterator(),
+            };
+        },
         _ => comptime unreachable,
     }
     return .success;
@@ -171,27 +196,43 @@ fn layerMaskMatches(mask: u32, z: i32) bool {
     return mask & (@as(u32, 1) << @intCast(@backingInt(layer))) != 0;
 }
 
-/// Copy every stored image ID, even when no placement references the image.
-/// A size query or undersized output never partially writes the destination.
-pub fn image_ids(
-    graphics_: KittyGraphics,
-    ids: ?[*]u32,
-    capacity: usize,
-    out_len: *usize,
+pub fn image_iterator_new(
+    alloc_: ?*const CAllocator,
+    out_: ?*ImageIterator,
 ) callconv(lib.calling_conv) Result {
-    out_len.* = 0;
-    if (comptime !build_options.kitty_graphics) return .no_value;
-
-    const count = graphics_.images.count();
-    out_len.* = count;
-    if (capacity < count) return .out_of_space;
-    if (count == 0) return .success;
-    const output = ids orelse return .invalid_value;
-
-    var it = graphics_.images.keyIterator();
-    var index: usize = 0;
-    while (it.next()) |id| : (index += 1) output[index] = id.*;
+    if (comptime !lib.feature(.kitty_graphics)) {
+        if (out_) |o| o.* = null;
+        return .unsupported;
+    }
+    const out = out_ orelse return .invalid_value;
+    const alloc = lib.alloc.default(alloc_);
+    const ptr = alloc.create(ImageIteratorWrapper) catch {
+        out.* = null;
+        return .out_of_memory;
+    };
+    ptr.* = .{ .alloc = alloc };
+    out.* = ptr;
     return .success;
+}
+
+pub fn image_iterator_free(iter_: ImageIterator) callconv(lib.calling_conv) void {
+    if (comptime !lib.feature(.kitty_graphics)) return;
+    const iter = iter_ orelse return;
+    iter.alloc.destroy(iter);
+}
+
+pub fn image_iterator_next(iter_: ImageIterator) callconv(lib.calling_conv) bool {
+    if (comptime !lib.feature(.kitty_graphics)) return false;
+    const iter = iter_ orelse return false;
+    const inner = if (iter.inner) |*inner| inner else return false;
+    iter.image = inner.next();
+    return iter.image != null;
+}
+
+pub fn image_iterator_get_image(iter_: ImageIterator) callconv(lib.calling_conv) ImageHandle {
+    if (comptime !lib.feature(.kitty_graphics)) return null;
+    const iter = iter_ orelse return null;
+    return iter.image;
 }
 
 /// C: GhosttyKittyGraphicsPlacementIteratorOption
@@ -764,7 +805,7 @@ fn computeViewportPos(
     return .{ .col = vp_col, .row = vp_row, .visible = visible };
 }
 
-test "image_ids includes unplaced images and respects output bounds" {
+test "image iterator includes unplaced images" {
     if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
 
     var t: terminal_c.Terminal = null;
@@ -778,9 +819,13 @@ test "image_ids includes unplaced images and respects output bounds" {
 
     var graphics: KittyGraphics = undefined;
     try testing.expectEqual(Result.success, terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)));
-    var count: usize = 99;
-    try testing.expectEqual(Result.success, image_ids(graphics, null, 0, &count));
-    try testing.expectEqual(@as(usize, 0), count);
+    var iter: ImageIterator = null;
+    try testing.expectEqual(Result.success, image_iterator_new(&lib.alloc.test_allocator, &iter));
+    defer image_iterator_free(iter);
+    try testing.expect(!image_iterator_next(iter));
+    try testing.expectEqual(@as(ImageHandle, null), image_iterator_get_image(iter));
+    try testing.expectEqual(Result.success, get(graphics, .image_iterator, @ptrCast(&iter)));
+    try testing.expect(!image_iterator_next(iter));
 
     // Two payloads without placements and one Unicode-placeholder placement.
     const commands =
@@ -789,31 +834,57 @@ test "image_ids includes unplaced images and respects output bounds" {
         "\x1b_Ga=T,f=32,s=1,v=1,i=10,p=1,U=1,c=1,r=1,q=2;AAECAw==\x1b\\";
     terminal_c.vt_write(t, commands.ptr, commands.len);
 
-    try testing.expectEqual(Result.out_of_space, image_ids(graphics, null, 0, &count));
-    try testing.expectEqual(@as(usize, 3), count);
-    var output = [_]u32{ 99, 99, 99, 99 };
-    try testing.expectEqual(Result.out_of_space, image_ids(graphics, &output, 2, &count));
-    try testing.expectEqual(@as(usize, 3), count);
-    try testing.expectEqualSlices(u32, &.{ 99, 99, 99, 99 }, &output);
-    try testing.expectEqual(Result.invalid_value, image_ids(graphics, null, 3, &count));
-
-    try testing.expectEqual(Result.success, image_ids(graphics, &output, 3, &count));
-    try testing.expectEqual(@as(usize, 3), count);
-    try testing.expectEqual(@as(u32, 99), output[3]);
-    for ([_]u32{ 1, 7, 10 }) |id| {
-        try testing.expect(std.mem.indexOfScalar(u32, output[0..count], id) != null);
+    try testing.expectEqual(Result.success, get(graphics, .image_iterator, @ptrCast(&iter)));
+    var seen: u3 = 0;
+    while (image_iterator_next(iter)) {
+        const image = image_iterator_get_image(iter);
+        var id: u32 = 0;
+        try testing.expectEqual(Result.success, image_get(image, .id, @ptrCast(&id)));
+        const bit: u3 = switch (id) {
+            1 => 1,
+            7 => 2,
+            10 => 4,
+            else => return error.UnexpectedImage,
+        };
+        try testing.expectEqual(@as(u3, 0), seen & bit);
+        seen |= bit;
     }
+    try testing.expectEqual(@as(u3, 7), seen);
+    try testing.expectEqual(@as(ImageHandle, null), image_iterator_get_image(iter));
+    try testing.expect(!image_iterator_next(iter));
 
     const deletion = "\x1b_Ga=d,d=I,i=7,q=2;\x1b\\";
     terminal_c.vt_write(t, deletion.ptr, deletion.len);
-    try testing.expectEqual(Result.success, image_ids(graphics, &output, output.len, &count));
+    try testing.expectEqual(Result.success, get(graphics, .image_iterator, @ptrCast(&iter)));
+    var count: usize = 0;
+    while (image_iterator_next(iter)) {
+        var id: u32 = 0;
+        try testing.expectEqual(Result.success, image_get(image_iterator_get_image(iter), .id, @ptrCast(&id)));
+        try testing.expect(id != 7);
+        count += 1;
+    }
     try testing.expectEqual(@as(usize, 2), count);
-    try testing.expect(std.mem.indexOfScalar(u32, output[0..count], 7) == null);
 
     const clear = "\x1b_Ga=d,d=R,x=1,y=4294967295,q=2;\x1b\\";
     terminal_c.vt_write(t, clear.ptr, clear.len);
-    try testing.expectEqual(Result.success, image_ids(graphics, null, 0, &count));
-    try testing.expectEqual(@as(usize, 0), count);
+    try testing.expectEqual(Result.success, get(graphics, .image_iterator, @ptrCast(&iter)));
+    try testing.expect(!image_iterator_next(iter));
+}
+
+test "image iterator invalid arguments" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+    try testing.expectEqual(Result.invalid_value, image_iterator_new(null, null));
+    image_iterator_free(null);
+    try testing.expect(!image_iterator_next(null));
+    try testing.expectEqual(@as(ImageHandle, null), image_iterator_get_image(null));
+    var t: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(&lib.alloc.test_allocator, &t, 10, 5));
+    defer terminal_c.free(t);
+    var graphics: KittyGraphics = undefined;
+    try testing.expectEqual(Result.success, terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)));
+    var iter: ImageIterator = null;
+    try testing.expectEqual(Result.invalid_value, get(graphics, .image_iterator, @ptrCast(&iter)));
+    try testing.expectEqual(Result.invalid_value, get(graphics, .image_iterator, null));
 }
 
 test "placement default preserves external preference over anonymous IDs" {

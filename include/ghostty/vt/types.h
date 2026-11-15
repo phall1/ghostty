@@ -238,6 +238,14 @@ typedef struct GhosttyKittyGraphicsImpl* GhosttyKittyGraphics;
 typedef const struct GhosttyKittyGraphicsImageImpl* GhosttyKittyGraphicsImage;
 
 /**
+ * Opaque iterator over all stored Kitty graphics images, including images
+ * without placements. See ghostty_kitty_graphics_image_iterator_new().
+ *
+ * @ingroup kitty_graphics
+ */
+typedef struct GhosttyKittyGraphicsImageIteratorImpl* GhosttyKittyGraphicsImageIterator;
+
+/**
  * Opaque handle to a Kitty graphics placement iterator.
  *
  * @ingroup kitty_graphics

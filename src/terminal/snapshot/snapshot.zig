@@ -706,42 +706,13 @@ pub const Decoder = struct {
         alloc: Allocator,
         t: *Terminal,
     ) NextError!?Progress {
-        return self.nextWithBoundary(alloc, t, null);
-    }
-
-    /// Decode a caller-framed unit without reading the next unit's header.
-    /// `page_placements` declares whether this unit includes the optional
-    /// KITTY_IMAGE_PAGE_PLACEMENTS immediately after its PAGE.
-    pub fn nextStaged(
-        self: *Decoder,
-        alloc: Allocator,
-        t: *Terminal,
-        page_placements: bool,
-    ) NextError!?Progress {
-        return self.nextWithBoundary(alloc, t, page_placements);
-    }
-
-    fn nextWithBoundary(
-        self: *Decoder,
-        alloc: Allocator,
-        t: *Terminal,
-        page_placements: ?bool,
-    ) NextError!?Progress {
-        switch (self.state) {
-            // `ready` must succeed before history exists to decode, and a
-            // failed decoder no longer knows its stream position.
-            .start => return error.DecoderNotReady,
-            .failed => return error.DecoderFailed,
-            .finished => return null,
-            .history => {},
-        }
+        const state = try self.nextState() orelse return null;
         errdefer self.state = .failed;
-        const state = &self.state.history;
 
         while (true) {
             // Read the next header before deciding how to decode the
             // record. Unknown records before it were skipped.
-            const header = try self.takeHeaderStaged(page_placements != null);
+            const header = try self.takeHeader();
 
             // Kitty graphics pixels may come anywhere after READY, even
             // between the pages of a HISTORY sequence, in any screen order.
@@ -749,21 +720,12 @@ pub const Decoder = struct {
                 if (header.tag == .kitty_image_payload) {
                     return try self.nextPayload(alloc, t, header);
                 }
-            } else if (page_placements != null and header.tag == .kitty_image_payload) {
-                const payload = try kitty.discardPayload(self.source, header);
-                if (state.generations.get(payload.key) == null) return error.UnexpectedKittyKey;
-                return .{ .image = .{
-                    .key = payload.key,
-                    .image_id = payload.image_id,
-                    .frame = payload.frame,
-                    .bytes = 0,
-                } };
             }
 
             // Stream the current sequence's next PAGE if one remains.
             if (state.current) |*sequence| {
                 if (sequence.remaining > 0) {
-                    return try self.nextPage(alloc, t, sequence, header, page_placements);
+                    return try self.nextPage(alloc, t, sequence, header);
                 }
                 state.current = null;
             }
@@ -771,55 +733,70 @@ pub const Decoder = struct {
             // All sequences are consumed: FINISH ends the snapshot, leaving
             // trailing transport bytes unread.
             if (state.pending == 0) {
-                try checkpoint.decode(.finish, self.source, header);
-                if (comptime build_options.slow_runtime_safety) {
-                    var it = state.generations.iterator();
-                    while (it.next()) |entry| {
-                        const restored = t.screens.get(entry.key) orelse
-                            continue;
-                        restored.pages.assertIntegrity();
-                        restored.assertIntegrity();
-                    }
-                }
-                self.state = .finished;
+                try self.finish(t, header);
                 return null;
             }
 
-            // Begin the next HISTORY sequence. Keys route the sequences
-            // order-independently, but each must name a declared screen and
-            // may not repeat.
-            state.pending -= 1;
-            var manifest: history.Decoder = undefined;
-            try manifest.init(self.source, header);
-            const key = manifest.header.key;
-            if (state.generations.get(key) == null) {
-                return error.UnexpectedHistoryKey;
-            }
-            if (state.routed.contains(key)) return error.DuplicateHistory;
-            state.routed.insert(key);
-            state.current = .{
-                .key = key,
-                .remaining = manifest.header.page_count,
-                .apply = true,
-            };
+            try self.beginHistory(header);
         }
+    }
+
+    /// `ready` must succeed before history exists to decode, and a failed
+    /// decoder no longer knows its stream position. FINISH is idempotent.
+    fn nextState(self: *Decoder) NextError!?*History {
+        return switch (self.state) {
+            .start => error.DecoderNotReady,
+            .failed => error.DecoderFailed,
+            .finished => null,
+            .history => |*state| state,
+        };
+    }
+
+    fn finish(self: *Decoder, t: *Terminal, header: record.Header) NextError!void {
+        try checkpoint.decode(.finish, self.source, header);
+        if (comptime build_options.slow_runtime_safety) {
+            var it = self.state.history.generations.iterator();
+            while (it.next()) |entry| {
+                const restored = t.screens.get(entry.key) orelse continue;
+                restored.pages.assertIntegrity();
+                restored.assertIntegrity();
+            }
+        }
+        self.state = .finished;
+    }
+
+    fn beginHistory(self: *Decoder, header: record.Header) NextError!void {
+        const state = &self.state.history;
+        // Begin the next HISTORY sequence. Keys route the sequences
+        // order-independently, but each must name a declared screen and
+        // may not repeat.
+        state.pending -= 1;
+        var manifest: history.Decoder = undefined;
+        try manifest.init(self.source, header);
+        const key = manifest.header.key;
+        if (state.generations.get(key) == null) {
+            return error.UnexpectedHistoryKey;
+        }
+        if (state.routed.contains(key)) return error.DuplicateHistory;
+        state.routed.insert(key);
+        state.current = .{
+            .key = key,
+            .remaining = manifest.header.page_count,
+            .apply = true,
+        };
     }
 
     /// Return the next record header: the one a previous call read ahead,
     /// or else the next one from the source. A failure from reading ahead
     /// is returned here.
-    fn takeHeaderStaged(self: *Decoder, staged: bool) NextError!record.Header {
+    fn takeHeader(self: *Decoder) NextError!record.Header {
         const state = &self.state.history;
         if (state.pending_error) |err| return err;
         if (state.pending_header) |header| {
             state.pending_header = null;
             return header;
         }
-        if (comptime build_options.kitty_graphics) return try record.nextHeader(self.source);
-        if (!staged) return try record.nextHeader(self.source);
-        // Disabled Kitty is normally an unknown record. A staged image is
-        // nevertheless a complete progress unit, not a reason to read ahead.
-        return try stagedHeader(self.source);
+        return try record.nextHeader(self.source);
     }
 
     /// The screen for `key` in `t`, if it is still the screen restored at
@@ -855,8 +832,7 @@ pub const Decoder = struct {
         return restored;
     }
 
-    /// Attach placements only when their history page was applied. Staged
-    /// decoding must still validate the record in builds without Kitty.
+    /// Attach placements only when their history page was applied.
     fn restorePagePlacements(
         self: *Decoder,
         alloc: Allocator,
@@ -865,7 +841,7 @@ pub const Decoder = struct {
         applied: ?*TerminalScreen,
         header: record.Header,
     ) NextError!void {
-        if (comptime !build_options.kitty_graphics) return discardRecord(self.source, header);
+        if (comptime !build_options.kitty_graphics) unreachable;
         try kitty.decodePagePlacements(
             self.source,
             header,
@@ -932,7 +908,6 @@ pub const Decoder = struct {
         t: *Terminal,
         sequence: *Sequence,
         header: record.Header,
-        page_placements: ?bool,
     ) NextError!Progress {
         const state = &self.state.history;
 
@@ -983,14 +958,6 @@ pub const Decoder = struct {
             .remaining = sequence.remaining,
         } };
 
-        if (page_placements) |present| {
-            if (!present) return progress;
-            const following = try stagedHeader(self.source);
-            if (following.tag != .kitty_image_page_placements) return error.UnexpectedRecordTag;
-            try self.restorePagePlacements(alloc, t, sequence.key, applied, following);
-            return progress;
-        }
-
         // The page's Kitty graphics placements, if any, follow it. Read the
         // next header to find out. Anything else waits for the next call,
         // and so does a failure to read it, because this page is already
@@ -1010,26 +977,6 @@ pub const Decoder = struct {
         return progress;
     }
 };
-
-fn discardRecord(source: *std.Io.Reader, header: record.Header) !void {
-    var reader: record.Reader = undefined;
-    reader.initHeader(source, header);
-    try reader.payloadReader().discardAll(header.payload_len);
-    try reader.finish();
-}
-
-/// Keep explicit Kitty unit boundaries even when that feature is disabled,
-/// while preserving upstream's validation and skipping of unknown records.
-fn stagedHeader(source: *std.Io.Reader) !record.Header {
-    while (true) {
-        const header = try record.Header.decode(source);
-        switch (header.tag) {
-            .kitty_image_storage, .kitty_image_payload, .kitty_image_page_placements => return header,
-            else => if (header.tag.known()) return header,
-        }
-        try discardRecord(source, header);
-    }
-}
 
 /// Restore one complete snapshot into a native Terminal and continuation.
 ///
@@ -1155,63 +1102,6 @@ fn testHistoryTerminal(history_pages: u8) !Terminal {
 fn testTopLeftCodepoint(terminal_screen: *const TerminalScreen) u21 {
     return terminal_screen.pages.getTopLeft(.screen).node
         .page().getRowAndCell(0, 0).cell.codepoint();
-}
-
-/// Exercise exactly the transport's byte boundary, not an always-full reader.
-fn testStagedUnits(bytes: []const u8) !void {
-    const testing = std.testing;
-    var reader: std.Io.Reader = .fixed(bytes);
-    var decoder: Decoder = .init(&reader);
-    var decoded = try decoder.ready(testing.allocator, testing.io, test_decode_options);
-    defer decoded.deinit(testing.allocator);
-    var offset = reader.seek;
-    var pages: usize = 0;
-    while (offset < bytes.len) {
-        const start = offset;
-        var framing: std.Io.Reader = .fixed(bytes[offset..]);
-        var placements = false;
-        var tag: record.Tag = undefined;
-        while (true) {
-            const header = try record.Header.decode(&framing);
-            try framing.discardAll(header.payload_len);
-            tag = header.tag;
-            if (tag != .history) break;
-        }
-        if (tag == .page and bytes.len - offset - framing.seek >= record.Header.len) {
-            var peek: std.Io.Reader = .fixed(bytes[offset + framing.seek ..]);
-            const following = try record.Header.decode(&peek);
-            if (following.tag == .kitty_image_page_placements) {
-                try framing.discardAll(record.Header.len + following.payload_len);
-                placements = true;
-            }
-        }
-        offset += framing.seek;
-        reader = .fixed(bytes[start..offset]);
-        const progress = try decoder.nextStaged(testing.allocator, &decoded.terminal.?, placements);
-        try testing.expectEqual(offset - start, reader.seek);
-        if (tag == .finish) {
-            try testing.expectEqual(@as(?Decoder.Progress, null), progress);
-        } else {
-            try testing.expect(progress != null);
-            if (tag == .page) pages += 1;
-        }
-    }
-    try testing.expect(pages >= 2);
-    try testing.expectEqual(@as(?Decoder.Progress, null), try decoder.nextStaged(testing.allocator, &decoded.terminal.?, false));
-}
-
-test "staged decoder preserves EOF boundaries across pages and FINISH" {
-    var t = try testHistoryTerminal(3);
-    defer t.deinit(std.testing.allocator);
-    var bytes: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer bytes.deinit();
-    try encode(std.testing.allocator, &bytes.writer, &t, test_encode_options);
-    try testStagedUnits(bytes.written());
-}
-
-test "staged decoder preserves Kitty page placement and pixel units" {
-    const bytes = comptime test_fixture.parse(@embedFile("testdata/kitty-history-v1.hex"));
-    try testStagedUnits(&bytes);
 }
 
 test "complete snapshot round trip with history and alternate screen" {
@@ -2480,19 +2370,6 @@ test "incremental decode applies history below live PTY output" {
     );
 }
 
-const TestHistoryDecodeMode = enum { stream, staged };
-
-fn testHistoryNext(
-    decoder: *Decoder,
-    t: *Terminal,
-    mode: TestHistoryDecodeMode,
-) !?Decoder.Progress {
-    return switch (mode) {
-        .stream => decoder.next(std.testing.allocator, t),
-        .staged => decoder.nextStaged(std.testing.allocator, t, false),
-    };
-}
-
 fn testBothHistoryScreens() !Terminal {
     var t = try testHistoryTerminal(3);
     errdefer t.deinit(std.testing.allocator);
@@ -2507,7 +2384,6 @@ fn testBothHistoryScreens() !Terminal {
 }
 
 fn testLiveHistoryClear(
-    mode: TestHistoryDecodeMode,
     key: TerminalScreenKey,
     reset: bool,
     applied_pages: usize,
@@ -2536,7 +2412,7 @@ fn testLiveHistoryClear(
 
     var applied: usize = 0;
     while (applied < applied_pages) {
-        const progress = (try testHistoryNext(&decoder, restored, mode)).?.page;
+        const progress = (try decoder.next(testing.allocator, restored)).?.page;
         if (progress.key == key) applied += 1;
     }
     restored.screens.switchTo(key);
@@ -2544,16 +2420,20 @@ fn testLiveHistoryClear(
     defer live.deinit();
     live.nextSlice(if (reset) "\x1bc" else "\x1b[3J");
 
-    var dropped: usize = 0;
-    while (try testHistoryNext(&decoder, restored, mode)) |progress| {
-        const cleared = reset or progress.page.key == key;
-        try testing.expectEqual(@as(usize, if (cleared) 0 else 2), progress.page.rows);
-        if (cleared) dropped += 1;
-    }
-    try testing.expect(dropped > 0);
+    try testConsumeClearedHistory(&decoder, restored, key, reset);
     try testing.expect(decoder.state == .finished);
     try testing.expectEqual(snapshot_len, source.seek);
     try testClearedHistoryRows(restored, key, reset);
+}
+
+fn testConsumeClearedHistory(decoder: *Decoder, t: *Terminal, key: TerminalScreenKey, reset: bool) !void {
+    var dropped: usize = 0;
+    while (try decoder.next(std.testing.allocator, t)) |progress| {
+        const cleared = reset or progress.page.key == key;
+        try std.testing.expectEqual(@as(usize, if (cleared) 0 else 2), progress.page.rows);
+        if (cleared) dropped += 1;
+    }
+    try std.testing.expect(dropped > 0);
 }
 
 fn testClearedHistoryRows(t: *Terminal, key: TerminalScreenKey, reset: bool) !void {
@@ -2566,24 +2446,20 @@ fn testClearedHistoryRows(t: *Terminal, key: TerminalScreenKey, reset: bool) !vo
 }
 
 test "live history clear never resurrects deferred snapshot rows" {
-    for (std.enums.values(TestHistoryDecodeMode)) |mode| {
-        for (std.enums.values(TerminalScreenKey)) |key| {
-            for ([_]bool{ false, true }) |reset| {
-                for (0..2) |applied_pages|
-                    try testLiveHistoryClear(mode, key, reset, applied_pages);
-            }
+    for (std.enums.values(TerminalScreenKey)) |key| {
+        for ([_]bool{ false, true }) |reset| {
+            for (0..2) |applied_pages|
+                try testLiveHistoryClear(key, reset, applied_pages);
         }
     }
 }
 
 test "live history clear still validates discarded records and FINISH" {
-    for (std.enums.values(TestHistoryDecodeMode)) |mode| {
-        for ([_]bool{ false, true }) |corrupt_page|
-            try testHistoryClearCorruption(mode, corrupt_page);
-    }
+    for ([_]bool{ false, true }) |corrupt_page|
+        try testHistoryClearCorruption(corrupt_page);
 }
 
-fn testHistoryClearCorruption(mode: TestHistoryDecodeMode, corrupt_page: bool) !void {
+fn testHistoryClearCorruption(corrupt_page: bool) !void {
     const testing = std.testing;
     var t = try testHistoryTerminal(3);
     defer t.deinit(testing.allocator);
@@ -2607,44 +2483,42 @@ fn testHistoryClearCorruption(mode: TestHistoryDecodeMode, corrupt_page: bool) !
     restored.eraseDisplay(.scrollback, false);
     const valid_pages: usize = if (corrupt_page) 0 else 3;
     for (0..valid_pages) |_| {
-        const progress = (try testHistoryNext(&decoder, restored, mode)).?.page;
+        const progress = (try decoder.next(testing.allocator, restored)).?.page;
         try testing.expectEqual(@as(usize, 0), progress.rows);
     }
-    try testing.expectError(error.InvalidChecksum, testHistoryNext(&decoder, restored, mode));
+    try testing.expectError(error.InvalidChecksum, decoder.next(testing.allocator, restored));
     try testing.expect(decoder.state == .failed);
 }
 
 test "live history clear preserves pending active image pixels" {
     if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
     const testing = std.testing;
-    for (std.enums.values(TestHistoryDecodeMode)) |mode| {
-        var t = try testHistoryTerminal(3);
-        defer t.deinit(testing.allocator);
-        var vt = t.vtStream();
-        defer vt.deinit();
-        vt.nextSlice("\x1b_Ga=T,f=32,s=1,v=1,i=42,p=1,q=2;AAECAw==\x1b\\");
-        var encoded: std.Io.Writer.Allocating = .init(testing.allocator);
-        defer encoded.deinit();
-        try encode(testing.allocator, &encoded.writer, &t, test_encode_options);
-        var source: std.Io.Reader = .fixed(encoded.written());
-        var decoder: Decoder = .init(&source);
-        var decoded = try decoder.ready(testing.allocator, testing.io, test_decode_options);
-        defer decoded.deinit(testing.allocator);
-        const restored = &decoded.terminal.?;
-        const storage = &restored.screens.active.kitty_images;
-        try testing.expect(storage.imageById(42).?.data.isPending());
-        restored.eraseDisplay(.scrollback, false);
-        const image = (try testHistoryNext(&decoder, restored, mode)).?.image;
-        try testing.expectEqual(@as(usize, 4), image.bytes);
-        try testing.expectEqualSlices(u8, &.{ 0, 1, 2, 3 }, storage.imageById(42).?.data.bytes().?);
-        var pages: usize = 0;
-        while (try testHistoryNext(&decoder, restored, mode)) |progress| {
-            try testing.expectEqual(@as(usize, 0), progress.page.rows);
-            pages += 1;
-        }
-        try testing.expectEqual(@as(usize, 3), pages);
-        try testing.expect(decoder.state == .finished);
+    var t = try testHistoryTerminal(3);
+    defer t.deinit(testing.allocator);
+    var vt = t.vtStream();
+    defer vt.deinit();
+    vt.nextSlice("\x1b_Ga=T,f=32,s=1,v=1,i=42,p=1,q=2;AAECAw==\x1b\\");
+    var encoded: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer encoded.deinit();
+    try encode(testing.allocator, &encoded.writer, &t, test_encode_options);
+    var source: std.Io.Reader = .fixed(encoded.written());
+    var decoder: Decoder = .init(&source);
+    var decoded = try decoder.ready(testing.allocator, testing.io, test_decode_options);
+    defer decoded.deinit(testing.allocator);
+    const restored = &decoded.terminal.?;
+    const storage = &restored.screens.active.kitty_images;
+    try testing.expect(storage.imageById(42).?.data.isPending());
+    restored.eraseDisplay(.scrollback, false);
+    const image = (try decoder.next(testing.allocator, restored)).?.image;
+    try testing.expectEqual(@as(usize, 4), image.bytes);
+    try testing.expectEqualSlices(u8, &.{ 0, 1, 2, 3 }, storage.imageById(42).?.data.bytes().?);
+    var pages: usize = 0;
+    while (try decoder.next(testing.allocator, restored)) |progress| {
+        try testing.expectEqual(@as(usize, 0), progress.page.rows);
+        pages += 1;
     }
+    try testing.expectEqual(@as(usize, 3), pages);
+    try testing.expect(decoder.state == .finished);
 }
 
 test "incremental decode discards history for screens changed since READY" {

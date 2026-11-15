@@ -62,18 +62,6 @@ typedef enum GHOSTTY_ENUM_TYPED {
   GHOSTTY_MOUSE_FORMAT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyMouseFormat;
 
-/** Terminal-derived effective mouse encoder options. */
-typedef struct {
-  size_t size;
-  GhosttyMouseTrackingMode event;
-  GhosttyMouseFormat format;
-} GhosttyMouseEncoderTerminalOptions;
-
-/** Capture exactly the options ghostty_mouse_encoder_set_from_terminal applies. */
-GHOSTTY_API GhosttyResult ghostty_mouse_encoder_terminal_options(
-    GhosttyTerminal terminal,
-    GhosttyMouseEncoderTerminalOptions *options);
-
 /**
  * Mouse encoder size and geometry context.
  *
@@ -117,8 +105,8 @@ typedef struct {
 /**
  * Mouse encoder option identifiers.
  *
- * These values are used with ghostty_mouse_encoder_set() to configure
- * the behavior of the mouse encoder.
+ * These values are used with ghostty_mouse_encoder_set() and
+ * ghostty_mouse_encoder_get(). Each getter writes the same type the setter reads.
  *
  * @ingroup mouse
  */
@@ -173,6 +161,22 @@ GHOSTTY_API GhosttyResult ghostty_mouse_encoder_new(const GhosttyAllocator *allo
  * @ingroup mouse
  */
 GHOSTTY_API void ghostty_mouse_encoder_free(GhosttyMouseEncoder encoder);
+
+/**
+ * Read an encoder option, including effective tracking and format after
+ * ghostty_mouse_encoder_set_from_terminal(). The output type is the value type
+ * documented on GhosttyMouseEncoderOption. Initialize the SIZE output with
+ * GHOSTTY_INIT_SIZED().
+ *
+ * NULL encoder or out, or OPT_INVALID, returns GHOSTTY_INVALID_VALUE.
+ * An unknown option or disabled input encoding returns GHOSTTY_UNSUPPORTED.
+ *
+ * @ingroup mouse
+ */
+GHOSTTY_API GhosttyResult ghostty_mouse_encoder_get(
+    GhosttyMouseEncoder encoder,
+    GhosttyMouseEncoderOption option,
+    void *out);
 
 /**
  * Set an option on the mouse encoder.

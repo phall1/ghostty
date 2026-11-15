@@ -532,53 +532,6 @@
         }
       }
     },
-    "GhosttyKeyEncoderTerminalOptions": {
-      "kind": "struct",
-      "size": 16,
-      "align": 8,
-      "fields": {
-        "size": {
-          "offset": 0,
-          "size": 8,
-          "type": "u64"
-        },
-        "cursor_key_application": {
-          "offset": 8,
-          "size": 1,
-          "type": "bool"
-        },
-        "keypad_key_application": {
-          "offset": 9,
-          "size": 1,
-          "type": "bool"
-        },
-        "ignore_keypad_with_numlock": {
-          "offset": 10,
-          "size": 1,
-          "type": "bool"
-        },
-        "alt_esc_prefix": {
-          "offset": 11,
-          "size": 1,
-          "type": "bool"
-        },
-        "modify_other_keys_state_2": {
-          "offset": 12,
-          "size": 1,
-          "type": "bool"
-        },
-        "kitty_flags": {
-          "offset": 13,
-          "size": 1,
-          "type": "u8"
-        },
-        "backarrow_key_mode": {
-          "offset": 14,
-          "size": 1,
-          "type": "bool"
-        }
-      }
-    },
     "GhosttyKittyGraphicsPlacementRenderInfo": {
       "kind": "struct",
       "size": 56,
@@ -718,28 +671,6 @@
           "offset": 36,
           "size": 4,
           "type": "u32"
-        }
-      }
-    },
-    "GhosttyMouseEncoderTerminalOptions": {
-      "kind": "struct",
-      "size": 16,
-      "align": 8,
-      "fields": {
-        "size": {
-          "offset": 0,
-          "size": 8,
-          "type": "u64"
-        },
-        "event": {
-          "offset": 8,
-          "size": 4,
-          "type": "GhosttyMouseTrackingMode"
-        },
-        "format": {
-          "offset": 12,
-          "size": 4,
-          "type": "GhosttyMouseFormat"
         }
       }
     },
@@ -2708,6 +2639,7 @@
         "INVALID": 0,
         "PLACEMENT_ITERATOR": 1,
         "GENERATION": 2,
+        "IMAGE_ITERATOR": 3,
         "MAX_VALUE": 2147483647
       },
       "keys": {
@@ -2718,6 +2650,10 @@
         "GENERATION": {
           "direction": "out",
           "type": "u64"
+        },
+        "IMAGE_ITERATOR": {
+          "direction": "out",
+          "type": "GhosttyKittyGraphicsImageIterator"
         }
       }
     },
@@ -5155,6 +5091,11 @@
       "align": 8
     },
     "GhosttyKittyGraphicsPlacementIterator": {
+      "kind": "opaque",
+      "size": 8,
+      "align": 8
+    },
+    "GhosttyKittyGraphicsImageIterator": {
       "kind": "opaque",
       "size": 8,
       "align": 8

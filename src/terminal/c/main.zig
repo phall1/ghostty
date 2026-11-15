@@ -15,7 +15,10 @@ pub const grid_ref_tracked = @import("grid_ref_tracked.zig");
 pub const io = @import("io.zig");
 pub const kitty_graphics = @import("kitty_graphics.zig");
 pub const kitty_graphics_get = kitty_graphics.get;
-pub const kitty_graphics_image_ids = kitty_graphics.image_ids;
+pub const kitty_graphics_image_iterator_new = kitty_graphics.image_iterator_new;
+pub const kitty_graphics_image_iterator_free = kitty_graphics.image_iterator_free;
+pub const kitty_graphics_image_iterator_next = kitty_graphics.image_iterator_next;
+pub const kitty_graphics_image_iterator_get_image = kitty_graphics.image_iterator_get_image;
 pub const kitty_graphics_animation_tick = kitty_graphics.animation_tick;
 pub const kitty_graphics_image = kitty_graphics.image_get_handle;
 pub const kitty_graphics_image_get = kitty_graphics.image_get;
@@ -151,7 +154,7 @@ pub const key_encoder_new = key_encode.new;
 pub const key_encoder_free = key_encode.free;
 pub const key_encoder_set = key_encode.set;
 pub const key_encoder_set_from_terminal = key_encode.set_from_terminal;
-pub const key_encoder_terminal_options = key_encode.terminal_options;
+pub const key_encoder_get = key_encode.get;
 pub const key_encoder_encode = key_encode.encode;
 
 pub const mouse_event_new = mouse_event.new;
@@ -170,7 +173,7 @@ pub const mouse_encoder_new = mouse_encode.new;
 pub const mouse_encoder_free = mouse_encode.free;
 pub const mouse_encoder_set = mouse_encode.set;
 pub const mouse_encoder_set_from_terminal = mouse_encode.set_from_terminal;
-pub const mouse_encoder_terminal_options = mouse_encode.terminal_options;
+pub const mouse_encoder_get = mouse_encode.get;
 pub const mouse_encoder_reset = mouse_encode.reset;
 pub const mouse_encoder_encode = mouse_encode.encode;
 
@@ -198,7 +201,6 @@ pub const sys_set = sys.set;
 pub const terminal_new = terminal.new;
 pub const terminal_free = terminal.free;
 pub const terminal_reset = terminal.reset;
-pub const terminal_clear_presentation = terminal.clear_presentation;
 pub const terminal_resize = terminal.resize;
 pub const terminal_set = terminal.set;
 pub const terminal_vt_write = terminal.vt_write;
@@ -245,7 +247,6 @@ pub const terminal_grid_ref_track = terminal.grid_ref_track;
 pub const terminal_point_from_grid_ref = terminal.point_from_grid_ref;
 
 pub const snapshot_encode = snapshot.encode;
-pub const snapshot_validate_records = snapshot.validate_records;
 pub const snapshot_encode_buf = snapshot.encode_buf;
 pub const snapshot_encode_alloc = snapshot.encode_alloc;
 pub const snapshot_decoder_new = snapshot.decoder_new;
@@ -256,7 +257,6 @@ pub const snapshot_decoder_get = snapshot.decoder_get;
 pub const snapshot_decoder_get_multi = snapshot.decoder_get_multi;
 pub const snapshot_decoder_ready = snapshot.decoder_ready;
 pub const snapshot_decoder_next = snapshot.decoder_next;
-pub const snapshot_decoder_next_staged = snapshot.decoder_next_staged;
 pub const snapshot_decoder_decode = snapshot.decoder_decode;
 
 pub const type_json = types.get_json;
@@ -363,7 +363,9 @@ test "unknown keys return unsupported in every family" {
         .{ "kitty_graphics_placement_get", kitty, kitty_graphics.placement_get(null, @fromBackingInt(@intCast(unknown)), &out) },
         .{ "kitty_graphics_placement_get_multi", kitty, kitty_graphics.placement_get_multi(null, 1, &.{@fromBackingInt(@intCast(unknown))}, &values, &written) },
         .{ "key_encoder_set", Result.unsupported, key_encode.set(null, @fromBackingInt(@intCast(unknown)), &out) },
+        .{ "key_encoder_get", Result.unsupported, key_encode.get(null, @fromBackingInt(@intCast(unknown)), &out) },
         .{ "mouse_encoder_set", Result.unsupported, mouse_encode.set(null, @fromBackingInt(@intCast(unknown)), &out) },
+        .{ "mouse_encoder_get", Result.unsupported, mouse_encode.get(null, @fromBackingInt(@intCast(unknown)), &out) },
         .{ "osc_set", Result.unsupported, osc.set(null, @fromBackingInt(@intCast(unknown)), &out) },
         .{ "osc_command_data", Result.unsupported, osc.commandData(null, @fromBackingInt(@intCast(unknown)), &out) },
         .{ "render_state_get", Result.unsupported, render.get(state, @fromBackingInt(@intCast(unknown)), &out) },
@@ -465,7 +467,9 @@ test "INVALID keys return invalid_value with a live handle" {
 
     const cases = .{
         .{ "key_encoder_set", Result.invalid_value, key_encode.set(key_enc, .invalid, &out) },
+        .{ "key_encoder_get", Result.invalid_value, key_encode.get(key_enc, .invalid, &out) },
         .{ "mouse_encoder_set", Result.invalid_value, mouse_encode.set(mouse_enc, .invalid, &out) },
+        .{ "mouse_encoder_get", Result.invalid_value, mouse_encode.get(mouse_enc, .invalid, &out) },
         .{ "osc_set", Result.invalid_value, osc.set(parser, .invalid, &out) },
         .{ "search_set", Result.invalid_value, search.set(search_, .invalid, &out) },
         .{ "search_get", Result.invalid_value, search.get(search_, .invalid, &out) },

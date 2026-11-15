@@ -16,25 +16,6 @@ const apc = @import("../apc.zig");
 const default_max_continuation_bytes = apc.Protocol.maxDefaultBytes();
 const terminal_c = @import("terminal.zig");
 
-/// Validate all framing and CRCs of a staged unit before terminal mutation.
-/// Semantic ordering is still validated by the normal decoder.
-pub fn validate_records(
-    ptr: ?[*]const u8,
-    len: usize,
-) callconv(lib.calling_conv) Result {
-    if (comptime !lib.feature(.snapshot)) return .unsupported;
-    const bytes = if (ptr) |p| p[0..len] else if (len == 0) &.{} else return .invalid_value;
-    var source: std.Io.Reader = .fixed(bytes);
-    while (source.seek < bytes.len) {
-        const header = snapshot_core.record.Header.decode(&source) catch return .invalid_value;
-        var reader: snapshot_core.record.Reader = undefined;
-        reader.initHeader(&source, header);
-        reader.payloadReader().discardAll(header.payload_len) catch return .invalid_value;
-        reader.finish() catch return .invalid_value;
-    }
-    return .success;
-}
-
 /// C: GhosttySnapshotDecoderOption.
 ///
 /// Options configure validation and returned-terminal policy before snapshot
@@ -540,18 +521,6 @@ pub fn decoder_ready(
 pub fn decoder_next(
     decoder_: Decoder,
 ) callconv(lib.calling_conv) Result {
-    return decoderNext(decoder_, null);
-}
-
-/// Decode one pre-framed unit without speculative reads into the next unit.
-pub fn decoder_next_staged(
-    decoder_: Decoder,
-    page_placements: bool,
-) callconv(lib.calling_conv) Result {
-    return decoderNext(decoder_, page_placements);
-}
-
-fn decoderNext(decoder_: Decoder, page_placements: ?bool) Result {
     if (comptime !lib.feature(.snapshot)) return .unsupported;
     // FINISH is idempotent; every other non-history state rejects `next`.
     const decoder = decoder_ orelse return .invalid_value;
@@ -568,10 +537,7 @@ fn decoderNext(decoder_: Decoder, page_placements: ?bool) Result {
     history.progress = null;
 
     // Consume one validated record and preserve READY metadata on failure.
-    const progress = (if (page_placements) |present|
-        decoder.decoder.nextStaged(decoder.alloc, native, present)
-    else
-        decoder.decoder.next(decoder.alloc, native)) catch |err| {
+    const progress = decoder.decoder.next(decoder.alloc, native) catch |err| {
         const metadata = history.metadata;
         decoder.state = .{ .failed = metadata };
         return decoderMapError(decoder, err);
@@ -990,25 +956,6 @@ test "decoder option and empty source" {
         &terminal,
     ));
     try testing.expectEqual(null, terminal);
-}
-
-test "snapshot record prevalidation checks complete groups and unknown CRCs" {
-    var bytes: std.Io.Writer.Allocating = .init(testing.allocator);
-    defer bytes.deinit();
-    var records: snapshot_core.record.Writer = .init(testing.allocator, &bytes.writer);
-    defer records.deinit();
-    try records.begin(.page).writeAll("framing only, not semantic validation");
-    try records.finish();
-    try records.begin(@fromBackingInt(4242)).writeAll("unknown optional record");
-    try records.finish();
-    try testing.expectEqual(Result.success, validate_records(bytes.written().ptr, bytes.written().len));
-    try testing.expectEqual(Result.success, validate_records(null, 0));
-    try testing.expectEqual(Result.invalid_value, validate_records(null, 1));
-    try testing.expectEqual(Result.invalid_value, validate_records(bytes.written().ptr, 1));
-    try testing.expectEqual(Result.invalid_value, validate_records(bytes.written().ptr, bytes.written().len - 1));
-    const len = bytes.written().len;
-    bytes.writer.buffer[len - 1] ^= 1;
-    try testing.expectEqual(Result.invalid_value, validate_records(bytes.written().ptr, len));
 }
 
 test "snapshot C API full round trip restores continuation" {

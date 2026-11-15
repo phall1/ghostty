@@ -77,6 +77,15 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Output type: uint64_t *
    */
   GHOSTTY_KITTY_GRAPHICS_DATA_GENERATION = 2,
+
+  /**
+   * Populate a pre-allocated image iterator with every stored image, including
+   * images without placements. Iteration order is unspecified. The iterator
+   * and returned image handles are invalidated by terminal mutation.
+   *
+   * Output type: GhosttyKittyGraphicsImageIterator *
+   */
+  GHOSTTY_KITTY_GRAPHICS_DATA_IMAGE_ITERATOR = 3,
   GHOSTTY_KITTY_GRAPHICS_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyKittyGraphicsData;
 
@@ -490,17 +499,40 @@ GHOSTTY_API GhosttyResult ghostty_kitty_graphics_get(
     void* out);
 
 /**
- * Copy all resident image IDs, including unplaced images, without allocating.
- * An undersized buffer returns GHOSTTY_OUT_OF_SPACE, sets out_len to the
- * required capacity, and writes no IDs. NULL with zero capacity queries size.
- * The order is unspecified. Do not mutate the terminal between query and copy.
- * Without Kitty graphics, returns GHOSTTY_NO_VALUE and sets out_len to zero.
+ * Allocate an image iterator. Populate it with ghostty_kitty_graphics_get()
+ * using GHOSTTY_KITTY_GRAPHICS_DATA_IMAGE_ITERATOR before iterating.
+ * NULL allocator selects the default allocator. NULL out_iterator returns
+ * GHOSTTY_INVALID_VALUE. Disabled Kitty graphics returns GHOSTTY_UNSUPPORTED.
+ *
+ * @ingroup kitty_graphics
  */
-GHOSTTY_API GhosttyResult ghostty_kitty_graphics_image_ids(
-    GhosttyKittyGraphics graphics,
-    uint32_t* ids,
-    size_t capacity,
-    size_t* out_len);
+GHOSTTY_API GhosttyResult ghostty_kitty_graphics_image_iterator_new(
+    const GhosttyAllocator* allocator,
+    GhosttyKittyGraphicsImageIterator* out_iterator);
+
+/** Free an image iterator. NULL is a no-op. @ingroup kitty_graphics */
+GHOSTTY_API void ghostty_kitty_graphics_image_iterator_free(
+    GhosttyKittyGraphicsImageIterator iterator);
+
+/**
+ * Advance to the next image. Returns false before population, at the end,
+ * for NULL, or when Kitty graphics are disabled.
+ *
+ * @ingroup kitty_graphics
+ */
+GHOSTTY_API bool ghostty_kitty_graphics_image_iterator_next(
+    GhosttyKittyGraphicsImageIterator iterator);
+
+/**
+ * Return the current borrowed image handle. Read its fields with
+ * ghostty_kitty_graphics_image_get(). Returns NULL before successful next,
+ * after exhaustion, for NULL, or when Kitty graphics are disabled.
+ * Terminal mutation invalidates the handle.
+ *
+ * @ingroup kitty_graphics
+ */
+GHOSTTY_API GhosttyKittyGraphicsImage ghostty_kitty_graphics_image_iterator_get_image(
+    GhosttyKittyGraphicsImageIterator iterator);
 
 /**
  * Advance playing animations and get the time of the next frame.
