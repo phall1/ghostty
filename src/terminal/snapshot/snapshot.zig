@@ -708,7 +708,26 @@ pub const Decoder = struct {
     ) NextError!?Progress {
         const state = try self.nextState() orelse return null;
         errdefer self.state = .failed;
+        const header = try self.takeProgressHeader();
 
+        if (comptime build_options.kitty_graphics) {
+            if (header.tag == .kitty_image_payload) {
+                return try self.nextPayload(alloc, t, header);
+            }
+        }
+
+        // takeProgressHeader has already retired any exhausted sequence.
+        if (state.current) |*sequence| {
+            return try self.nextPage(alloc, t, sequence, header);
+        }
+
+        try self.finish(t, header);
+        return null;
+    }
+
+    /// Read through HISTORY manifests to the next PAGE, image, or FINISH.
+    fn takeProgressHeader(self: *Decoder) NextError!record.Header {
+        const state = &self.state.history;
         while (true) {
             // Read the next header before deciding how to decode the
             // record. Unknown records before it were skipped.
@@ -718,27 +737,29 @@ pub const Decoder = struct {
             // between the pages of a HISTORY sequence, in any screen order.
             if (comptime build_options.kitty_graphics) {
                 if (header.tag == .kitty_image_payload) {
-                    return try self.nextPayload(alloc, t, header);
+                    return header;
                 }
             }
 
-            // Stream the current sequence's next PAGE if one remains.
-            if (state.current) |*sequence| {
-                if (sequence.remaining > 0) {
-                    return try self.nextPage(alloc, t, sequence, header);
-                }
-                state.current = null;
-            }
+            // The current sequence's next PAGE is ready to decode.
+            if (self.currentSequence() != null) return header;
 
             // All sequences are consumed: FINISH ends the snapshot, leaving
             // trailing transport bytes unread.
-            if (state.pending == 0) {
-                try self.finish(t, header);
-                return null;
-            }
+            if (state.pending == 0) return header;
 
             try self.beginHistory(header);
         }
+    }
+
+    /// Retire an exhausted history sequence before selecting its next record.
+    fn currentSequence(self: *Decoder) ?*Sequence {
+        const state = &self.state.history;
+        if (state.current) |*sequence| {
+            if (sequence.remaining > 0) return sequence;
+            state.current = null;
+        }
+        return null;
     }
 
     /// `ready` must succeed before history exists to decode, and a failed
